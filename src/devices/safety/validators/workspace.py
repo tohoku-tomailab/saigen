@@ -2,6 +2,8 @@
 可動域バリデータ
 
 X, Y, Z座標とJoint1角度の可動域を検証します。
+任意で水平半径 r = hypot(X, Y) の範囲（r_min / r_max）も検証できます
+（MaxArm など、基部近傍や最大到達距離付近を避けたいアーム用）。
 """
 
 import logging
@@ -55,6 +57,8 @@ class WorkspaceValidator(PositionValidator):
         y_min, y_max: Y軸の可動範囲 (mm)
         z_min, z_max: Z軸の可動範囲 (mm)
         joint1_min, joint1_max: Joint1の可動範囲 (度)
+        r_min, r_max: 水平半径 hypot(X, Y) の可動範囲 (mm)。任意（None = 検証しない）。
+            validate_xyz でのみ検証する。既定値は None で、既存の検証は変わらない
 
     使用例:
         validator = WorkspaceValidator(
@@ -79,6 +83,8 @@ class WorkspaceValidator(PositionValidator):
         z_max: float = 150,
         joint1_min: float = -135,
         joint1_max: float = 135,
+        r_min: Optional[float] = None,
+        r_max: Optional[float] = None,
     ):
         limits = {
             "x": (x_min, x_max),
@@ -98,6 +104,18 @@ class WorkspaceValidator(PositionValidator):
                     f"可動域の下限が上限より大きい: {axis}_min={lo} > {axis}_max={hi}"
                 )
 
+        for name, value in (("r_min", r_min), ("r_max", r_max)):
+            if value is None:
+                continue
+            if _non_finite({name: value}):
+                raise ValueError(f"可動域の半径制限が有限の数値ではありません: {name}={value!r}")
+            if value < 0:
+                raise ValueError(f"可動域の半径制限は 0 以上で指定してください: {name}={value}")
+        if r_min is not None and r_max is not None and r_min > r_max:
+            raise ValueError(
+                f"可動域の下限が上限より大きい: r_min={r_min} > r_max={r_max}"
+            )
+
         self.x_min = x_min
         self.x_max = x_max
         self.y_min = y_min
@@ -106,12 +124,15 @@ class WorkspaceValidator(PositionValidator):
         self.z_max = z_max
         self.joint1_min = joint1_min
         self.joint1_max = joint1_max
+        self.r_min = r_min
+        self.r_max = r_max
 
-        logger.debug(
-            f"WorkspaceValidator初期化: "
-            f"X=[{x_min}, {x_max}], Y=[{y_min}, {y_max}], "
-            f"Z=[{z_min}, {z_max}], Joint1=[{joint1_min}, {joint1_max}]"
-        )
+        logger.debug(f"WorkspaceValidator初期化: {self!r}")
+
+    @property
+    def has_radius_limits(self) -> bool:
+        """r_min / r_max のどちらかが設定されているか"""
+        return self.r_min is not None or self.r_max is not None
 
     def validate_xyz(self, x: float, y: float, z: float) -> None:
         """
@@ -123,10 +144,12 @@ class WorkspaceValidator(PositionValidator):
             z: Z座標 (mm)
 
         Raises:
-            WorkspaceViolationError: 可動域外の場合
+            WorkspaceViolationError: 可動域外の場合（r_min / r_max 設定時は
+                水平半径 hypot(x, y) の範囲外も含む）
         """
         violations: List[ViolationDetail] = []
         self._require_finite({"x": x, "y": y, "z": z}, "XYZ座標が有限の数値ではありません (NaN/inf)")
+        target = {"x": x, "y": y, "z": z}
 
         # X軸チェック
         if x < self.x_min or x > self.x_max:
@@ -161,10 +184,26 @@ class WorkspaceValidator(PositionValidator):
                 )
             )
 
+        # 水平半径チェック（設定時のみ）
+        if self.has_radius_limits:
+            r = math.hypot(x, y)
+            target["r"] = r
+            too_close = self.r_min is not None and r < self.r_min
+            too_far = self.r_max is not None and r > self.r_max
+            if too_close or too_far:
+                violations.append(
+                    ViolationDetail(
+                        axis="R",
+                        current_value=r,
+                        min_value=self.r_min if self.r_min is not None else 0.0,
+                        max_value=self.r_max if self.r_max is not None else math.inf,
+                    )
+                )
+
         if violations:
             raise WorkspaceViolationError(
                 message="XYZ座標が可動域外です",
-                target_position={"x": x, "y": y, "z": z},
+                target_position=target,
                 violations=violations,
             )
 
@@ -279,13 +318,25 @@ class WorkspaceValidator(PositionValidator):
             )
 
     def get_limits(self) -> Dict[str, Dict[str, float]]:
-        """現在の可動域制限を取得"""
-        return {
+        """現在の可動域制限を取得
+
+        r_min / r_max は設定されている場合のみ ``"r"`` キーに含める
+        （設定されている側の ``"min"`` / ``"max"`` だけを持つ）。
+        """
+        limits = {
             "x": {"min": self.x_min, "max": self.x_max},
             "y": {"min": self.y_min, "max": self.y_max},
             "z": {"min": self.z_min, "max": self.z_max},
             "joint1": {"min": self.joint1_min, "max": self.joint1_max},
         }
+        if self.has_radius_limits:
+            r = {}
+            if self.r_min is not None:
+                r["min"] = self.r_min
+            if self.r_max is not None:
+                r["max"] = self.r_max
+            limits["r"] = r
+        return limits
 
     def __repr__(self) -> str:
         return (
@@ -293,5 +344,7 @@ class WorkspaceValidator(PositionValidator):
             f"X=[{self.x_min}, {self.x_max}], "
             f"Y=[{self.y_min}, {self.y_max}], "
             f"Z=[{self.z_min}, {self.z_max}], "
-            f"Joint1=[{self.joint1_min}, {self.joint1_max}])"
+            f"Joint1=[{self.joint1_min}, {self.joint1_max}]"
+            + (f", R=[{self.r_min}, {self.r_max}]" if self.has_radius_limits else "")
+            + ")"
         )

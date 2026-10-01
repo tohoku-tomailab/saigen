@@ -18,7 +18,20 @@ def restore_config_path():
 def test_robot_ports_have_int_keys():
     ports = lab_config.get_robot_ports()
     assert all(isinstance(k, int) for k in ports)
-    assert set(ports.keys()) == {1, 2, 3}
+    # 1-3: Dobot Magician, 4: optional Hiwonder MaxArm (placeholder port)
+    assert set(ports.keys()) == {1, 2, 3, 4}
+    assert all(ports[rid]["type"] == "dobot" for rid in (1, 2, 3))
+    assert ports[4]["type"] == "maxarm"
+
+
+def test_example_yaml_robot4_is_a_placeholder_maxarm(tmp_path, restore_config_path):
+    """config.example.yaml の Robot 4 はポート未設定の MaxArm（実機ランは起動を拒否する）"""
+    lab_config.CONFIG_PATH = str(tmp_path / "absent-config.yaml")
+    r4 = lab_config.load_config(force_reload=True)["robots"][4]
+    assert r4["type"] == "maxarm"
+    assert r4["maxarm_port"] == ""
+    ws = r4["workspace"]
+    assert ws["z_min"] > 0 and ws["y_max"] < 0 and ws["r_min"] < ws["r_max"]
 
 
 def test_robot3_has_no_pipette():

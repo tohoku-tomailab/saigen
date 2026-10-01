@@ -42,6 +42,22 @@ DEFAULTS = {
         1: {"dobot_port": "COM3", "picus2_address": "COM4"},
         2: {"dobot_port": "COM5", "picus2_address": "COM6"},
         3: {"dobot_port": "COM7"},
+        # Hiwonder MaxArm (suction pick-and-place). Placeholder port: a flow that
+        # uses robot 4 refuses to start a real run until maxarm_port is set.
+        # The workspace is a conservative starting box inside the arm's reach,
+        # in the MaxArm's own frame (mm, origin on the base yaw axis); measure
+        # your cell and tighten it before any real run.
+        4: {
+            "type": "maxarm",
+            "maxarm_port": "",
+            "workspace": {
+                "x_min": -250.0, "x_max": 250.0,
+                "y_min": -280.0, "y_max": -60.0,
+                "z_min": 40.0, "z_max": 225.0,
+                "r_min": 60.0, "r_max": 260.0,
+            },
+            "move_ms": 1500,
+        },
     },
     "shared_devices": {
         "scale_port": "COM8",
@@ -152,9 +168,111 @@ def load_monitoring_config(force_reload: bool = False) -> dict:
     return config
 
 
+#: Robot types a ``robots.<id>.type`` entry may name. Robots without a type are
+#: Dobot Magicians (the only type before the MaxArm was added), so existing
+#: config.yaml files keep working unchanged.
+ROBOT_TYPES = ("dobot", "maxarm")
+DEFAULT_ROBOT_TYPE = "dobot"
+
+
 def get_robot_ports() -> dict:
-    """robot_id (int) -> connection ports for that robot."""
-    return {int(rid): dict(ports) for rid, ports in load_config()["robots"].items()}
+    """robot_id (int) -> connection settings for that robot.
+
+    Every entry carries ``type`` (``"dobot"`` when the file does not say);
+    MaxArm entries also carry ``maxarm_port``, an optional ``workspace``
+    override and driver options such as ``move_ms``.
+    """
+    robots = {}
+    for rid, ports in (load_config().get("robots") or {}).items():
+        entry = copy.deepcopy(dict(ports or {}))
+        entry.setdefault("type", DEFAULT_ROBOT_TYPE)
+        robots[int(rid)] = entry
+    return robots
+
+
+def get_robot_type(robot_id: int) -> str:
+    """``"dobot"`` or ``"maxarm"`` for ``robot_id`` (``"dobot"`` if not configured).
+
+    Raises:
+        ConfigError: the configured type is not one of :data:`ROBOT_TYPES`
+    """
+    rtype = get_robot_ports().get(int(robot_id), {}).get("type", DEFAULT_ROBOT_TYPE)
+    if rtype not in ROBOT_TYPES:
+        raise ConfigError(
+            f"robots.{robot_id}.type = {rtype!r} is not a known robot type {ROBOT_TYPES}"
+        )
+    return rtype
+
+
+#: Keys a MaxArm's ``robots.<id>.workspace`` must set. Its frame differs from
+#: the Dobot's, so none of these may be inherited from the global workspace.
+MAXARM_REQUIRED_WORKSPACE_KEYS = ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")
+
+#: Keys a MaxArm workspace may set in addition (the base-protecting radius).
+MAXARM_OPTIONAL_WORKSPACE_KEYS = ("r_min", "r_max")
+
+
+def maxarm_workspace(robot_id, entry) -> dict:
+    """The MaxArm workspace block of one ``robots.<id>`` entry, checked.
+
+    The MaxArm works in its own frame, so its limits come only from its own
+    ``workspace`` block, never merged over the global (Dobot) box. The block must
+    set every key of :data:`MAXARM_REQUIRED_WORKSPACE_KEYS`; ``r_min`` / ``r_max``
+    are optional. A key present with no value (YAML ``z_min:``) is an error, never
+    "unlimited".
+
+    Raises:
+        ConfigError: the block is missing, not a mapping, incomplete or has a null value
+    """
+    override = (entry or {}).get("workspace")
+    where = f"robots.{robot_id}.workspace"
+    if override is None or override == {}:
+        raise ConfigError(
+            f"Robot {robot_id} is a MaxArm (type: maxarm) but {where} is not set. "
+            f"A MaxArm needs its own complete workspace "
+            f"({', '.join(MAXARM_REQUIRED_WORKSPACE_KEYS)}; r_min / r_max optional) in its "
+            f"own frame; it never uses the global Dobot limits."
+        )
+    if not isinstance(override, dict):
+        raise ConfigError(f"{where} must be a mapping, got {type(override).__name__}")
+    missing = [k for k in MAXARM_REQUIRED_WORKSPACE_KEYS if k not in override]
+    if missing:
+        raise ConfigError(
+            f"{where} (MaxArm, robot {robot_id}) is missing {', '.join(missing)}. "
+            f"All of {', '.join(MAXARM_REQUIRED_WORKSPACE_KEYS)} are required."
+        )
+    nulls = [k for k, v in override.items() if v is None]
+    if nulls:
+        raise ConfigError(
+            f"{where} (MaxArm, robot {robot_id}): {', '.join(nulls)} has no value (null). "
+            f"Give a number or delete the optional key; a null is never read as unlimited."
+        )
+    return dict(override)
+
+
+def get_robot_workspace(robot_id: int) -> dict:
+    """Workspace limits for one robot.
+
+    - MaxArm (``type: maxarm``): only its own ``robots.<id>.workspace`` block,
+      checked by :func:`maxarm_workspace` (never merged over the global box).
+    - Dobot: the global ``workspace`` merged with ``robots.<id>.workspace``
+      (the robot's own keys win); without its own section, the global limits.
+
+    Raises:
+        ConfigError: the robot's workspace is not a mapping, or a MaxArm's is
+            missing, incomplete or has a null value
+    """
+    entry = get_robot_ports().get(int(robot_id), {})
+    if entry.get("type") == "maxarm":
+        return maxarm_workspace(robot_id, entry)
+    merged = dict(load_config()["workspace"])
+    override = entry.get("workspace") or {}
+    if not isinstance(override, dict):
+        raise ConfigError(
+            f"robots.{robot_id}.workspace must be a mapping, got {type(override).__name__}"
+        )
+    merged.update(override)
+    return _reject_null_limits(merged, f"robots.{robot_id}.workspace (merged over workspace)")
 
 
 def get_shared_devices() -> dict:
@@ -163,8 +281,29 @@ def get_shared_devices() -> dict:
 
 
 def get_workspace() -> dict:
-    """Dobot workspace limits (keys match the WorkspaceValidator arguments)."""
-    return dict(load_config()["workspace"])
+    """Global (Dobot) workspace limits (keys match the WorkspaceValidator arguments).
+
+    Robots with their own ``robots.<id>.workspace`` use :func:`get_robot_workspace`.
+
+    Raises:
+        ConfigError: the section is not a mapping or a key has no value (YAML
+            ``r_min:`` / ``r_min: null``). A null is never read as "unlimited"
+            (the same rule as :func:`maxarm_workspace`).
+    """
+    return _reject_null_limits(load_config()["workspace"], "workspace")
+
+
+def _reject_null_limits(ws, where: str) -> dict:
+    """Return ``ws`` as a dict; ConfigError if it is not a mapping or has a null value."""
+    if not isinstance(ws, dict):
+        raise ConfigError(f"{where} must be a mapping, got {type(ws).__name__}")
+    nulls = [k for k, v in ws.items() if v is None]
+    if nulls:
+        raise ConfigError(
+            f"{where}: {', '.join(map(str, nulls))} has no value (null). "
+            f"Give a number or delete the key; a null is never read as unlimited."
+        )
+    return dict(ws)
 
 
 def get_video_camera_index() -> int:
