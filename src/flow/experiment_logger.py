@@ -113,6 +113,7 @@ class ExperimentLogger:
         self.events = []           # 重量測定・画像撮影など特筆すべきイベント
         self.robots_used = set()
         self.picus2_robots = set()
+        self.robot_types = {}      # robot_id -> "dobot" / "maxarm"
         self.status = "running"
         self.error = None
         self.finished_at = None
@@ -141,10 +142,20 @@ class ExperimentLogger:
     # ------------------------------------------------------------------
     # 記録 API
     # ------------------------------------------------------------------
-    def record_resources(self, robot_ids, picus2_robots):
-        """使用リソースをメタデータに反映"""
+    def record_resources(self, robot_ids, picus2_robots, robot_types=None):
+        """使用リソースをメタデータに反映
+
+        Args:
+            robot_ids: 使用するロボット ID
+            picus2_robots: ピペットを使うロボット ID
+            robot_types: robot_id → 種別（"dobot" / "maxarm"）。省略時は
+                使用ロボットすべて "dobot"
+        """
         self.robots_used = set(robot_ids)
         self.picus2_robots = set(picus2_robots)
+        types = dict(robot_types or {})
+        self.robot_types = {int(rid): types.get(rid, types.get(str(rid), "dobot"))
+                            for rid in self.robots_used}
 
     def record_recording(self, info: dict):
         """センサー CSV 録画の情報を残す（``started_by_this_run`` など）。
@@ -279,6 +290,8 @@ class ExperimentLogger:
             "error_steps": sum(1 for r in self.records if r["status"] == "error"),
             "robots_used": sorted(self.robots_used),
             "picus2_robots": sorted(self.picus2_robots),
+            # JSON のキーは文字列になる: {"4": "maxarm"}
+            "robot_types": {str(rid): t for rid, t in sorted(self.robot_types.items())},
             "weight_measurements": len(weights),
             "images_captured": len(images),
             "sensor_recording": self.recording,
@@ -319,6 +332,9 @@ class ExperimentLogger:
                      f" 失敗 {sum(1 for r in self.records if r['status']=='error')}）")
         if self.robots_used:
             lines.append(f"- **使用ロボット**: {sorted(self.robots_used)}")
+            if self.robot_types:
+                lines.append("- **ロボット種別**: " + ", ".join(
+                    f"Robot {rid} = {t}" for rid, t in sorted(self.robot_types.items())))
         lines.append(f"- **重量測定**: {len(weights)} 回 / **撮影画像**: {len(images)} 枚")
         if self.error:
             lines.append(f"- **エラー**: {self.error}")

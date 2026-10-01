@@ -32,7 +32,7 @@ https://youtu.be/5X2-4LuQfns
 | Path | Contents |
 |---|---|
 | `src/agent/` | AI agent that generates JSON experimental flows from natural language (Gemini API or any OpenAI-compatible endpoint) and the preset flows |
-| `src/devices/` | Control drivers for each instrument (robot arm, electric pipette, hot-plate stirrer, electronic balance, webcam) and the safety wrapper the flows run through |
+| `src/devices/` | Control drivers for each instrument (robot arm, electric pipette, hot-plate stirrer, electronic balance, webcam, digital microscope, and the optional Hiwonder MaxArm suction arm) and the safety wrapper the flows run through |
 | `src/flow/` | Schema, validator, executor and command-line runner for the JSON experimental flow format |
 | `src/gui/` | Browser-based GUI for parameter input and flow confirmation |
 | `src/voice/` | Voice input (whisper-large-v3-turbo) |
@@ -40,9 +40,10 @@ https://youtu.be/5X2-4LuQfns
 | `src/imaging/` | Appearance-imaging system: NEEWER RGB62 light + Logitech C920n camera control, white/red/green/blue capture sequence, cropped-image comparison and depth-direction transmitted-light profiles (paper Figure 6) |
 | `detection/` | Object detection based on YOLOv8 — **kept separate for licensing reasons, see below** |
 | `cad/` | CAD design bank of 3D-printable experimental components (STL + editable Fusion 360 sources) |
-| `docs/` | Bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument |
+| `docs/` | Bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument, MaxArm commissioning notes |
 | `examples/zif8/` | Sample experimental flows of the ZIF-8 demonstration (JSON equivalents of the spreadsheet sequence) and monitoring CSV templates |
 | `examples/microscope/` | Example flow that photographs the product with the USB digital microscope (`capture_microscope`) |
+| `examples/maxarm/` | Example suction pick-and-place flow for the optional Hiwonder MaxArm (robot 4) |
 | `examples/dispensing_stability/` | Measured data of the 100-shot dispensing-repeatability test and the script that recorded it |
 
 ## Getting started

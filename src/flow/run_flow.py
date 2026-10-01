@@ -14,11 +14,17 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
         --robot2-dobot COM5 --robot2-picus2 COM6 \
         --scale-port COM8
 
+    # MaxArm（robot 4, config.yaml の type: maxarm）のポートは --robot4-maxarm
+    python -m src.flow.run_flow examples/maxarm/pick_and_place.json --mock
+
 処理の流れ:
     1. JSON を読み込み、Pydantic スキーマ（schema.py）で検証する
     2. loop_start / loop_end を展開してフラットなステップ列にする
     2.5 プリフライト: 絶対目標（move_xyz / rotate）を可動域バリデータで検査する。
-       違反があればデバイスを開く前に中止する（--validate-only でも同じ）。
+       可動域はロボットごと（robots.<id>.workspace があればそれ、無ければ共通の
+       workspace）。各アクションがそのロボットの種別（dobot / maxarm）で
+       実行できるかも検査する。違反があればデバイスを開く前に中止する
+       （--validate-only でも同じ）。
        相対移動（move_z / rotate_relative / move_radial）は開始姿勢に依存するため
        ここでは検査できず、--mock / 実機実行時に 1 手ごとに検査される
     3. 実行ごとのログフォルダを作る（logs/<日付>/<フロー名>_<時刻>/）
@@ -40,7 +46,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib import request as urlrequest
 from urllib.error import URLError
 
@@ -56,14 +62,22 @@ from src.devices.safety.validators import WorkspaceViolationError, default_works
 from src.flow.accuracy_logger import DispenseAccuracyLogger
 from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS
 from src.flow.experiment_logger import ExperimentLogger
-from src.flow.experiment_session import ExperimentSession
-from src.flow.schema import ExperimentWorkflow
+from src.flow.experiment_session import ExperimentSession, robot_type, validator_for_robot
+from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
 
 load_dotenv()
 logger = logging.getLogger("run_flow")
 
 PICUS2_ACTIONS = {"aspirate", "dispense", "blow_out"}
 LOOP_ACTIONS = {"loop_start", "loop_end"}
+#: ロボット種別ごとに実行できるロボットアクション（共有デバイス・ループは対象外）。
+#: preflight_capabilities が実行前に、executor が実行時（SUPPORTED_ACTIONS）に検査する。
+ROBOT_ACTIONS_BY_TYPE = {
+    "dobot": frozenset({"move_xyz", "move_z", "move_radial", "rotate", "rotate_relative",
+                        "go_home", "move_slider", "move_conveyer", "wait",
+                        "aspirate", "dispense", "blow_out"}),
+    "maxarm": frozenset({"move_xyz", "move_z", "go_home", "suction", "wait"}),
+}
 # 開始姿勢に依存し、実行前には目標位置が決まらない相対移動
 RELATIVE_MOVE_ACTIONS = {"move_z", "rotate_relative", "move_radial"}
 LOGS_DIR = os.path.join(_REPO_ROOT, "logs")
@@ -228,13 +242,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="スキーマ検証・ループ展開・絶対目標（move_xyz / rotate）の可動域チェックのみ行い、"
                         "デバイスを開かずに終了する。相対移動は --mock / 実行時に 1 手ごとに検査される")
     # ポートは None を既定にして、環境変数 → config.yaml の順で解決する
-    for rid in (1, 2, 3):
+    for rid in range(1, MAX_ROBOT_ID + 1):
         p.add_argument(f"--robot{rid}-dobot", default=None,
                        help=f"Robot {rid} の Dobot ポート"
                             f"（既定: 環境変数 ROBOT{rid}_DOBOT_PORT / config.yaml）")
         p.add_argument(f"--robot{rid}-picus2", default=None,
                        help=f"Robot {rid} の Picus2 ポート。空なら Picus2 なし"
                             f"（既定: ROBOT{rid}_PICUS2_PORT / config.yaml）")
+        p.add_argument(f"--robot{rid}-maxarm", default=None,
+                       help=f"Robot {rid} が MaxArm（config.yaml の type: maxarm）の場合のポート"
+                            f"（既定: ROBOT{rid}_MAXARM_PORT / config.yaml）")
     p.add_argument("--scale-port", default=None,
                    help="電子天秤のポート（既定: SCALE_PORT / config.yaml）")
     p.add_argument("--camera-index", type=int, default=None,
@@ -257,20 +274,30 @@ def build_parser() -> argparse.ArgumentParser:
 def resolve_ports(args) -> Tuple[dict, dict]:
     """接続設定を「引数 > 環境変数 > config.yaml」の優先順で解決する。
 
+    ロボットの種別（``type``）・ロボット別の ``workspace``・ドライバオプションは
+    config.yaml の値をそのまま保つ（上書きできるのはポートだけ）。
+
     Returns:
         (robot_ports, shared_config)
     """
     robot_ports = lab_config.get_robot_ports()
     shared_config = lab_config.get_shared_devices()
 
-    for rid in (1, 2, 3):
+    for rid in range(1, MAX_ROBOT_ID + 1):
         ports = dict(robot_ports.get(rid, {}))
-        dobot = getattr(args, f"robot{rid}_dobot") or os.getenv(f"ROBOT{rid}_DOBOT_PORT")
-        picus2 = getattr(args, f"robot{rid}_picus2") or os.getenv(f"ROBOT{rid}_PICUS2_PORT")
+        ports.setdefault("type", lab_config.DEFAULT_ROBOT_TYPE)
+        dobot = getattr(args, f"robot{rid}_dobot", None) or os.getenv(f"ROBOT{rid}_DOBOT_PORT")
+        picus2 = getattr(args, f"robot{rid}_picus2", None) or os.getenv(f"ROBOT{rid}_PICUS2_PORT")
+        maxarm = getattr(args, f"robot{rid}_maxarm", None) or os.getenv(f"ROBOT{rid}_MAXARM_PORT")
         if dobot:
             ports["dobot_port"] = dobot
         if picus2:
             ports["picus2_address"] = picus2
+        if maxarm:
+            if ports["type"] != "maxarm":
+                logger.warning(f"Robot {rid} は type={ports['type']} のため MaxArm ポート "
+                               f"{maxarm} は使われません（config.yaml の robots.{rid}.type を確認）")
+            ports["maxarm_port"] = maxarm
         robot_ports[rid] = ports
 
     scale = args.scale_port or os.getenv("SCALE_PORT")
@@ -311,14 +338,24 @@ def load_and_validate(path: str) -> Tuple[ExperimentWorkflow, list]:
 
 @dataclass
 class PreflightReport:
-    """実行前の可動域チェックの結果（ステップ番号はループ展開後の 1 始まり）"""
+    """実行前の可動域・対応アクションチェックの結果（ステップ番号はループ展開後の 1 始まり）
+
+    Attributes:
+        capability_errors: ロボット種別が対応しないアクションなど（1 件 1 文）
+        validators_by_robot: run_preflight が使ったロボットごとのバリデータ。
+            ExperimentSession(robot_validators=...) に渡して実行時も同じ可動域を使う
+        robot_types: フローが使うロボットの robot_id → 種別
+    """
     checked: int = 0
     violations: List[Tuple[int, dict, Exception]] = field(default_factory=list)
     unverified: List[Tuple[int, dict]] = field(default_factory=list)
+    capability_errors: List[str] = field(default_factory=list)
+    validators_by_robot: Dict[int, object] = field(default_factory=dict)
+    robot_types: Dict[int, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
-        return not self.violations
+        return not self.violations and not self.capability_errors
 
 
 def _step_label(index: int, step: dict) -> str:
@@ -327,8 +364,12 @@ def _step_label(index: int, step: dict) -> str:
     return f"ステップ {index}" + (f"（ループ {it} 回目）" if it else "") + f" Robot {rid} {step.get('action')}"
 
 
-def preflight_workspace(steps: list, validator=None) -> PreflightReport:
+def preflight_workspace(steps: list, validator=None,
+                        validators_by_robot: Optional[dict] = None) -> PreflightReport:
     """展開後のステップの絶対目標を、デバイスを開かずに可動域バリデータで検査する。
+
+    ``validators_by_robot`` に robot_id があるステップはそのバリデータで、
+    無いステップは ``validator``（共通の可動域）で検査する。
 
     - move_xyz: ``validate_xyz(x, y, z)``
     - rotate: ``validate_joint1(angle)``
@@ -340,16 +381,18 @@ def preflight_workspace(steps: list, validator=None) -> PreflightReport:
     """
     if validator is None:
         validator = default_workspace_validator()
+    validators_by_robot = validators_by_robot or {}
     report = PreflightReport()
     for i, step in enumerate(steps, 1):
         action = step.get("action")
+        v = validators_by_robot.get(step.get("robot_id", 1), validator)
         try:
             if action == "move_xyz":
                 report.checked += 1
-                validator.validate_xyz(step.get("x"), step.get("y"), step.get("z"))
+                v.validate_xyz(step.get("x"), step.get("y"), step.get("z"))
             elif action == "rotate":
                 report.checked += 1
-                validator.validate_joint1(step.get("angle"))
+                v.validate_joint1(step.get("angle"))
             elif action in RELATIVE_MOVE_ACTIONS:
                 report.unverified.append((i, step))
         except WorkspaceViolationError as e:
@@ -357,13 +400,70 @@ def preflight_workspace(steps: list, validator=None) -> PreflightReport:
     return report
 
 
+def _robot_ids_in(steps: list) -> list:
+    """ロボットアクション（共有デバイス・ループ以外）が使う robot_id"""
+    return sorted({s.get("robot_id", 1) for s in steps
+                   if s.get("action") not in SHARED_DEVICE_ACTIONS
+                   and s.get("action") not in LOOP_ACTIONS})
+
+
+def preflight_capabilities(steps: list, robot_types: dict) -> List[str]:
+    """各ロボットアクションが、そのロボットの種別で実行できるかを検査する。
+
+    例: MaxArm（type: maxarm）への aspirate、Dobot への suction、未知の種別。
+    デバイスは開かない。同じ (robot, action) の誤りはまとめて 1 件にする。
+
+    Args:
+        steps: ループ展開後のステップ dict のリスト
+        robot_types: robot_id → 種別（無い robot_id は "dobot"）
+
+    Returns:
+        エラー文のリスト（空なら OK）
+    """
+    errors = []
+    seen = {}
+    for i, step in enumerate(steps, 1):
+        action = step.get("action")
+        if action in SHARED_DEVICE_ACTIONS or action in LOOP_ACTIONS:
+            continue
+        rid = step.get("robot_id", 1)
+        rtype = (robot_types or {}).get(rid) or lab_config.DEFAULT_ROBOT_TYPE
+        allowed = ROBOT_ACTIONS_BY_TYPE.get(rtype)
+        if allowed is not None and action in allowed:
+            continue
+        seen.setdefault((rid, rtype, action), []).append(i)
+    for (rid, rtype, action), idx in seen.items():
+        shown = ", ".join(map(str, idx[:10])) + (" ..." if len(idx) > 10 else "")
+        allowed = ROBOT_ACTIONS_BY_TYPE.get(rtype)
+        if allowed is None:
+            errors.append(f"Robot {rid} の種別 {rtype!r} は未知です（config.yaml の "
+                          f"robots.{rid}.type は {', '.join(ROBOT_ACTIONS_BY_TYPE)} のいずれか）"
+                          f": ステップ {shown}")
+        else:
+            note = "（MaxArm にピペットはありません）" if (
+                rtype == "maxarm" and action in PICUS2_ACTIONS) else ""
+            errors.append(f"Robot {rid}（{rtype}）はアクション {action!r} に対応していません"
+                          f"{note}: ステップ {shown}（{len(idx)} 回）。"
+                          f"対応: {', '.join(sorted(allowed))}")
+    return errors
+
+
 def log_preflight(report: PreflightReport, validator, log=None) -> None:
     """プリフライト結果をログに出す（違反は ERROR、相対移動は INFO で要約）"""
     logger = log or globals()["logger"]
+    for msg in report.capability_errors:
+        logger.error(f"対応していないアクション: {msg}")
     for i, step, err in report.violations:
         logger.error(f"可動域違反 {_step_label(i, step)} {_fmt_params(step)}\n{err}")
     if report.violations:
-        logger.error(f"可動域の上下限（config.yaml の workspace）: {validator.get_limits()}")
+        violating = {step.get("robot_id", 1) for _, step, _ in report.violations}
+        own = {rid for rid, v in (report.validators_by_robot or {}).items()
+               if v is not validator and rid in violating}
+        if validator is not None and violating - own:
+            logger.error(f"可動域の上下限（config.yaml の workspace）: {validator.get_limits()}")
+        for rid in sorted(own):
+            logger.error(f"Robot {rid} の可動域の上下限（config.yaml の robots.{rid}.workspace）: "
+                         f"{report.validators_by_robot[rid].get_limits()}")
 
     if report.unverified:
         # ループ展開で同じステップが何度も出るので、同一内容ごとにまとめる
@@ -404,8 +504,15 @@ def _unverified_note(report: PreflightReport) -> str:
 
 def violation_message(report: PreflightReport) -> str:
     """違反を 1 件 1 行にまとめた、UI / 例外向けの短い文面"""
-    lines = [f"可動域チェックで {len(report.violations)} 件の違反があります。"
-             "デバイスを開かずに中止します:"]
+    lines = []
+    if report.capability_errors:
+        lines.append(f"ロボットが対応していないアクションが {len(report.capability_errors)} 件あります。"
+                     "デバイスを開かずに中止します:")
+        lines.extend(f"- {msg}" for msg in report.capability_errors)
+    if not report.violations:
+        return "\n".join(lines)
+    lines.append(f"可動域チェックで {len(report.violations)} 件の違反があります。"
+                 "デバイスを開かずに中止します:")
     for i, step, err in report.violations[:20]:
         lines.append(f"- {_step_label(i, step)} {_fmt_params(step)}: {err}")
     if len(report.violations) > 20:
@@ -413,8 +520,20 @@ def violation_message(report: PreflightReport) -> str:
     return "\n".join(lines)
 
 
-def run_preflight(steps: list, validator=None, log=None) -> PreflightReport:
-    """デバイスを開く前の可動域プリフライト（検査 + ログ出力）。
+def robot_types_from_ports(robot_ports: dict) -> Dict[int, str]:
+    """robot_id → 種別（``type`` が無ければ "dobot"）"""
+    return {int(rid): robot_type(ports) for rid, ports in (robot_ports or {}).items()}
+
+
+def build_robot_validators(robot_ids, validator, robot_ports: dict) -> Dict[int, object]:
+    """robot_id → 可動域バリデータ（専用の workspace が無いロボットは ``validator``）"""
+    return {rid: validator_for_robot(rid, validator, robot_ports) for rid in robot_ids}
+
+
+def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optional[dict] = None,
+                  validators_by_robot: Optional[dict] = None,
+                  robot_types: Optional[dict] = None) -> PreflightReport:
+    """デバイスを開く前のプリフライト（可動域 + 対応アクションの検査とログ出力）。
 
     run_flow.py・CSV ランナー（run_csv.py）・GUI（src/gui/runner.py）が共通で
     使う入口。呼び出し側は ``report.ok`` が False なら何も開かずに中止する
@@ -422,17 +541,64 @@ def run_preflight(steps: list, validator=None, log=None) -> PreflightReport:
 
     Args:
         steps: ループ展開後のステップ dict のリスト
-        validator: 可動域バリデータ（省略時は config.yaml の workspace）
+        validator: 共通の可動域バリデータ（省略時は config.yaml の workspace）
         log: 出力先ロガー（省略時は run_flow のロガー）
+        robot_ports: robot_id → ロボット設定（種別・ロボット別 workspace の出どころ）。
+            省略時は config.yaml
+        validators_by_robot: robot_id → バリデータ。省略時は robot_ports から作る
+            （robots.<id>.workspace を持つロボットだけ専用、他は ``validator``）。
+            渡した map に無い（または None の）使用ロボットは robot_ports から
+            :func:`validator_for_robot` で補う（共通のバリデータで黙って埋めない）。
+            MaxArm の項目が共通の（Dobot の）バリデータそのものなら ConfigError
+        robot_types: robot_id → 種別。省略時は robot_ports から作る
+
+    Returns:
+        PreflightReport。``validators_by_robot`` と ``robot_types`` には実際に
+        使った値が入る（ExperimentSession に渡して実行時も同じ可動域を使う）。
+
+    Raises:
+        lab_config.ConfigError: ロボットの可動域の設定が使えない場合、または
+            渡された ``validators_by_robot`` が MaxArm に共通のバリデータを割り当てている場合
     """
     log = log or logger
     if validator is None:
         validator = default_workspace_validator()
-    report = preflight_workspace(steps, validator)
+    robot_ids = _robot_ids_in(steps)
+    if validators_by_robot is None:
+        missing = list(robot_ids)
+    else:
+        missing = [rid for rid in robot_ids if validators_by_robot.get(rid) is None]
+    if robot_ports is None and (missing or robot_types is None):
+        robot_ports = lab_config.get_robot_ports()
+    # 渡された map に無いロボットも robot_ports から作る（MaxArm が共通の Dobot の
+    # 可動域で検査・実行されることのないように）
+    validators_by_robot = dict(validators_by_robot or {})
+    validators_by_robot.update(build_robot_validators(missing, validator, robot_ports))
+    if robot_types is None:
+        robot_types = robot_types_from_ports(robot_ports)
+    for rid in robot_ids:
+        if (robot_types.get(rid) == "maxarm" and validators_by_robot[rid] is validator):
+            raise lab_config.ConfigError(
+                f"Robot {rid} is a MaxArm, but the supplied validators_by_robot gives it the "
+                f"shared (Dobot) workspace validator. A MaxArm is checked only against its own "
+                f"robots.{rid}.workspace."
+            )
+    # 共通の可動域と異なるロボットだけ渡す（共通のみなら従来どおりの呼び出し）
+    own = {rid: v for rid, v in validators_by_robot.items() if v is not validator}
+    report = (preflight_workspace(steps, validator, validators_by_robot=own) if own
+              else preflight_workspace(steps, validator))
+    report.validators_by_robot = {rid: validators_by_robot[rid] for rid in robot_ids}
+    report.robot_types = {rid: robot_types.get(rid, lab_config.DEFAULT_ROBOT_TYPE)
+                          for rid in robot_ids}
+    report.capability_errors = preflight_capabilities(steps, robot_types)
     log_preflight(report, validator, log=log)
     if not report.ok:
-        log.error(f"可動域チェックで {len(report.violations)} 件の違反があります。"
-                  "デバイスを開かずに中止します（ステップと座標は上記）")
+        if report.capability_errors:
+            log.error(f"ロボットが対応していないアクションが {len(report.capability_errors)} 件"
+                      "あります。デバイスを開かずに中止します（上記）")
+        if report.violations:
+            log.error(f"可動域チェックで {len(report.violations)} 件の違反があります。"
+                      "デバイスを開かずに中止します（ステップと座標は上記）")
         return report
     checked_note = (f"絶対目標 {report.checked} 件すべて範囲内" if report.checked
                     else "絶対目標（move_xyz / rotate）なし")
@@ -440,9 +606,12 @@ def run_preflight(steps: list, validator=None, log=None) -> PreflightReport:
     return report
 
 
-def require_preflight(steps: list, validator=None, log=None) -> PreflightReport:
-    """:func:`run_preflight` を行い、違反があれば :class:`PreflightError` を送出する"""
-    report = run_preflight(steps, validator, log=log)
+def require_preflight(steps: list, validator=None, log=None, **kwargs) -> PreflightReport:
+    """:func:`run_preflight` を行い、違反があれば :class:`PreflightError` を送出する
+
+    ``kwargs`` は run_preflight の robot_ports / validators_by_robot / robot_types。
+    """
+    report = run_preflight(steps, validator, log=log, **kwargs)
     if not report.ok:
         raise PreflightError(report, violation_message(report))
     return report
@@ -476,9 +645,11 @@ def _fmt_params(step: dict) -> str:
 async def run(args) -> int:
     workflow, steps = load_and_validate(args.flow)
 
-    # プリフライト: どのデバイスも開く前に絶対目標を可動域チェックする
+    # プリフライト: どのデバイスも開く前に、絶対目標の可動域（ロボットごと）と
+    # 各アクションがそのロボットの種別で実行できるかを検査する
+    robot_ports, shared_config = resolve_ports(args)
     validator = default_workspace_validator()
-    report = run_preflight(steps, validator)
+    report = run_preflight(steps, validator, robot_ports=robot_ports)
     if not report.ok:
         return PREFLIGHT_EXIT_CODE
     unverified_note = _unverified_note(report)
@@ -494,7 +665,7 @@ async def run(args) -> int:
     (robot_ids, picus2_robots, needs_scale, needs_camera,
      needs_microscope, needs_microscope_serial) = plan_resources(steps)
     needs_shared = needs_scale or needs_camera or needs_microscope or needs_microscope_serial
-    robot_ports, shared_config = resolve_ports(args)
+    robot_types = report.robot_types
 
     # 実機実行では既定で録画する。Mock モードでは常に録画しない。
     record = (not args.mock) and (True if args.record is None else args.record)
@@ -505,7 +676,7 @@ async def run(args) -> int:
         workflow.name, workflow.description, args.flow, base_dir=LOGS_DIR,
         mode="mock" if args.mock else "real",
     )
-    exp_logger.record_resources(robot_ids, picus2_robots)
+    exp_logger.record_resources(robot_ids, picus2_robots, robot_types=robot_types)
     logger.info(f"実験ログ保存先: {exp_logger.dir}")
 
     accuracy_logger = DispenseAccuracyLogger(
@@ -513,7 +684,8 @@ async def run(args) -> int:
     )
     logger.info(f"分注精度CSV: {accuracy_logger.csv_path} (密度={args.liquid_density}g/mL)")
 
-    logger.info(f"使用ロボット: {robot_ids}")
+    logger.info(f"使用ロボット: {robot_ids}（種別: "
+                + ", ".join(f"{rid}={robot_types.get(rid, 'dobot')}" for rid in robot_ids) + "）")
     if picus2_robots:
         logger.info(f"ピペット使用: Robot {sorted(picus2_robots)}")
     if needs_shared:
@@ -551,6 +723,7 @@ async def run(args) -> int:
         robot_ports=robot_ports,
         shared_config=shared_config,
         workspace_validator=validator,
+        robot_validators=report.validators_by_robot,
     )
 
     async def body():

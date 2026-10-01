@@ -54,11 +54,16 @@ SYSTEM_PROMPT = """
 {"name": "名前", "description": "説明", "steps": [...]}
 
 ## ロボットID（robot_id）について
-- システムには3台のDobotロボットアームがあります
+- システムには3台のDobotロボットアームと、任意で1台のMaxArmがあります
   - Robot 1 (robot_id: 1): メインロボット。コンベアベルトもRobot 1が制御
   - Robot 2 (robot_id: 2): サブロボット
   - Robot 3 (robot_id: 3): スライダーレール上のロボット。ピペットなし
-- 各ステップに "robot_id": 1, 2, または 3 を指定します
+  - Robot 4 (robot_id: 4): 任意の Hiwonder MaxArm（吸着ノズルによるピック＆プレース用）。ピペットなし。
+    使えるアクションは move_xyz / move_z / go_home / suction / wait だけ
+    （rotate_relative, move_radial, aspirate, dispense, blow_out, move_slider, move_conveyer は使えない）。
+    座標は MaxArm 自身の座標系（mm、原点は台座の回転軸、アームはホームで -Y 方向を向く）で、
+    Dobot の座標とは別物。ユーザーが MaxArm / 吸着 / ピック＆プレースを指示したときだけ使う
+- 各ステップに "robot_id": 1, 2, 3, または 4 を指定します
 - 指定がない場合やデフォルトは robot_id: 1 です
 
 ## 利用可能なアクション
@@ -76,6 +81,9 @@ SYSTEM_PROMPT = """
 - aspirate: {"action": "aspirate", "robot_id": 1, "volume": 5.0, "speed": 5} (液体吸引。volume: 0.5-10.0 mL（実機ピペットの最小操作量 0.5 mL）, speed: 1-9)
 - dispense: {"action": "dispense", "robot_id": 1, "volume": 5.0, "speed": 5} (液体分注。volume: 0.5-10.0 mL（実機ピペットの最小操作量 0.5 mL）, speed: 1-9)
 - blow_out: {"action": "blow_out", "robot_id": 1, "go_home": true, "speed": 1, "delay_ms": 3000} (残液完全排出)
+
+### 吸着ノズル操作（MaxArm, Robot 4 専用）
+- suction: {"action": "suction", "robot_id": 4, "on": true} (on: true=吸着（ポンプ ON）, false=解放。Dobot（robot_id 1-3）には使えない)
 
 ### カメラ操作（Webcam）※共有デバイスのためrobot_id不要
 - capture_and_save: {"action": "capture_and_save", "file_path": "captured_images/image.jpg"}

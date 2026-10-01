@@ -13,6 +13,10 @@ from typing import Literal, Union, List, Optional
 PIPETTE_MIN_VOLUME_ML = 0.5
 #: ピペットの最大容量 (mL)。LabRobot.max_pipette_volume と同じ。
 PIPETTE_MAX_VOLUME_ML = 10.0
+#: robot_id の上限。1〜3 は Dobot Magician、4 は任意の Hiwonder MaxArm
+#: （config.yaml の robots.<id>.type で種別を決める）。ロボットが実際に
+#: そのアクションを実行できるかは run_flow.preflight_capabilities が検査する。
+MAX_ROBOT_ID = 4
 
 
 class _StrictModel(BaseModel):
@@ -47,8 +51,8 @@ class ActionMoveXYZ(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionMoveZ(_StrictModel):
@@ -67,8 +71,8 @@ class ActionMoveZ(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionRotate(_StrictModel):
@@ -87,8 +91,8 @@ class ActionRotate(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionRotateRelative(_StrictModel):
@@ -111,8 +115,8 @@ class ActionRotateRelative(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionMoveRadial(_StrictModel):
@@ -133,8 +137,8 @@ class ActionMoveRadial(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionGoHome(_StrictModel):
@@ -149,8 +153,8 @@ class ActionGoHome(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 # ==========================================
@@ -175,8 +179,8 @@ class ActionMoveSlider(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionMoveConveyer(_StrictModel):
@@ -209,8 +213,8 @@ class ActionMoveConveyer(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionWait(_StrictModel):
@@ -230,8 +234,8 @@ class ActionWait(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 # ==========================================
@@ -266,8 +270,8 @@ class ActionAspirate(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionDispense(_StrictModel):
@@ -298,8 +302,8 @@ class ActionDispense(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
     )
 
 class ActionBlowOut(_StrictModel):
@@ -332,8 +336,35 @@ class ActionBlowOut(_StrictModel):
     robot_id: int = Field(
         default=1,
         ge=1,
-        le=3,
-        description="操作対象のロボットID (1, 2, or 3)"
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)"
+    )
+
+# ==========================================
+# 1.55 個別のアクション定義 (MaxArm 吸着ノズル用)
+# ==========================================
+
+class ActionSuction(_StrictModel):
+    """
+    吸着ノズル（ポンプ）の ON / OFF
+    MaxArmRobot.suction(on) に対応
+
+    MaxArm（config.yaml の type: maxarm）専用。Dobot に指定すると
+    プリフライトで拒否される。
+    """
+    action: Literal["suction"] = Field(
+        ...,
+        description="アクション識別子: 吸着 ON/OFF"
+    )
+    on: bool = Field(
+        default=True,
+        description="True で吸着（ポンプ ON）、False で解放（バルブを開いて離す）"
+    )
+    robot_id: int = Field(
+        default=1,
+        ge=1,
+        le=MAX_ROBOT_ID,
+        description="操作対象のロボットID (1..4)。MaxArm の robot_id を指定する"
     )
 
 # ==========================================
@@ -558,6 +589,8 @@ LabRobotAction = Union[
     ActionAspirate,
     ActionDispense,
     ActionBlowOut,
+    # MaxArm（吸着ノズル）操作
+    ActionSuction,
     # カメラ操作
     ActionCaptureAndSave,
     # デジタル顕微鏡操作

@@ -113,6 +113,11 @@ ACTION_CONFIG = {
         "icon": "💨", "label": "排出", "category": "pipette",
         "defaults": {"go_home": True, "speed": 1, "delay_ms": 3000}
     },
+    # MaxArm（吸着ノズル）。追加時の robot_id は MaxArm のロボット（add_step）
+    "suction": {
+        "icon": "🧲", "label": "吸着 ON/OFF", "category": "maxarm",
+        "defaults": {"on": True}
+    },
     "capture_and_save": {
         "icon": "📷", "label": "撮影", "category": "sensor",
         "defaults": {"file_path": ""}
@@ -153,6 +158,7 @@ ROBOT_COLORS = {
     1: {"bg": "#e3f2fd", "border": "#1976d2", "label": "🔵", "name": "Robot 1"},
     2: {"bg": "#e8f5e9", "border": "#388e3c", "label": "🟢", "name": "Robot 2"},
     3: {"bg": "#fff3e0", "border": "#e65100", "label": "🟠", "name": "Robot 3 (Slider)"},
+    4: {"bg": "#f3e5f5", "border": "#7b1fa2", "label": "🟣", "name": "Robot 4 (MaxArm)"},
 }
 
 SHARED_COLOR = {"bg": "#f5f5f5", "border": "#9e9e9e"}
@@ -162,6 +168,7 @@ CATEGORIES = {
     "robot": ("🤖 ロボット", ["move_xyz", "move_z", "move_radial", "rotate_relative", "go_home"]),
     "peripheral": ("🔩 周辺機器", ["move_slider", "move_conveyer"]),
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
+    "maxarm": ("🧲 MaxArm", ["suction"]),
     "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
@@ -202,6 +209,19 @@ if "robot_configs" not in st.session_state or "shared_config" not in st.session_
     _device_defaults = flow_runner.default_device_settings()
     st.session_state.robot_configs = _device_defaults["robots"]
     st.session_state.shared_config = _device_defaults["shared"]
+else:
+    # 以前のバージョンで作られたセッション: 追加されたロボット（Robot 4 など）を補う。
+    # config.yaml でロボットの種別が変わった（Dobot ⇔ MaxArm）エントリは、古い種別の
+    # ポートを持ち越さないよう config.yaml の値で置き換え、そのウィジェットの状態も捨てる
+    # （捨てないと古い入力値がウィジェットに残り、置き換えた値を上書きする）
+    for _rid, _cfg in flow_runner.default_device_settings()["robots"].items():
+        _old = st.session_state.robot_configs.get(_rid)
+        if _old is None:
+            st.session_state.robot_configs[_rid] = _cfg
+        elif _old.get("type") != _cfg.get("type"):
+            st.session_state.robot_configs[_rid] = _cfg
+            for _suffix in ("_dp", "_picus2", "_pp", "_mp"):
+                st.session_state.pop(f"r{_rid}{_suffix}", None)
 
 # 実行モード: 既定は Mock。実機で動かすには実行パネルの「実機で実行する」を
 # このセッション内で毎回チェックし、さらに確認ダイアログで承認する必要がある。
@@ -245,8 +265,17 @@ def add_step(action_type):
         return
 
     if action_type not in SHARED_DEVICE_ACTIONS:
-        new_step["robot_id"] = 1
+        new_step["robot_id"] = _default_robot_for(action_type)
     st.session_state.workflow_data["steps"].append(new_step)
+
+
+def _default_robot_for(action_type):
+    """新しいブロックの robot_id。吸着は最初の MaxArm、それ以外は Robot 1"""
+    if action_type == "suction":
+        for rid, cfg in sorted(st.session_state.robot_configs.items()):
+            if cfg.get("type") == "maxarm":
+                return rid
+    return 1
 
 
 def remove_step(index):
@@ -557,7 +586,9 @@ def confirm_real_run_dialog():
                 f"**ステップ数**: {len(data.get('steps') or [])}（ループ展開前）")
     ports = flow_runner.settings_to_session_args(build_run_settings())[0]
     st.caption("接続ポート: " + ", ".join(
-        f"Robot {rid}: {cfg.get('dobot_port') or '-'}" for rid, cfg in ports.items()))
+        f"Robot {rid}: " + ((f"MaxArm {cfg.get('maxarm_port') or '-'}")
+                            if cfg.get("type") == "maxarm" else (cfg.get('dobot_port') or '-'))
+        for rid, cfg in ports.items()))
     c1, c2 = st.columns(2)
     if c1.button("実機で開始", type="primary", use_container_width=True, key="confirm_real_run"):
         st.session_state["_disarm_real_run"] = True
@@ -767,6 +798,8 @@ def get_param_summary(step):
         return f"{step.get('volume', 0)}mL 速度: {step.get('speed', 5)}"
     elif action == "blow_out":
         return f"速度: {step.get('speed', 1)} 遅延: {step.get('delay_ms', 0)}ms"
+    elif action == "suction":
+        return "吸着 ON" if step.get("on", True) else "吸着 OFF（解放）"
     elif action == "capture_and_save":
         path = step.get('file_path', '')
         return escape(path) if path else "(自動)"
@@ -904,6 +937,10 @@ def render_step_params(step, idx):
         _num(c2, "速度", step, idx, "speed", int, 1, min_value=1, max_value=9)
         _num(c3, "遅延(ms)", step, idx, "delay_ms", int, 3000,
              min_value=0, max_value=10000, step=100)
+
+    elif action == "suction":
+        _check(st, "吸着する（OFF で解放）", step, idx, "on", True)
+        st.caption("MaxArm（config.yaml の type: maxarm）専用")
 
     elif action in ("capture_and_save", "capture_microscope"):
         _text(st, "ファイルパス（空欄で実験フォルダに自動保存）", step, idx, "file_path")
@@ -1259,7 +1296,7 @@ def render_workflow_canvas():
             with col2:
                 render_step_card(step, idx, len(steps), step_error)
         else:
-            # Robot 3: 右側
+            # Robot 3 / Robot 4 (MaxArm): 右側
             col1, col2, col3 = st.columns(3)
             with col3:
                 render_step_card(step, idx, len(steps), step_error)
@@ -1287,10 +1324,20 @@ def render_settings_panel():
         )
         for robot_id in ROBOT_COLORS:
             color = ROBOT_COLORS[robot_id]
-            config = st.session_state.robot_configs[robot_id]
+            config = st.session_state.robot_configs.get(robot_id)
+            if config is None:
+                continue
             st.markdown(f"**{color['label']} {color['name']}**")
+            if config.get("type") == "maxarm":
+                # MaxArm: 吸着ノズルのみ（ピペットなし）。種別は config.yaml で決める
+                config["maxarm_port"] = st.text_input(
+                    "MaxArm Port", value=config.get("maxarm_port", ""),
+                    key=f"r{robot_id}_mp", disabled=running,
+                    help="Hiwonder MaxArm（CH340）のシリアルポート。"
+                         "空のままでは実機ランを開始できません")
+                continue
             config["dobot_port"] = st.text_input(
-                "Dobot Port", value=config["dobot_port"],
+                "Dobot Port", value=config.get("dobot_port", ""),
                 key=f"r{robot_id}_dp", disabled=running)
             config["use_picus2"] = st.checkbox(
                 "Picus2 あり", value=config.get("use_picus2", False),
@@ -1312,6 +1359,12 @@ def render_settings_panel():
         defaults = flow_runner.default_device_settings()
         st.session_state.robot_configs = defaults["robots"]
         st.session_state.shared_config = defaults["shared"]
+        # ウィジェットに残った入力値が戻した値を上書きしないよう、その状態も捨てる
+        for _rid in defaults["robots"]:
+            for _suffix in ("_dp", "_picus2", "_pp", "_mp"):
+                st.session_state.pop(f"r{_rid}{_suffix}", None)
+        for _key in ("scale_port", "camera_index"):
+            st.session_state.pop(_key, None)
         st.rerun()
 
     st.divider()

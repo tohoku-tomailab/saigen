@@ -13,7 +13,7 @@ Turns a natural-language description of an experiment into a JSON experimental f
 
 ## How it works
 
-`SYSTEM_PROMPT` in `llm_service.py` describes the robots (`robot_id` 1–3), every
+`SYSTEM_PROMPT` in `llm_service.py` describes the robots (`robot_id` 1–3 Dobot, 4 the optional MaxArm), every
 available action with its parameters and units, three worked examples, and the safety
 conventions (return home at the end of each loop and of the flow). The user text is
 appended and the model is asked for a single JSON object at temperature 0.

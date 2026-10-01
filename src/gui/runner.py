@@ -56,7 +56,7 @@ from src.flow.executor import SHARED_DEVICE_ACTIONS, execute_step, expand_loops
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, SafetyAbort
 from src.flow.run_flow import LOGS_DIR, PreflightError, plan_resources, require_preflight
-from src.flow.schema import ExperimentWorkflow
+from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
 
 logger = logging.getLogger("gui.runner")
 
@@ -64,8 +64,9 @@ __all__ = ["FlowRunner", "PreflightError", "SafetyAbort", "ProgressEvent",
            "validate_workflow", "format_validation_error", "check_is_safe",
            "_safety_gate"]
 
-#: Robots the sidebar offers. Robot 3 is the slider/conveyer arm.
-ROBOT_IDS = (1, 2, 3)
+#: Robots the sidebar offers. Robot 3 is the slider/conveyer arm; robot 4 is
+#: the optional Hiwonder MaxArm (``type: maxarm`` in config.yaml).
+ROBOT_IDS = tuple(range(1, MAX_ROBOT_ID + 1))
 
 
 # ======================================================================
@@ -244,13 +245,16 @@ def default_device_settings() -> dict:
     robots = {}
     for rid in ROBOT_IDS:
         rp = ports.get(rid, {})
-        picus2 = rp.get("picus2_address", "") or ""
+        rtype = rp.get("type") or lab_config.DEFAULT_ROBOT_TYPE
+        picus2 = (rp.get("picus2_address", "") or "") if rtype == "dobot" else ""
         robots[rid] = {
             "enabled": True,
-            "use_dobot": True,
+            "type": rtype,
+            "use_dobot": rtype == "dobot",
             "use_picus2": bool(picus2),
             "dobot_port": rp.get("dobot_port", "") or "",
             "picus2_port": picus2,
+            "maxarm_port": rp.get("maxarm_port", "") or "",
         }
     return {
         "robots": robots,
@@ -266,15 +270,44 @@ def default_device_settings() -> dict:
 def settings_to_session_args(settings: dict):
     """Convert the sidebar settings into ExperimentSession arguments.
 
+    The robot type, a robot's own ``workspace`` and its driver options (e.g. the
+    MaxArm's ``move_ms``) are not editable in the sidebar; they are taken from
+    ``config.yaml`` so the GUI checks and runs with the same limits as the CLI.
+    A ``type`` in ``settings`` that differs from ``config.yaml`` (stale session
+    state kept across a config change) is ignored with a warning, and so are that
+    entry's port fields: its ports belong to the old robot type, so the
+    connection settings come from ``config.yaml`` as well. Sidebar ports are
+    used only when the sidebar type matches the configured type.
+
     Returns:
         ``(robot_ports, shared_config)`` in the shape ExperimentSession expects.
     """
+    configured = lab_config.get_robot_ports()
     robot_ports = {}
     for rid, cfg in (settings.get("robots") or {}).items():
-        robot_ports[int(rid)] = {
-            "dobot_port": cfg.get("dobot_port", ""),
-            "picus2_address": cfg.get("picus2_port", "") if cfg.get("use_picus2", True) else "",
-        }
+        base = dict(configured.get(int(rid), {}))
+        # The type always comes from config.yaml: a stale sidebar value (session
+        # state kept across a config change) must not turn a MaxArm into a Dobot
+        # (or back) and so pick the wrong driver and the wrong workspace.
+        rtype = base.get("type") or lab_config.DEFAULT_ROBOT_TYPE
+        stale = bool(cfg.get("type")) and cfg.get("type") != rtype
+        if stale:
+            logger.warning(f"Robot {rid}: sidebar type {cfg.get('type')!r} and its ports "
+                           f"ignored; config.yaml says {rtype!r} (its ports are used)")
+        entry = {k: v for k, v in base.items()
+                 if k not in ("dobot_port", "picus2_address", "maxarm_port")}
+        entry["type"] = rtype
+        if rtype == "maxarm":
+            entry["maxarm_port"] = (base.get("maxarm_port", "") if stale
+                                    else cfg.get("maxarm_port", base.get("maxarm_port", "")))
+        elif stale:
+            entry["dobot_port"] = base.get("dobot_port", "")
+            entry["picus2_address"] = base.get("picus2_address", "") or ""
+        else:
+            entry["dobot_port"] = cfg.get("dobot_port", base.get("dobot_port", ""))
+            entry["picus2_address"] = (cfg.get("picus2_port", "")
+                                       if cfg.get("use_picus2", True) else "")
+        robot_ports[int(rid)] = entry
     shared = settings.get("shared") or {}
     shared_config = {
         "scale_port": shared.get("scale_port", ""),
@@ -346,7 +379,8 @@ class FlowRunner:
     Args:
         workflow_data: the flow as a dict (LLM output, preset or edited canvas).
         mock: True runs against MockLabRobot / MockSharedDevices.
-        robot_ports: robot id -> ``{"dobot_port", "picus2_address"}``.
+        robot_ports: robot id -> ``{"type", "dobot_port", "picus2_address"}`` or,
+            for a MaxArm, ``{"type": "maxarm", "maxarm_port", "workspace", ...}``.
             Defaults to ``config.yaml``.
         shared_config: ``{"scale_port", "camera_index"}``. Defaults to ``config.yaml``.
         on_event: called for every :class:`ProgressEvent` (from the run thread).
@@ -386,7 +420,8 @@ class FlowRunner:
         # targets are checked before any device is opened; a violation raises
         # PreflightError here, before a session or run folder exists.
         self.validator = default_workspace_validator()
-        self.preflight = require_preflight(self.steps, self.validator, log=logger)
+        self.preflight = require_preflight(self.steps, self.validator, log=logger,
+                                           robot_ports=robot_ports)
         self.recording = recording
 
         self.workflow_data = workflow_data
@@ -543,7 +578,8 @@ class FlowRunner:
             base_dir=self.logs_dir,
             mode="mock" if self.mock else "real",
         )
-        exp_logger.record_resources(robot_ids, picus2_robots)
+        exp_logger.record_resources(robot_ids, picus2_robots,
+                                    robot_types=self.preflight.robot_types)
         if self.recording is not None:
             exp_logger.record_recording(self.recording)
         self.log_dir = exp_logger.dir
@@ -578,6 +614,7 @@ class FlowRunner:
             robot_ports=self.robot_ports,
             shared_config=self.shared_config,
             workspace_validator=self.validator,
+            robot_validators=self.preflight.validators_by_robot,
         )
         with self._lock:
             self.session = session

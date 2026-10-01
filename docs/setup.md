@@ -17,6 +17,8 @@ See [`bom.md`](bom.md) for the full list. The minimum for the ZIF-8 demonstratio
 - 1 × USB webcam
 - 1 × USB digital microscope (Sanwa Supply 400-CAM106 or any UVC microscope) — optional,
   used by the `capture_microscope` step
+- 1 × Hiwonder MaxArm with suction nozzle — optional robot 4 for pick-and-place,
+  USB (see §9); not needed for the ZIF-8 demonstration
 - 3D-printed fixtures from `cad/` (pipette holders on the arm tips, flask holders,
   balance splash guard)
 
@@ -61,7 +63,7 @@ Edit `config.yaml`:
 
 | Section | Purpose |
 |---|---|
-| `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id` |
+| `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); a robot without `type` is a Dobot |
 | `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
@@ -76,7 +78,7 @@ Edit `.env`:
 | `LLM_MODE` | `gemini` (default) or `openai_compatible` |
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
-| `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT` | optional per-run override of the `config.yaml` robot ports |
+| `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT` | optional per-run override of the `config.yaml` robot ports |
 | `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT` | optional per-run override of the shared devices |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
@@ -255,6 +257,141 @@ python src/monitoring/dashboard/launch_sensor_dashboard.py
 opens the dashboard at `http://localhost:8000`, receives sensor data from Raspberry Pi
 agents over TCP and records CSV/video into `experiment_data/`. Installing the Pi agent
 and the network settings are described in `src/monitoring/README.md`.
+
+## 9. MaxArm (Hiwonder) robot (optional)
+
+Robot 4 can be a Hiwonder MaxArm: an ESP32 running MicroPython, three bus
+servos and a suction nozzle, for suction pick-and-place (no pipette). It
+accepts only `move_xyz`, `move_z`, `go_home`, `suction` and `wait`; the
+preflight rejects anything else on robot 4 before any device is opened.
+
+**USB and the reset hazard.** The arm connects over a CH340 USB serial adapter
+(115200 baud; Windows: *USB-SERIAL CH340* in Device Manager, Linux
+`/dev/ttyUSB*`). Toggling DTR/RTS on that port can reset the ESP32, and the
+factory program calls `go_home()` at every boot, so **a reset moves the arm**.
+The saigen driver opens the port with DTR/RTS held low and refuses to continue
+if it sees a boot banner. Do not open the port with other serial terminals or
+tools that toggle DTR/RTS while the arm is in a fixture.
+
+**Firmware.** The driver talks to a small command server (protocol
+`saigen-maxarm`) that replaces the factory `main.py`; it never moves the arm at
+boot and stops the servos when the PC goes silent (watchdog). Installing it is
+a **human** step, with the arm clear of everything:
+
+```bash
+python -m src.devices.maxarm.deploy_firmware --port COM11 --list
+python -m src.devices.maxarm.deploy_firmware --port COM11 --backup backups/maxarm   # keep this folder
+python -m src.devices.maxarm.deploy_firmware --port COM11 --check                   # build compatible?
+python -m src.devices.maxarm.deploy_firmware --port COM11 --backup backups/maxarm --install
+# then power-cycle the arm with the reach clear (or pass --reset knowingly)
+```
+
+`--check` confirms on the board, without moving anything, that Hiwonder's
+MicroPython build offers what the firmware needs (`--install` runs it first and
+refuses on a failure). Set `home_position` for the MaxArm: the pose the arm
+rests in after Hiwonder's factory homing (z ≈ 222 mm) is one its own inverse
+kinematics cannot command, so without a configured home `go_home` is refused.
+The MaxArm's validator includes that kinematics, and reports the highest
+reachable z at the target's (x, y) when it rejects a move. To find the
+coordinates of your vials and rests, jog the arm with
+`python -m src.devices.maxarm.teach` (human-run; every command moves the arm,
+`--mock` to practise) and `save NAME` each pose: they are written to
+`maxarm_positions.json` (gitignored) for pasting into flows.
+`--install` refuses unless a backup of the current `main.py` exists;
+`--restore backups/maxarm` puts the factory files back. AI agents must not run
+this tool (see `CLAUDE.md`, rule 1). Details, the wire protocol and the
+restore-to-factory notes are in [`src/devices/maxarm/README.md`](../src/devices/maxarm/README.md);
+the order of work that proved safe, the numbers measured on a real arm and the
+recovery steps are in [`maxarm-commissioning.md`](maxarm-commissioning.md).
+
+**Configuration.** Set the port in `config.yaml` (or `--robot4-maxarm COM11` /
+`ROBOT4_MAXARM_PORT`):
+
+```yaml
+robots:
+  4:
+    type: maxarm
+    maxarm_port: COM11
+    workspace:            # MaxArm frame, replaces the global limits for robot 4 only
+      x_min: -250.0
+      x_max: 250.0
+      y_min: -280.0
+      y_max: -60.0
+      z_min: 40.0
+      z_max: 225.0
+      r_min: 60.0         # horizontal radius hypot(x, y)
+      r_max: 260.0
+    move_ms: 1500         # duration of one move (100..30000 ms)
+    # home_position: [0.0, -160.0, 180.0]   # optional, see "Home" below
+```
+
+**The workspace is required and self-contained.** A robot with `type: maxarm`
+(at any robot id, not only 4) is checked only against its own
+`robots.<id>.workspace`; nothing is inherited from the global Dobot
+`workspace`, whose frame is different. `x_min`, `x_max`, `y_min`, `y_max`,
+`z_min` and `z_max` must all be set; `r_min` / `r_max` are optional. If the
+block is missing or incomplete, `--validate-only`, `--mock`, the GUI and a real
+run all stop with a `ConfigError` naming the robot id, before any device is
+opened. A key written without a value (`z_min:` in YAML, i.e. null) is an
+error too, never "no limit": this holds for every workspace key, for the
+MaxArm and for a Dobot's own `robots.<id>.workspace`.
+
+**Home.** Without `home_position`, the pose the arm is in when the session
+connects becomes its home (as for the Dobots). With `home_position` set, that
+configured point is kept as the home and must lie inside the workspace; if it
+does not, the session disconnects the arm and refuses to start. The session
+never sends a MaxArm home by itself after an error; `go_home` runs only as a
+flow step.
+
+With `maxarm_port` empty, a real run that uses robot 4 refuses to start with a
+message naming `--robot4-maxarm` / `ROBOT4_MAXARM_PORT`; flows that do not use
+robot 4 are not affected. Other keys under `robots.4` (for example
+`pose_settle_tolerance`, `move_tolerance_mm`, `watchdog_ms`) are passed to the
+driver as options.
+
+**Workspace calibration.** The example box is a conservative guess inside the
+arm's reach, not a measured cell. The frame is the arm's own: millimetres,
+origin on the base yaw axis, z = 0 at the base plane, the arm faces −y at home.
+To measure your cell: with the firmware installed and the arm clear, read the
+pose at each fixture (pick points, place points, the lowest safe height above
+the table) from the driver's `status()` (or, for calibration only, with torque
+off and the arm moved by hand); take the smallest box and radius range that
+contains them plus a margin, and set `robots.4.workspace` to it. Then
+`--validate-only` and `--mock` your flow before any real run. Only tighten the
+limits; a move the validator rejects is the safety layer doing its job.
+
+**Emergency stop and suction.** Ctrl+C (or Stop in the GUI) sends STOP: the
+servos halt where they are and the firmware latches the stop. The session does
+not send the MaxArm home after an error. When the run ends normally, the
+driver turns the pump off before disconnecting (`pump_off_on_cleanup`, default
+true). After an emergency stop, or when the last motion failed and the pose is
+unknown, it **keeps the suction on** so a held part is not dropped from
+wherever the arm stopped, and logs a warning: remove the part by hand and
+switch the pump off manually. Set `pump_off_after_estop: true` under
+`robots.<id>` if your lab prefers the pump to be switched off in that case too.
+The MaxArm moves open loop and has no hardware emergency stop: put a physical
+switch on its 12 V servo supply within reach.
+
+**Stop latch at connect.** If the firmware still holds a stop latch from a
+previous session, the driver clears it when it connects (as the Dobot driver
+re-arms on connect) and logs this as a warning with the arm's status; it never
+clears the latch while the arm reports that it is moving.
+
+**Relative moves.** `move_z` is relative to the last *commanded* target, not to
+the read-back pose, so small servo errors do not accumulate into the target.
+The read-back must agree with the target within `move_tolerance_mm` (a finite
+number greater than 0); tighten it if your task needs a closer match.
+
+**Watchdog.** The firmware stops the servos when it hears nothing from the PC
+for `watchdog_ms` (default 1000 ms), and the watchdog then disables itself
+until the next connect or stop-clear; the driver re-arms it after every clear
+and treats a reply reporting a disabled watchdog as a link fault (no further
+motion until a new connect). A heartbeat keeps the watchdog fed, so
+`watchdog_ms` must be at least 1000 × (2 × heartbeat period + reply timeout)
+(1000 ms with the defaults of 0.25 s and 0.5 s); a shorter value is refused at
+connect. Details are in [`src/devices/maxarm/README.md`](../src/devices/maxarm/README.md).
+
+The example flow is [`examples/maxarm/pick_and_place.json`](../examples/maxarm/pick_and_place.json).
 
 ## Troubleshooting
 

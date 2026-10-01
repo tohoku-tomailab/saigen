@@ -119,6 +119,30 @@ def test_mock_run_writes_all_artifacts(tmp_path, monkeypatch):
     assert os.path.join(run_dir, "images") in csv_text
 
 
+def test_mock_run_of_maxarm_example_records_robot_types(tmp_path, monkeypatch):
+    """examples/maxarm/pick_and_place.json が Mock で完走し、ロボット種別が残る"""
+    monkeypatch.delenv("MOCK_START_POSE", raising=False)
+    flow = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "examples", "maxarm", "pick_and_place.json")
+    code, run_dir = run_mock(flow, tmp_path, monkeypatch)
+    assert code == 0
+    meta = json.load(open(os.path.join(run_dir, "metadata.json"), encoding="utf-8"))
+    assert meta["status"] == "completed"
+    assert meta["robots_used"] == [4]
+    assert meta["robot_types"] == {"4": "maxarm"}
+    assert meta["picus2_robots"] == []
+
+
+def test_mock_run_of_dobot_flow_records_dobot_type(tmp_path, monkeypatch):
+    flow = tmp_path / "dobot.json"
+    flow.write_text(json.dumps({"name": "d", "steps": [
+        {"action": "wait", "robot_id": 1, "seconds": 0}]}), encoding="utf-8")
+    code, run_dir = run_mock(flow, tmp_path, monkeypatch)
+    assert code == 0
+    meta = json.load(open(os.path.join(run_dir, "metadata.json"), encoding="utf-8"))
+    assert meta["robot_types"] == {"1": "dobot"}
+
+
 # ----------------------------------------------------------------------
 # 可動域違反: Mock でも実機と同じ WorkspaceValidator で弾かれる
 # ----------------------------------------------------------------------

@@ -210,6 +210,17 @@ async def execute_robot_step(step, robots, logger=None):
     else:
         robot = robots
 
+    # ロボット種別ごとの対応アクション（MaxArm は SUPPORTED_ACTIONS を持つ）。
+    # プリフライト（run_flow.preflight_capabilities）でも検査するが、ライブラリ
+    # 経路でも未対応のアクションをドライバへ送らないよう、ここでも止める。
+    supported = getattr(robot, "SUPPORTED_ACTIONS", None)
+    if supported is not None and action not in supported:
+        rtype = getattr(robot, "ROBOT_TYPE", type(robot).__name__)
+        raise RuntimeError(
+            f"Robot {robot_id}（{rtype}）はアクション {action!r} に対応していません"
+            f"（対応: {', '.join(sorted(supported))}）"
+        )
+
     if action == "move_xyz":
         x = step.get("x") if isinstance(step, dict) else step.x
         y = step.get("y") if isinstance(step, dict) else step.y
@@ -258,6 +269,11 @@ async def execute_robot_step(step, robots, logger=None):
         speed = step.get("speed", 1) if isinstance(step, dict) else step.speed
         delay_ms = step.get("delay_ms", 3000) if isinstance(step, dict) else step.delay_ms
         await robot.blow_out(go_home, speed, delay_ms)
+
+    # ===== MaxArm（吸着ノズル）操作 =====
+    elif action == "suction":
+        on = step.get("on", True) if isinstance(step, dict) else step.on
+        await robot.suction(bool(on))
 
     # ===== スライダー・コンベア操作 =====
     elif action == "move_slider":

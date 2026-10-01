@@ -30,6 +30,7 @@ configuration and flow files, not in the driver code.
 | `src/flow/csv_runner/` | Spreadsheet-driven runner for the two-solution mixing experiment (`run_csv.py`). |
 | `src/devices/safety/` | `LabRobot` (real), `MockLabRobot` (no hardware), shared devices and the workspace validators. **All flows run through this layer.** |
 | `src/devices/{dobot,picus2,scale,ika,webcam}/` | Per-instrument drivers. |
+| `src/devices/maxarm/` | Hiwonder MaxArm (optional robot 4, `type: maxarm`): serial client, protocol and the MicroPython firmware with its human-run installer `deploy_firmware.py`. Wrapped by `MaxArmRobot` / `MockMaxArmRobot` in `src/devices/safety/`. |
 | `src/agent/` | LLM-based generation of flows from natural language, plus preset flows. |
 | `src/gui/` | Streamlit GUI. `src/voice/` voice input. |
 | `src/monitoring/` | Sensor dashboard (FastAPI) and Raspberry Pi agent; own `config.example.yaml`. |
@@ -37,7 +38,8 @@ configuration and flow files, not in the driver code.
 | `detection/` | YOLOv8 object detection. **AGPL-3.0**, isolated on purpose; never import it from `src/`. |
 | `examples/zif8/` | Example flows of the paper's ZIF-8 demonstration. |
 | `examples/microscope/` | Example flow using the USB digital microscope (`capture_microscope`). |
-| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument. |
+| `examples/maxarm/` | Suction pick-and-place flow for the MaxArm (robot 4). |
+| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument, MaxArm commissioning notes (`maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery). |
 | `tests/`, `src/monitoring/tests/`, `src/imaging/tests/` | Unit tests; none need hardware. |
 
 ## How to verify a change (no hardware needed)
@@ -66,7 +68,12 @@ never a silent fallback to the built-in defaults. The CI workflow in
 1. **Never start a real run on your own.** Anything without `--mock` (or
    without *Mock* in the GUI) moves a robot arm and dispenses liquid; this
    includes the homing tool `src/devices/dobot/home_dobot.py`, whose sweep is
-   decided by the firmware and cannot be checked by the validator. Run
+   decided by the firmware and cannot be checked by the validator, and the
+   MaxArm firmware installer `src/devices/maxarm/deploy_firmware.py`: installing
+   or restoring firmware, and any reset of the ESP32 (including opening its
+   serial port with DTR/RTS toggling), can make the factory program move the
+   arm, and the MaxArm jog/teach tool `src/devices/maxarm/teach.py` (every
+   command moves the arm; only `--mock` is safe). Run
    `--validate-only`, then `--mock`, and stop there. A real run happens only
    when the human explicitly asks for it in the current conversation, after the
    mock run succeeded, and it is the human who presses Enter. Ctrl+C is the
@@ -112,6 +119,18 @@ never a silent fallback to the built-in defaults. The CI workflow in
   natural language if an API key is configured.
 - *"The robot hit something / a move was rejected"*: see rule 2. Collect the
   coordinates from `logs/<date>/<flow>_<time>/run.log` and report.
+- *"Use the MaxArm"*: robot 4 in `config.example.yaml` is a `type: maxarm`
+  entry with an empty `maxarm_port` and a conservative example `workspace`
+  in the MaxArm's own frame. Ask the user for the port; start from
+  `examples/maxarm/pick_and_place.json`; `--validate-only`, then `--mock`.
+  The MaxArm accepts only `move_xyz`, `move_z`, `go_home`, `suction` and
+  `wait`, and the preflight rejects other actions on it. Its validator also
+  runs the arm's inverse kinematics (`src/devices/maxarm/kinematics.py`): a
+  target inside the box can still be unreachable (near the top of the
+  workspace the wrist angle drops below 0°), and the rejection names the
+  highest reachable z at that (x, y). Do not loosen that check; lower the
+  target. Set `home_position` to a reachable pose. Firmware backup and
+  installation (`docs/setup.md` §9) are the human's job.
 - *"Add a new instrument"*: follow `docs/adding-an-instrument.md` step by
   step: a driver package under `src/devices/`, a mock counterpart, registration
   with `SharedDevices` / `MockSharedDevices`, the flow schema and executor, the

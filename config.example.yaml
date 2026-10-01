@@ -23,6 +23,40 @@ robots:
     picus2_address: COM6
   3:
     dobot_port: COM7      # Robot 3 has no pipette
+  # Optional Hiwonder MaxArm (suction pick-and-place, no pipette); see the
+  # "MaxArm (Hiwonder) robot" section of docs/setup.md. Robots without a
+  # "type" are Dobot Magicians. Only robots a flow uses are opened, so this
+  # entry is harmless without the hardware; a real run that uses robot 4
+  # refuses to start until maxarm_port is set (or --robot4-maxarm /
+  # ROBOT4_MAXARM_PORT is given).
+  4:
+    type: maxarm
+    maxarm_port: ""       # e.g. COM11 on Windows, /dev/ttyUSB0 on Linux (CH340)
+    # The MaxArm's own frame (mm, origin on the base yaw axis, z = 0 base
+    # plane, the arm faces -y at home). This per-robot box replaces the
+    # global workspace keys below for robot 4 only. The values are a
+    # conservative starting box INSIDE the arm's reach, NOT a measured cell:
+    # measure your own and tighten them before any real run.
+    # r_min / r_max bound the horizontal radius hypot(x, y).
+    # Required for a MaxArm: x/y/z min and max (r_min / r_max optional).
+    # Nothing is inherited from the global Dobot box; a missing key or a
+    # key without a value (e.g. "z_min:") refuses to start (ConfigError).
+    workspace:
+      x_min: -250.0
+      x_max: 250.0
+      y_min: -280.0
+      y_max: -60.0
+      z_min: 40.0
+      z_max: 225.0
+      r_min: 60.0
+      r_max: 260.0
+    move_ms: 1500         # duration of one move_xyz (100..30000 ms)
+    # home_position: [0.0, -160.0, 180.0]   # recommended go_home target (MaxArm frame);
+    #   kept as configured (not replaced by the start pose) and must lie inside
+    #   the workspace above AND be reachable by the arm's own inverse kinematics,
+    #   or the session refuses to start. Without it the start pose becomes home,
+    #   and the pose the arm rests in after Hiwonder's factory homing (z ~ 222)
+    #   is one the arm cannot be commanded back to, so go_home would be refused.
 
 # Devices shared by all robots.
 shared_devices:
@@ -33,7 +67,8 @@ shared_devices:
   microscope_resolution: "3840x2160"   # capture size; 4K is the sharpest and fastest mode (0.4-2 MB per JPEG). Use "1280x720" to keep data small
 
 # Dobot workspace limits. WorkspaceValidator checks every move against
-# these BEFORE the robot is commanded, for all robots and in mock mode.
+# these BEFORE the robot is commanded, for all robots (except where a
+# robot has its own "workspace" above) and in mock mode.
 # The values below are the Dobot Magician specification envelope, NOT a
 # safety-tuned cell. The setup used for the paper ran with narrower limits
 # (z -130..110 mm, joint1 -48..110 deg). Measure your own cell (vials,

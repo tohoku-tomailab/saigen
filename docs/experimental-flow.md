@@ -26,10 +26,43 @@ and executed by [`src/flow/executor.py`](../src/flow/executor.py). Run
 | `description` | string | no | default `""` |
 | `steps` | array | yes | executed in order; each element is one of the actions below |
 
-Every step has an `action` field. Robot actions take `robot_id` (1–3, default 1);
+Every step has an `action` field. Robot actions take `robot_id` (1–4, default 1);
 shared-device actions (balance, camera) do not. Unknown fields (e.g. a misspelled
 `robotid`), out-of-range values and non-finite numbers (`NaN`, `Infinity`) are
 rejected at validation time.
+
+### Robot types
+
+Each robot in `config.yaml` has a `type`. Robots 1–3 are Dobot Magicians
+(`type: dobot`, the default when the entry has no `type`, so existing
+`config.yaml` files keep working). Robot 4 is an optional Hiwonder MaxArm
+(`type: maxarm`) with a suction nozzle and no pipette. The type decides which
+robot actions a robot accepts:
+
+| Type | Accepted robot actions |
+|---|---|
+| `dobot` | `move_xyz`, `move_z`, `move_radial`, `rotate`, `rotate_relative`, `go_home`, `move_slider`, `move_conveyer`, `wait`, `aspirate`, `dispense`, `blow_out` |
+| `maxarm` | `move_xyz`, `move_z`, `go_home`, `suction`, `wait` |
+
+The preflight rejects an action the robot's type does not accept (for example
+`aspirate` on the MaxArm, or `suction` on a Dobot) before any device is opened,
+exactly like a workspace violation (exit code 3 / `PreflightError`). The
+executor refuses the same actions at run time as a second line of defence.
+
+A robot can have its own `workspace` block under `robots.<id>` in
+`config.yaml`. For a Dobot it is merged over the global `workspace` for that
+robot only. A MaxArm (`type: maxarm`, at any robot id) **must** have one, and it
+is used on its own, never merged over the global Dobot box (the frames differ):
+`x_min` … `z_max` are all required, `r_min` / `r_max` (bounds on the horizontal
+radius `hypot(x, y)`) are optional. A missing or incomplete MaxArm block, or any
+workspace key left without a value (null), stops `--validate-only`, `--mock` and
+real runs with a configuration error naming the robot, before any device is
+opened. For the MaxArm the validator additionally runs the arm's own inverse
+kinematics on the PC (`src/devices/maxarm/kinematics.py`): a `move_xyz` target
+inside the box can still be unreachable (the wrist joint would leave 0..240°,
+which happens near the top of the workspace), and such a step is rejected at
+`--validate-only` with the highest reachable z at that (x, y). See
+`docs/setup.md` §9.
 
 ## Actions
 
@@ -58,6 +91,19 @@ Speed 1 is slowest, 9 fastest (about 1–11 mL/s for a 10 mL tip, from the manuf
 The lower bound of 0.5 mL is the real wrapper's minimum operating volume
 (`LabRobot.min_pipette_volume`); the schema enforces it so that a flow the mock
 accepts is not rejected on hardware.
+
+### Suction nozzle (Hiwonder MaxArm) — `robot_id` of a `maxarm` robot
+
+| `action` | Parameters | Description |
+|---|---|---|
+| `suction` | `on` (bool, default true) | `true` switches the pump on (the object is held); `false` releases it (the firmware opens the release valve for about 1 s, so wait before lifting). Only a robot with `type: maxarm` accepts it |
+
+MaxArm coordinates are in the arm's own frame (mm, origin on the base yaw axis,
+z = 0 at the base plane, the arm faces −y at home); `move_xyz` / `move_z` /
+`go_home` behave as on the Dobot. After an error the session stops the MaxArm
+where it is and does **not** send it home (it has no verified safe return path);
+the Dobots are still sent home as before. See
+[`examples/maxarm/pick_and_place.json`](../examples/maxarm/pick_and_place.json).
 
 ### Shared devices — no `robot_id`
 
@@ -89,9 +135,13 @@ Applied before any device moves:
 1. **Schema** — every step must match exactly one action model; types and ranges
    above are enforced by Pydantic.
 2. **Loop structure** — `loop_id`s must pair up and must not nest.
-3. **Workspace preflight** (`--validate-only` and before every run, no device
-   opened) — every absolute target (`move_xyz`, `rotate`) is checked against the
-   `workspace` section of `config.yaml`. Relative moves (`move_z`,
+3. **Workspace and capability preflight** (`--validate-only` and before every
+   run, no device opened) — every absolute target (`move_xyz`, `rotate`) is
+   checked against the robot's workspace (for a Dobot, `robots.<id>.workspace`
+   merged over the global `workspace` section of `config.yaml`, or the global
+   section alone when the robot has none; for a MaxArm, its own required
+   `robots.<id>.workspace` alone), and every robot action is checked against the
+   robot's type (see *Robot types*). Relative moves (`move_z`,
    `rotate_relative`, `move_radial`) depend on the start pose and are listed as
    "unverified until run"; rule 5 checks them. The same preflight
    (`run_flow.run_preflight` / `require_preflight`) guards all three runners: the
@@ -101,8 +151,8 @@ Applied before any device moves:
 4. **Pipette volume tracking** (run time, in the safety wrapper) — cumulative
    `aspirate` may not exceed 10 mL; `dispense` may not exceed the volume held.
 5. **Workspace limits** (run time, move by move) — `move_xyz` / `move_z` / `rotate*` targets are
-   checked against the XYZ box and joint-1 range in the `workspace` section of
-   `config.yaml`; a violation raises before the command is sent, aborting the run.
+   checked against the XYZ box and joint-1 range of the robot's workspace (as in
+   rule 3); a violation raises before the command is sent, aborting the run.
    The same check runs in `--mock` mode, so a flow can be screened for out-of-range
    moves without hardware.
 
@@ -125,7 +175,9 @@ Running a flow leaves a record of the run in
 `logs/<YYYY-MM-DD>/<flow name>_<timestamp>/`: `run.log`, `measurements.csv` (one row
 per step, with the weights read, the nominal pipette duration of each aspirate/dispense
 step from the Picus 2 timing table, and the photographs taken), `summary.md`,
-`metadata.json`, `images/` and a copy of the flow JSON. The execution mode
+`metadata.json`, `images/` and a copy of the flow JSON. `metadata.json` also
+records the type of every robot used (`robot_types`, e.g. `{"4": "maxarm"}`).
+The execution mode
 (`mock` / `real`) is recorded in `metadata.json` (`mode`), in a `mode` column of
 `measurements.csv` and in `summary.md`. Runs started within the same second get
 distinct folders (`_2`, `_3`, … suffix). When sensor recording is on, a run stops

@@ -1,0 +1,18 @@
+{
+  "name": "MaxArm pick and place",
+  "description": "Robot 4 (Hiwonder MaxArm) picks one object with the suction nozzle at (120, -180) and places it at (-120, -180). Coordinates are in the MaxArm's own frame (mm) and lie inside the example workspace box of config.example.yaml; measure your cell and adjust them before a real run.",
+  "steps": [
+    {"action": "go_home", "robot_id": 4},
+    {"action": "move_xyz", "robot_id": 4, "x": 120.0, "y": -180.0, "z": 150.0},
+    {"action": "move_z", "robot_id": 4, "distance": -80.0},
+    {"action": "suction", "robot_id": 4, "on": true},
+    {"action": "wait", "robot_id": 4, "seconds": 0.5},
+    {"action": "move_z", "robot_id": 4, "distance": 80.0},
+    {"action": "move_xyz", "robot_id": 4, "x": -120.0, "y": -180.0, "z": 150.0},
+    {"action": "move_z", "robot_id": 4, "distance": -80.0},
+    {"action": "suction", "robot_id": 4, "on": false},
+    {"action": "wait", "robot_id": 4, "seconds": 1.0},
+    {"action": "move_z", "robot_id": 4, "distance": 80.0},
+    {"action": "go_home", "robot_id": 4}
+  ]
+}

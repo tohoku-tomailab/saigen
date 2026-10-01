@@ -8,10 +8,16 @@
 生成はファクトリ経由で差し替えられる（``mock=True`` で Mock 実装に切り替え）。
 
 使用例:
-    session = ExperimentSession(mock=args.mock)
+    # プリフライトが作ったロボットごとの可動域（MaxArm は robots.<id>.workspace
+    # だけから作る）を実行時にもそのまま使う
+    report = require_preflight(steps, validator, robot_ports=robot_ports)
+    session = ExperimentSession(mock=args.mock, robot_ports=robot_ports,
+                                workspace_validator=validator,
+                                robot_validators=report.validators_by_robot)
 
     async def body():
         robot = await session.add_robot(1, use_picus2=True)
+        arm = await session.add_robot(4)          # type: maxarm（専用の可動域）
         shared = await session.add_shared(use_scale=True)
         ...実験手順...
         return results
@@ -45,9 +51,100 @@ class SafetyAbort(RuntimeError):
 
 logger = logging.getLogger(__name__)
 
+#: ロボット設定（config.yaml の robots.<id>）のうち、ドライバのオプションではない
+#: キー。それ以外（move_ms, pose_settle_tolerance など）は MaxArm の
+#: device_configs としてそのまま渡す。
+_ROBOT_CONFIG_KEYS = {"type", "dobot_port", "picus2_address", "maxarm_port", "workspace"}
+
+#: エラー時の自動ホーム復帰（go_home_all）をしないロボット種別。MaxArm は
+#: 検証済みの安全な復帰経路を持たないため、エラー後に自動では動かさない。
+NO_RECOVERY_HOME_TYPES = frozenset({"maxarm"})
+
+
+def robot_type(ports: Optional[dict]) -> str:
+    """ロボット設定の種別（``type`` が無ければ ``"dobot"``）"""
+    return (ports or {}).get("type") or lab_config.DEFAULT_ROBOT_TYPE
+
+
+def robot_options(ports: Optional[dict]) -> dict:
+    """ロボット設定からポート・種別・可動域を除いたドライバオプション"""
+    return {k: v for k, v in (ports or {}).items() if k not in _ROBOT_CONFIG_KEYS}
+
+
+def _flatten_limits(limits: dict) -> dict:
+    """``WorkspaceValidator.get_limits()`` の {"x": {"min", "max"}} を x_min 形式にする"""
+    flat = {}
+    for axis, bounds in (limits or {}).items():
+        if isinstance(bounds, dict):
+            for key in ("min", "max"):
+                if bounds.get(key) is not None:
+                    flat[f"{axis}_{key}"] = bounds[key]
+    return flat
+
+
+def validator_for_robot(robot_id, shared_validator=None, robot_ports: Optional[dict] = None):
+    """ロボットごとの可動域バリデータを返す
+
+    - MaxArm（``type: maxarm``）: 座標系が Dobot と異なるため、そのロボットの
+      ``robots.<id>.workspace`` **だけ**から作る（共通の可動域にはマージしない）。
+      x/y/z の min/max がすべて必要で、r_min / r_max は任意。欠けている・null の
+      値がある場合は ``lab_config.ConfigError``（robot_id を含む）。共通の
+      （Dobot の）バリデータに黙って戻ることはない。
+    - Dobot で ``robots.<id>.workspace`` を持つもの: 共通の可動域にそのロボットの
+      値を上書きしたバリデータ（``lab_config.get_robot_workspace`` と同じマージ）。
+    - それ以外（Dobot 1〜3 の通常の設定）: ``shared_validator`` をそのまま返す。
+
+    Args:
+        robot_id: ロボット ID
+        shared_validator: 共通の可動域バリデータ。省略時は config.yaml の workspace。
+            渡した場合は Dobot のマージの土台にする（呼び出し側が狭めた値を保つ）
+        robot_ports: robot_id → ロボット設定。省略時は config.yaml
+
+    Raises:
+        lab_config.ConfigError: 可動域の設定が使えない場合（デバイスを開く前に送出）
+    """
+    if robot_ports is None:
+        robot_ports = lab_config.get_robot_ports()
+    ports = robot_ports.get(robot_id) or robot_ports.get(str(robot_id)) or {}
+    # 設定 dict のマージと未知キーの警告を行う純関数（safety 層）。遅延 import
+    from src.devices.safety.validators import (
+        maxarm_workspace_validator_from_config,
+        workspace_validator_from_config,
+    )
+    if robot_type(ports) == "maxarm":
+        own = lab_config.maxarm_workspace(robot_id, ports)
+        try:
+            # 箱・半径＋実機の逆運動学（届かない目標は送信前に拒否）
+            return maxarm_workspace_validator_from_config(own)
+        except ValueError as e:
+            raise lab_config.ConfigError(
+                f"robots.{robot_id}.workspace（MaxArm）が不正です: {e}") from e
+    override = ports.get("workspace")
+    if not override:
+        return shared_validator if shared_validator is not None else default_workspace_validator()
+    if not isinstance(override, dict):
+        raise lab_config.ConfigError(
+            f"robots.{robot_id}.workspace must be a mapping, got {type(override).__name__}"
+        )
+    if shared_validator is not None:
+        base = _flatten_limits(shared_validator.get_limits())
+    else:
+        base = lab_config.get_workspace()
+    try:
+        return workspace_validator_from_config(base, dict(override))
+    except ValueError as e:
+        raise lab_config.ConfigError(f"robots.{robot_id}.workspace が不正です: {e}") from e
+
 
 def default_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
-    """実機 LabRobot を生成する既定ファクトリ"""
+    """実機ロボットを生成する既定ファクトリ（種別で LabRobot / MaxArmRobot を切り替え）"""
+    if robot_type(ports) == "maxarm":
+        from src.devices.safety.maxarm_robot import MaxArmRobot  # 遅延 import
+        return MaxArmRobot(
+            maxarm_port=ports["maxarm_port"],
+            workspace_validator=workspace_validator,
+            **robot_options(ports),
+        )
     return LabRobot(
         use_dobot=True,
         use_picus2=use_picus2,
@@ -85,6 +182,33 @@ def mock_start_pose(robot_id=None, shared_config: Optional[dict] = None):
     return parse_start_pose(value)
 
 
+def maxarm_mock_start_pose(robot_id, shared_config: Optional[dict] = None):
+    """MaxArm の Mock 開始姿勢 (x, y, z)。未設定なら None（= MaxArm の ORIGIN）
+
+    座標系が Dobot と異なるため、環境変数 ``MOCK_START_POSE``（Dobot 用の
+    単一値）は使わない。config.yaml の ``shared_devices.mock_start_pose`` が
+    robot_id をキーにした辞書で、このロボットの値があるときだけ使う。
+    値は "x,y,z" / "x,y,z,r" 文字列または 3〜4 要素のリスト（r は無視）。
+
+    Raises:
+        ValueError: 値を解釈できない場合
+    """
+    if os.environ.get("MOCK_START_POSE", "").strip():
+        logger.info(f"[MOCK] Robot {robot_id} は MaxArm のため MOCK_START_POSE を使いません"
+                    "（shared_devices.mock_start_pose の robot_id 別の値だけを使います）")
+    if shared_config is None:
+        try:
+            shared_config = lab_config.get_shared_devices()
+        except Exception as e:  # noqa: BLE001 - 設定が読めなければ既定の姿勢
+            logger.warning(f"mock_start_pose の設定を読めませんでした: {e}")
+            return None
+    value = (shared_config or {}).get("mock_start_pose")
+    if not isinstance(value, dict):
+        return None
+    from src.devices.safety.mock_maxarm import parse_maxarm_start_pose  # 遅延 import
+    return parse_maxarm_start_pose(value.get(robot_id, value.get(str(robot_id))))
+
+
 def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     """MockLabRobot を生成するファクトリ（実機なしでの動作確認用）
 
@@ -92,6 +216,16 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     実行前に検出されるため、フロー JSON の安全確認に使える。
     開始姿勢は mock_start_pose()（MOCK_START_POSE / config.yaml）から取る。
     """
+    if robot_type(ports) == "maxarm":
+        from src.devices.safety.mock_maxarm import MockMaxArmRobot  # 遅延 import
+        start_pose = maxarm_mock_start_pose(robot_id)
+        if start_pose is not None:
+            logger.info(f"[MOCK] Robot {robot_id}（MaxArm）の開始姿勢: {start_pose}")
+        return MockMaxArmRobot(
+            workspace_validator=workspace_validator,
+            start_pose=start_pose,
+            **robot_options(ports),
+        )
     start_pose = mock_start_pose(robot_id)
     if start_pose is not None:
         logger.info(f"[MOCK] Robot {robot_id} の開始姿勢: {start_pose}")
@@ -139,6 +273,10 @@ class ExperimentSession:
         robot_ports: robot_id → ポート設定。省略時は config.yaml
         shared_config: 共有デバイス設定。省略時は config.yaml
         workspace_validator: 可動域バリデータ。省略時は config.yaml の workspace
+        robot_validators: robot_id → そのロボット専用の可動域バリデータ。
+            含まれないロボットは :func:`validator_for_robot` で作る（MaxArm は
+            robots.<id>.workspace だけから、他は ``workspace_validator``）
+            （run_flow.run_preflight が返す ``report.validators_by_robot`` を渡す）
 
     Attributes:
         robots: robot_id → 初期化済みロボット（初期化に失敗したものは入らない）
@@ -156,6 +294,7 @@ class ExperimentSession:
         robot_ports: Optional[dict] = None,
         shared_config: Optional[dict] = None,
         workspace_validator=None,
+        robot_validators: Optional[dict] = None,
     ):
         self.mock = mock
         self.robot_factory = robot_factory or (
@@ -167,6 +306,8 @@ class ExperimentSession:
         self._robot_ports = robot_ports
         self._shared_config = shared_config
         self.workspace_validator = workspace_validator or default_workspace_validator()
+        self.robot_validators: Dict[int, object] = dict(robot_validators or {})
+        self._robot_types: Dict[int, str] = {}
 
         self.robots: Dict[int, object] = {}
         self.shared = None
@@ -186,6 +327,26 @@ class ExperimentSession:
             self._robot_ports = lab_config.get_robot_ports()
         return self._robot_ports
 
+    @property
+    def robot_types(self) -> Dict[int, str]:
+        """登録済みロボットの robot_id → 種別（"dobot" / "maxarm"）"""
+        return dict(self._robot_types)
+
+    def validator_for(self, robot_id: int):
+        """robot_id に使う可動域バリデータ
+
+        ``robot_validators`` に無ければ :func:`validator_for_robot` で作って記録する。
+        MaxArm は共通の（Dobot の）バリデータには決して戻らず、専用の可動域が
+        無ければ ``lab_config.ConfigError`` になる。
+
+        Raises:
+            lab_config.ConfigError: 可動域の設定が使えない場合
+        """
+        if robot_id not in self.robot_validators:
+            self.robot_validators[robot_id] = validator_for_robot(
+                robot_id, self.workspace_validator, self.robot_ports())
+        return self.robot_validators[robot_id]
+
     def shared_config(self) -> dict:
         if self._shared_config is None:
             self._shared_config = lab_config.get_shared_devices()
@@ -197,21 +358,45 @@ class ExperimentSession:
     async def add_robot(self, robot_id: int, *, use_picus2: bool = False):
         """設定のポートでロボットを生成・初期化して登録する
 
-        現在位置をホームとして設定する。初期化失敗時は例外を送出し、
-        ロボットは登録されない。
+        ホーム: 現在位置をホームとして設定する。ただし MaxArm で config.yaml に
+        ``home_position`` があるときはそれを保ち、可動域内か検査する（外なら
+        RuntimeError）。Dobot の挙動は従来どおり（常に現在位置）。
+
+        失敗時は例外を送出し、ロボットは登録されない。初期化中の中断、初期化が
+        False を返した場合、ホーム設定の失敗（中断・キャンセルを含む）では
+        ロボットを切断してから送出する（initialize() が例外を送出した場合の
+        切断は initialize() 自身が行う）。
+
+        Raises:
+            lab_config.ConfigError: 可動域の設定が使えない（デバイスは開かない）
+            RuntimeError: ポート未設定、初期化失敗、ホームが可動域外など
         """
         ports = self.robot_ports().get(robot_id)
-        if not self.mock and (not ports or not ports.get("dobot_port")):
+        rtype = robot_type(ports)
+        if rtype == "maxarm":
+            if not self.mock and not (ports or {}).get("maxarm_port"):
+                raise RuntimeError(
+                    f"Robot {robot_id}（MaxArm）の接続ポート maxarm_port が config.yaml の "
+                    f"robots セクションに設定されていません（--robot{robot_id}-maxarm / "
+                    f"ROBOT{robot_id}_MAXARM_PORT でも指定できます）"
+                )
+            if use_picus2:
+                logger.warning(f"Robot {robot_id} は MaxArm のためピペット（Picus2）は使えません。"
+                               "use_picus2 を無視します")
+                use_picus2 = False
+        elif not self.mock and (not ports or not ports.get("dobot_port")):
             raise RuntimeError(
                 f"Robot {robot_id} の接続ポートが config.yaml の robots セクションに"
                 f"定義されていません（--robot{robot_id}-dobot / "
                 f"ROBOT{robot_id}_DOBOT_PORT でも指定できます）"
             )
+        # 可動域の設定エラー（ConfigError）はデバイスを開く前に出す
+        validator = self.validator_for(robot_id)
         robot = self.robot_factory(
             robot_id,
             use_picus2=use_picus2,
             ports=ports or {},
-            workspace_validator=self.workspace_validator,
+            workspace_validator=validator,
         )
         # initialize() は失敗時に例外を送出する（戻り値の握りつぶし防止）
         try:
@@ -223,15 +408,51 @@ class ExperimentSession:
                 await self._cleanup_one(f"Robot {robot_id}", robot)
             raise
         if not ok:
+            await self._cleanup_one(f"Robot {robot_id}", robot)
             raise RuntimeError(f"Robot {robot_id} の初期化に失敗しました")
-        robot.set_current_position_as_home()
+        try:
+            self._set_home(robot_id, robot, rtype, ports or {})
+        except BaseException:
+            # 未登録なので session.cleanup() では切断されない（接続・ハートビートが
+            # 残る）。ここで切断してから再送出する（中断・キャンセルも同じ）
+            await self._cleanup_one(f"Robot {robot_id}", robot)
+            raise
         self.robots[robot_id] = robot
-        logger.info(
-            f"Robot {robot_id} 初期化完了 "
-            f"(dobot={(ports or {}).get('dobot_port') or '-'}, "
-            f"picus2={'有' if use_picus2 else '無'})"
-        )
+        self._robot_types[robot_id] = rtype
+        if rtype == "maxarm":
+            logger.info(
+                f"Robot {robot_id} 初期化完了 "
+                f"(MaxArm={(ports or {}).get('maxarm_port') or '-'})"
+            )
+        else:
+            logger.info(
+                f"Robot {robot_id} 初期化完了 "
+                f"(dobot={(ports or {}).get('dobot_port') or '-'}, "
+                f"picus2={'有' if use_picus2 else '無'})"
+            )
         return robot
+
+    @staticmethod
+    def _set_home(robot_id, robot, rtype: str, ports: dict) -> None:
+        """ホームを設定する（add_robot から。失敗時は例外）
+
+        MaxArm で ``home_position`` が設定されていればそれを保ち（現在位置で
+        上書きしない）、``home_is_within_limits()`` で検査する。それ以外は
+        現在位置をホームにする。
+        """
+        if rtype == "maxarm" and ports.get("home_position") is not None:
+            if getattr(robot, "home_position", None) is None:
+                raise RuntimeError(
+                    f"Robot {robot_id}（MaxArm）: 設定の home_position がロボットに渡っていません")
+            if not robot.home_is_within_limits():
+                raise RuntimeError(
+                    f"Robot {robot_id}（MaxArm）: 設定の home_position {list(robot.home_position)} が"
+                    f"可動域（robots.{robot_id}.workspace）の外です。home_position か可動域を"
+                    "確認してください")
+            logger.info(f"Robot {robot_id}（MaxArm）: 設定の home_position "
+                        f"{list(robot.home_position)} をホームにします")
+            return
+        robot.set_current_position_as_home()
 
     async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
                          use_microscope: bool = False, use_microscope_serial: bool = False):
@@ -287,6 +508,12 @@ class ExperimentSession:
             if stopped:
                 logger.warning(f"Robot {rid} は緊急停止済みのためホーム復帰しません")
                 continue
+            rtype = self._robot_types.get(rid) or getattr(robot, "ROBOT_TYPE", None)
+            if rtype in NO_RECOVERY_HOME_TYPES:
+                # 検証済みの安全な復帰経路が無い: エラー後に自動では動かさない
+                logger.warning(f"Robot {rid}（{rtype}）はエラー後の自動ホーム復帰を行いません"
+                               "（その場で停止しています）")
+                continue
             try:
                 logger.info(f"Robot {rid} をホームに戻しています...")
                 await robot.go_home()
@@ -331,7 +558,8 @@ class ExperimentSession:
           ホーム復帰はせず、そのまま再送出
         - 安全ゲートによる停止（SafetyAbort）: 全ロボットを緊急停止し、
           ホーム復帰はせずに status="aborted" で再送出
-        - その他の例外: 全ロボットをホームに戻して再送出。ホーム復帰中に
+        - その他の例外: 全ロボットをホームに戻して再送出（MaxArm など
+          NO_RECOVERY_HOME_TYPES の種別は自動では動かさない）。ホーム復帰中に
           中断（Ctrl+C / キャンセル）された場合は緊急停止してから再送出
         - いずれの場合もクリーンアップ（切断）は必ず実行する
 

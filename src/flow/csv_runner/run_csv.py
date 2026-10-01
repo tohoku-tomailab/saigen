@@ -418,11 +418,10 @@ async def run_two_solution_mixing(
     steps = expand_loops([s.model_dump() for s in workflow.steps])
     results = {"robot1_weight_g": None, "robot2_weight_g": None}
 
+    # Same preflight as run_flow (per-robot workspace + robot-type capabilities);
+    # raises PreflightError before the run folder or any device exists.
     validator = default_workspace_validator()
-    report = run_flow.preflight_workspace(steps, validator)
-    if not report.ok:
-        run_flow.log_preflight(report, validator, log=logger)
-        raise run_flow.PreflightError(report, run_flow.violation_message(report))
+    report = run_flow.require_preflight(steps, validator, log=logger, robot_ports=robot_ports)
 
     (robot_ids, picus2_robots, needs_scale, needs_camera,
      needs_microscope, needs_microscope_serial) = run_flow.plan_resources(steps)
@@ -431,7 +430,7 @@ async def run_two_solution_mixing(
         workflow.name, workflow.description, csv_path, base_dir=LOGS_DIR,
         mode="mock" if mock else "real",
     )
-    exp_logger.record_resources(robot_ids, picus2_robots)
+    exp_logger.record_resources(robot_ids, picus2_robots, robot_types=report.robot_types)
     logger.info(f"experiment log folder: {exp_logger.dir}")
     results["log_dir"] = exp_logger.dir
 
@@ -483,6 +482,7 @@ async def run_two_solution_mixing(
         robot_ports=robot_ports,
         shared_config=shared_config,
         workspace_validator=validator,
+        robot_validators=report.validators_by_robot,
     )
 
     async def body():
@@ -630,13 +630,13 @@ def main(argv=None) -> int:
     # Workspace preflight, same as run_flow: before any device is opened, and
     # with --validate-only too. Exit code 3 on a violation.
     steps = expand_loops([s.model_dump() for s in workflow.steps])
-    if not run_flow.run_preflight(steps, log=logger).ok:
+    robot_ports, shared_config = run_flow.resolve_ports(args)
+    if not run_flow.run_preflight(steps, log=logger, robot_ports=robot_ports).ok:
         return run_flow.PREFLIGHT_EXIT_CODE
     if args.validate_only:
         logger.info("validation only (--validate-only)")
         return 0
 
-    robot_ports, shared_config = run_flow.resolve_ports(args)
     record = (not args.mock) and (True if args.record is None else args.record)
 
     try:
