@@ -1,103 +1,110 @@
-# NF LI5640 ロックインアンプ（GPIB、読み取り専用）
+# NF LI5640 lock-in amplifier (GPIB, read-only)
 
-エヌエフ回路設計ブロックのマルチファンクション・デジタル・ロックインアンプ。
-SAIGEN は GPIB（IEEE 488.1、488.2 一部準拠）で PyVISA を通して読む。RS-232 には
-対応しない（LI5640 は GPIB と RS-232 を同時には使えない）。セットアップは
-`docs/setup.md` §11。コマンドは取扱説明書（英語版 DB509993-003）第 5 章で確認した
-（以下の 5-n は説明書のページ）。
+A multifunction digital lock-in amplifier by NF Corporation. SAIGEN reads it over GPIB
+(IEEE 488.1, partially 488.2) through PyVISA. RS-232 is not supported (the LI5640 cannot
+use GPIB and RS-232 at the same time). Setup is in `docs/setup.md` §11. The commands were
+checked against chapter 5 of the instruction manual (English edition DB509993-003); the
+"5-n" references below are manual pages.
 
-## 方針: 測定の設定は前面パネル、SAIGEN は読むだけ
+## Policy: measurement settings on the front panel, SAIGEN only reads
 
-感度・時定数・スロープ・参照信号・入力・フィルタ・ダイナミックリザーブ・
-DATA1 / DATA2 の表示・オフセット・拡大・正規化・レシオは前面パネルで設定する。
-SAIGEN がこれらを送ることはない。送る設定は読み出し項目の選択 `OTYP`（リモート
-専用、5-22, 5-32）だけで、接続時の値を覚えておき、切断時に戻して読み返す。
+Sensitivity, time constant, slope, reference signal, input, filters, dynamic reserve, the
+DATA1 / DATA2 display, offset, expand, normalise and ratio are all set on the front panel.
+SAIGEN never sends any of them. The only setting it writes is the read-out selection `OTYP`
+(remote only, 5-22, 5-32): the value is remembered on connect, restored on disconnect and
+read back.
 
-そのほかの副作用:
+Other side effects:
 
-- デバイスクリア（この機器宛ての SDC。入出力バッファを消す。設定は変わらない、5-77, 5-78）
-- `*CLS`（イベントレジスタとエラーキューを消す。戻さない、5-36）
-- GTL までの REMOTE 状態（前面パネルを操作できない、5-6）。GTL はこの機器宛てで、
-  バス全体の REN・IFC・DCL は使わない
+- Device clear (SDC addressed to this instrument; clears the I/O buffers, settings are
+  unchanged, 5-77, 5-78)
+- `*CLS` (clears the event registers and the error queue; not restored, 5-36)
+- REMOTE state until GTL (the front panel cannot be operated, 5-6). GTL is addressed to
+  this instrument; bus-wide REN, IFC and DCL are not used
 
-## 配線と設定
+## Wiring and settings
 
-- 前面 SHIFT+SPECIAL の `intFc` を `GPib` にする（5-3）
-- 前面 SHIFT+ADDRESS でアドレス（0〜30）を設定する（5-4）。同じバスのほかの機器と
-  重ならないこと（両方のパネルで確かめる）。送信ターミネータはどれでもよい
-  （ドライバは END で受信を終え、CR / LF を削る）
-- 連続データ出力（`OSTR 1`）は止めておく。動いていると他の問い合わせが通らない
-  （5-68 の -440）ので、接続時に `OSTR?` が 1 なら初期化を失敗にする（止める
-  コマンドは送らない）
+- Set `intFc` under SHIFT+SPECIAL on the front panel to `GPib` (5-3)
+- Set the address (0–30) under SHIFT+ADDRESS on the front panel (5-4). It must not clash
+  with other instruments on the same bus (check on both panels). Any transmit terminator
+  works (the driver ends reception on END and strips CR / LF)
+- Keep continuous data output (`OSTR 1`) off. While it is running, other queries do not get
+  through (-440, 5-68), so if `OSTR?` returns 1 on connect, initialisation fails (the stop
+  command is not sent)
 - `config.yaml`:
 
   ```yaml
   shared_devices:
-    lockin_resource: "GPIB0::<アドレス>::INSTR"
+    lockin_resource: "GPIB0::<address>::INSTR"
     lockin_timeout_ms: 5000
-    wait_after_lockin: 0.0     # 各 measure_lockin の後の待機（測定前の整定待ちではない）
+    wait_after_lockin: 0.0     # wait after each measure_lockin (not a settling wait before the measurement)
   ```
 
-## コマンド列
+## Command sequence
 
 ```
-接続:     デバイスクリア, *CLS, *IDN?（LI5640 を含むこと）, EROR?（0 まで、最大 21 回）,
-          OSTR?（0 であること）, OTYP?（覚える）
-各ステップ: OTYP 1,2,3,5 → EROR?        DOUT? が DATA1, DATA2, FREQ, OVERLEVEL を返す
-          設定スナップショット（問い合わせのみ）
-          DOUT?, WRCR? を samples 回（interval 秒おき）
-          設定スナップショット（もう一度）
-切断:     デバイスクリア → OTYP <覚えた値> → OTYP?（読み返し）→ GTL → close
-          （どれかが失敗しても次へ進む。中断要求は見ない）
+connect:    device clear, *CLS, *IDN? (must contain LI5640), EROR? (until 0, at most 21 times),
+            OSTR? (must be 0), OTYP? (remembered)
+each step:  OTYP 1,2,3,5 → EROR?        DOUT? then returns DATA1, DATA2, FREQ, OVERLEVEL
+            settings snapshot (queries only)
+            DOUT?, WRCR? samples times (waiting interval seconds between completed pairs)
+            settings snapshot (again)
+disconnect: device clear → OTYP <remembered value> → OTYP? (read back) → GTL → close
+            (continues to the next step if any of them fails; ignores interrupt requests)
 ```
 
-スナップショットで読む設定: `DDEF? 1/2`, `ISRC?`, `NORM?`, `VSTD?` / `ISTD?`,
+Settings read in the snapshot: `DDEF? 1/2`, `ISRC?`, `NORM?`, `VSTD?` / `ISTD?`,
 `RAT?`, `KFAC?`, `OFSO? 1/2`, `OFFS? 1/2`, `OEXP? 1/2`, `PHAS?`, `ICPL?`, `IGND?`,
 `VSEN?` / `ISEN?`, `TCON?`, `SLOP?`, `SYNC?`, `NOIS?`, `ILIN?`, `IFRQ?`, `ITHR?`,
-`DRSV?`, `RSRC?`, `REDG?`, `HARM?`, `OPCR?`, `OSTR?`。読めない・範囲外の応答は
-ステップの失敗。前後で違えば失敗（途中で変えて戻された場合は検出できない）。
-`OPCR` の 256 / 512（自動設定・自動感度の実行中）も失敗。
+`DRSV?`, `RSRC?`, `REDG?`, `HARM?`, `OPCR?`, `OSTR?`. An unreadable or out-of-range reply
+fails the step. A difference between the two snapshots fails the step (a setting changed and
+changed back in between cannot be detected). `OPCR` 256 / 512 (auto-setting or
+auto-sensitivity in progress) also fails.
 
-`FREQ?` は内部発振器の設定周波数で、測定周波数ではない（5-23）。測定周波数は
-`DOUT?` の FREQ（高調波測定では基本波）で読む。`DOUT?` と `WRCR?` は同時刻ではない。
+`FREQ?` is the set frequency of the internal oscillator, not the measured frequency (5-23).
+The measured frequency is read from the FREQ field of `DOUT?` (the fundamental in harmonic
+measurement). `DOUT?` and `WRCR?` are not taken at the same instant.
 
-## 値の意味（`describe()`）
+## Meaning of the values (`describe()`)
 
-DATA1 / DATA2 は**パネル表示の値**（5-70）。
+DATA1 / DATA2 are the **values shown on the panel** (5-70).
 
-| 条件 | DATA1 | DATA2 |
+| Condition | DATA1 | DATA2 |
 |---|---|---|
-| 通常 | X / R: V（入力 A, A−B）または A（I 入力）。AUX IN1: V | Y: V または A。θ: deg。AUX: V |
-| DATA1 = NOISE | V/√Hz または A/√Hz（4-35） | DDEF に関係なく AUX IN1、V（4-34） |
-| 正規化 dB / % | X / R が dB / %（4-32） | Y への効き方は説明書から読めないので種類 `Y[normalize?]`、単位なし |
-| レシオ表示 | X / R が比（単位なし、正規化より優先、4-33） | Y が比。θ・AUX はそのまま |
+| Normal | X / R: V (input A, A−B) or A (I input). AUX IN1: V | Y: V or A. θ: deg. AUX: V |
+| DATA1 = NOISE | V/√Hz or A/√Hz (4-35) | AUX IN1 regardless of DDEF, V (4-34) |
+| Normalization (dB / %) | X / R in dB / % (4-32) | the effect on Y cannot be determined from the manual, so the kind is `Y[normalize?]` with no unit |
+| Ratio display | X / R as a ratio (no unit, takes precedence over normalization, 4-33) | Y as a ratio. θ and AUX unchanged |
 
-オフセット・拡大は単位を変えないが、値は素の X / Y ではなくなる。設定は
-`lockin_settings` に残る。
+Offset and expand do not change the unit, but the value is no longer the raw X / Y. The
+settings are kept in `lockin_settings`.
 
-## 捨てるサンプル（保守的な方針）
+## Rejected samples (conservative policy)
 
-次のどれかがあればサンプル全体（AUX のチャネルも含む）を捨て、理由ごとに数える:
-OVERLEVEL の 1（入力）・2（中段）、表示中チャネルの 4 / 8（レシオ表示なら 16 / 32）、
-`WRCR` の 1（UNLOCK）・2（SIGNAL 参照で同期できない）、`DOUT?` の形が違う・
-非有限、`WRCR?` が 0〜3 の整数でない。オーバーレベル時の数値は説明書にないので、
-値（Keithley の 9.9E37 のような閾値）では判定しない。
+If any of the following occurs, the whole sample (including the AUX channels) is rejected
+and counted per reason: OVERLEVEL 1 (input) or 2 (intermediate stage), 4 / 8 for the
+displayed channel (16 / 32 in ratio display), `WRCR` 1 (UNLOCK) or 2 (cannot synchronise to
+the SIGNAL reference), a malformed or non-finite `DOUT?` reply, `WRCR?` not an integer in
+0–3. The manual does not say what the numeric value is during an overlevel, so no
+threshold on the value (like Keithley's 9.9E37) is used.
 
-中央値は有効サンプルで取る。θ は全点が幅 180° 未満の円弧に入るときだけ、その円弧の
-上で中央値を取る（±180° をまたいでも順序に依存しない）。入らなければ失敗。
+The median is taken over the valid samples. For θ the median is taken on the arc only when
+all points fall within an arc narrower than 180° (independent of order even across ±180°).
+Otherwise the step fails.
 
-## 整定
+## Settling
 
-SAIGEN は整定を待たない。パネルを変えたら、ステップの前に人が待つ（説明書
-表 4-3: 24 dB/oct で 99 % に約 10τ、99.9 % に約 13τ。NOISE は 24 dB/oct で
-約 170τ × 平滑化係数、4-34）。`interval` は読み取りの間隔で、整定待ちではない。
+SAIGEN does not wait for settling. After changing the front-panel settings, allow the
+instrument to settle before starting the step (manual Table 4-3: at 24 dB/oct, about 10τ to 99 % and about 13τ to 99.9 %. NOISE at
+24 dB/oct is about 170τ × smoothing factor, 4-34). `interval` is the spacing between
+readings, not a settling wait.
 
-## 使用例と接続確認
+## Usage and connection check
 
 ```python
 from src.devices.li5640 import LI5640, READ_OUTPUT_TYPE, describe
 
-lia = LI5640("GPIB0::<アドレス>::INSTR")
+lia = LI5640("GPIB0::<address>::INSTR")
 saved = None
 try:
     lia.clear_status()
@@ -107,14 +114,14 @@ try:
     snap = lia.snapshot()
     print(describe(snap), lia.read_sample())
 finally:
-    lia.release(saved)        # クリア・OTYP 復元・GTL・切断
+    lia.release(saved)        # clear, restore OTYP, GTL, disconnect
 ```
 
-実機で確かめたこと・未確認のこと（ファームウェア 1.60 の応答、レビューで見つかった
-不具合、残っている確認事項）は `docs/li5640-commissioning.md`。
+What was confirmed on the instrument and what was not (the replies of firmware 1.60, the
+defects found by review, the open points) are in `docs/li5640-commissioning.md`.
 
-接続確認（人が実行する。読むだけで、OTYP は戻す）:
+Connection check (run by a human; read-only, and OTYP is restored):
 
 ```bash
-python -m src.devices.li5640.li5640 GPIB0::<アドレス>::INSTR
+python -m src.devices.li5640.li5640 GPIB0::<address>::INSTR
 ```

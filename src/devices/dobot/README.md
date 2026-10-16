@@ -1,80 +1,89 @@
-# Dobotロボットアーム制御モジュール
+# Dobot robot-arm control module
 
-Dobot Magician を `pydobot` ライブラリ経由（シリアル通信）で制御するドライバです。
-各インスタンスが独立したシリアル接続を持つため、複数台の Dobot を同時に制御できます。
+Driver for the Dobot Magician through the `pydobot` library (serial communication). Each
+instance owns its own serial connection, so several Dobots can be controlled at the same
+time.
 
-## ファイル
+## Files
 
-- `home_dobot.py` — ホーミング CLI（`python -m src.devices.dobot.home_dobot --robot N`）
+- `home_dobot.py` — homing CLI (`python -m src.devices.dobot.home_dobot --robot N`)
 
-| ファイル | 役割 |
+| File | Role |
 |---|---|
-| `pydobot_controller.py` | `PyDobotController` — 本体 |
-| `pydobot_patch.py` | pydobot の通信部分を差し替えるパッチ（応答フレームの検証、完了待ちのタイムアウトと緊急停止での打ち切り） |
-| `dobot_config.py` | 速度プリセット・作業位置の定義（`DobotConfig`） |
+| `pydobot_controller.py` | `PyDobotController` — the driver itself |
+| `pydobot_patch.py` | Patch replacing pydobot's communication layer (reply-frame validation, timeout on completion waits, abort on emergency stop) |
+| `dobot_config.py` | Speed presets and working positions (`DobotConfig`) |
 
-## 使用例
+## Usage
 
 ```python
 from src.devices.dobot import PyDobotController
 
-# ポート名を指定して接続（Windows: 'COM12', Linux/macOS: '/dev/ttyUSB0' など）
+# Connect by port name (Windows: 'COM12', Linux/macOS: '/dev/ttyUSB0', etc.)
 robot = PyDobotController(port_name='COM12', homing=False)
 
-robot.move_XYZ_abs(200, 0, 100)   # 絶対座標へ移動
-robot.move_Z(-50)                 # Z 相対移動
-robot.move_XY(20, 30)             # XY 相対移動
-robot.move_angle(45)              # ベース（Joint1）角度
+robot.move_XYZ_abs(200, 0, 100)   # move to absolute coordinates
+robot.move_Z(-50)                 # relative Z move
+robot.move_XY(20, 30)             # relative XY move
+robot.move_angle(45)              # base (joint 1) angle
 print(robot.get_current_position())
 
 robot.disconnect()
 ```
 
-利用可能なシリアルポートの一覧:
+List the available serial ports:
 
 ```python
 PyDobotController.list_available_ports()
 ```
 
-## 主なメソッド
+## Main methods
 
-| メソッド | 説明 |
+| Method | Description |
 |---|---|
-| `move_XYZ_abs(x, y, z, r=None)` | 絶対座標へ移動 |
-| `move_Z(z_offset)` / `move_XY(dx, dy)` | 相対移動 |
-| `move_angle(angle)` | Joint1 の絶対角度 |
-| `move_to_initial_pos()` | 初期位置へ |
-| `pickup(...)` / `place(...)` | ピックアンドプレース |
-| `set_gripper(enabled, on)` / `set_suction_cup(enabled, on)` | エンドエフェクタ |
-| `set_speed_preset(name)` | `DobotConfig.SPEED_PRESETS` の速度に切替（直交・Joint の両方） |
-| `set_home_params(x, y, z, r)` | ホーム位置の記録 |
-| `home(x, y, z, r, timeout_s)` | ファームウェアのホーミング（SetHOMEParams / SetHOMECmd）。完了まで待ち、戻り先を省略すると開始位置に戻る |
-| `move_slider(pos)` | リニアレール（0–1000 mm） |
-| `move_conveyer(index, speed, time_seconds)` | コンベアベルト |
-| `get_current_position()` | `[x, y, z, r]` |
-| `force_stop()` | 緊急停止（キュー強制停止・破棄・コンベア停止）。完了待ち中のスレッドも解放する |
-| `disconnect()` | 切断 |
+| `move_XYZ_abs(x, y, z, r=None)` | Move to absolute coordinates |
+| `move_Z(z_offset)` / `move_XY(dx, dy)` | Relative moves |
+| `move_angle(angle)` | Absolute joint-1 angle |
+| `move_to_initial_pos()` | Go to the initial position |
+| `pickup(...)` / `place(...)` | Pick and place |
+| `set_gripper(enabled, on)` / `set_suction_cup(enabled, on)` | End effectors |
+| `set_speed_preset(name)` | Switch to a speed in `DobotConfig.SPEED_PRESETS` (both Cartesian and joint) |
+| `set_home_params(x, y, z, r)` | Record the home position |
+| `home(x, y, z, r, timeout_s)` | Firmware homing (SetHOMEParams / SetHOMECmd). Waits for completion; returns to the start position if no destination is given |
+| `move_slider(pos)` | Linear rail (0–1000 mm) |
+| `move_conveyer(index, speed, time_seconds)` | Conveyor belt |
+| `get_current_position()` | `[x, y, z, r, joint1, joint2, joint3, joint4]` |
+| `force_stop()` | Emergency stop (force-stop and clear the queue, stop the conveyor). Also releases any thread waiting for completion |
+| `disconnect()` | Disconnect |
 
-## 注意点
+## Notes
 
-- 自動運転の前に、手動で可動域と周囲の安全を確認してください。
-- `homing=True` を指定するとホーミング動作で腕が動きます。障害物がないことを確認してください。
-  通常は電源投入後に CLI で 1 台ずつ行います:
-  `python -m src.devices.dobot.home_dobot --robot 1`（`--mock` で手順だけ確認、
-  実機では Enter を押すまで動きません）。戻り先は config.yaml の workspace で事前検証されます。
-- 実験用の安全ラッパ（`src/devices/safety/lab_robot.py`）はこのクラスを内部で使い、
-  可動域チェックと待機時間を追加します。フロー実行時はラッパ経由で呼び出されます。
-- モーターから異音がした場合は直ちに `disconnect()` して物理的な干渉を確認してください。
-- 通信の扱い（`pydobot_patch.py`）: 応答はヘッダ `AA AA`・長さ・チェックサム・コマンド ID を
-  確認してから使い、送信前に受信バッファを捨てます。一致する応答が 2 秒以内に来なければ
-  `DobotReplyError`（`ConnectionError` の派生）。キュー付き移動の完了待ちは既定 60 秒で
-  `DobotWaitTimeout`（`PyDobotController(move_timeout_s=...)` で変更可。アームは止めないので
-  呼び出し側で `force_stop()` すること）。`force_stop()` の後は待機中の移動が
-  `DobotMoveAborted` で即座に戻ります。停止フラグは次の移動指示で下ります。
+- Before automatic operation, manually check the range of motion and confirm that the
+  surrounding area is clear.
+- With `homing=True` the arm moves during the homing motion. Make sure there are no
+  obstacles. Normally this is done one arm at a time with the CLI after power-on:
+  `python -m src.devices.dobot.home_dobot --robot 1` (`--mock` only walks through the
+  procedure; on the real arm nothing moves until you press Enter). The return position is
+  validated in advance against the workspace in config.yaml.
+- The experiment safety wrapper (`src/devices/safety/lab_robot.py`) uses this class
+  internally and adds range-of-motion checks and wait times. Flows call the arm through the
+  wrapper.
+- If a motor makes an unusual noise, call `force_stop()` immediately (`disconnect()` only
+  closes the connection and does not stop the arm). Confirm the arm has stopped before
+  disconnecting and checking for physical interference.
+- Communication handling (`pydobot_patch.py`): a reply is used only after its header
+  `AA AA`, length, checksum and command ID have been verified, and the receive buffer is
+  discarded before sending. If no matching reply arrives within 2 s, `DobotReplyError` (a
+  subclass of `ConnectionError`) is raised. Waiting for a queued move to complete times out
+  after 60 s by default with `DobotWaitTimeout` (change with
+  `PyDobotController(move_timeout_s=...)`; the arm is not stopped, so the caller must call
+  `force_stop()`). After `force_stop()`, a move being waited on returns immediately with
+  `DobotMoveAborted`. The stop flag is cleared by the next move command.
 
-## 依存関係
+## Dependencies
 
-- `pydobot`（Copyright 2017 Luis Mesas, MIT License。`pydobot_patch.py` はこのライブラリの `_send_command` / `_send_message` / `_read_message` / `_get_queued_cmd_current_index` / `__init__` を差し替える派生コードです。全文は `THIRD_PARTY_NOTICES.md` 参照）
+- `pydobot` (Copyright 2017 Luis Mesas, MIT License. `pydobot_patch.py` is derived code that replaces this library's `_send_command` / `_send_message` / `_read_message` / `_get_queued_cmd_current_index` / `__init__`. The full text is in `THIRD_PARTY_NOTICES.md`)
 - `pyserial`
 
-Dobot 純正 DLL（DobotDll）を用いる旧ドライバはライセンス上の理由で本リポジトリには含めていません。
+The older driver based on Dobot's own DLL (DobotDll) is not included in this repository
+for licensing reasons.

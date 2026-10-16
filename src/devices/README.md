@@ -25,8 +25,7 @@ wrapper decides *how*.
 | `li5640/` | NF LI5640 digital lock-in amplifier (optional, read-only: settings stay on the front panel) | GPIB (IEEE-488) through a VISA library, NF command set | `pyvisa` | `LI5640` |
 | `microscope/` | USB digital microscope for close-up photos (Sanwa Supply 400-CAM106 = Vitiny UM22 in the paper's cell) | UVC (image) + USB serial via CP210x (LED, focus motor, status) | `opencv-python`, `pyserial` | `MicroscopeController` (subclass of `WebcamController`), `UM22SerialController` |
 
-Each directory has its own README (in Japanese) with the command set and a usage
-example. Device addresses (COM port, Bluetooth MAC) are always passed in by the
+Each directory has its own README with the command set and a usage example. Device addresses (COM port, Bluetooth MAC) are always passed in by the
 caller; there are no hard-coded addresses.
 
 ## Safety wrapper (`safety/`)

@@ -1,85 +1,88 @@
-# IKA撹拌装置制御モジュール
+# IKA hot-plate stirrer control module
 
-このモジュールは実験自動化システムにおいてIKA RET Control-viscホットスターラーをシリアル通信で制御するためのクラスと関数を提供します。
+This module provides the classes and functions for controlling an IKA RET control-visc
+hot-plate stirrer over serial communication in the experiment-automation system.
 
-## 概要
+## Overview
 
-`ika_controller.py`はIKAホットスターラーを操作するためのインターフェースを提供します。主な機能には以下が含まれます：
+`ika_controller.py` provides the interface for operating the IKA hot-plate stirrer. Its
+main features are:
 
-- シリアル接続管理
-- 温度制御
-- 撹拌速度制御
-- 重量測定（RET control-visc のみ。下記の注意を参照）
-- データ記録とグラフ表示
+- Serial connection management
+- Temperature control
+- Stirring-speed control
+- Weighing (RET control-visc only; see the note below)
+- Data recording and plotting
 
-このモジュールを使用することで、実験の温度・撹拌を正確に制御し、リアルタイムでのモニタリングが可能になります。
+With this module the temperature and stirring of an experiment can be controlled
+precisely and monitored in real time.
 
-## 使用方法
+## Usage
 
-### 基本的な使用例
+### Basic example
 
 ```python
 from src.devices.ika.ika_controller import IKAController
 import time
 
-# IKAコントローラーの初期化（ポート名を指定）
+# Initialise the IKA controller (give the port name)
 device = IKAController(port='COM8')
 
-# デバイスのリセット（任意）
+# Reset the device (optional)
 device.reset_device()
 
-# 温度と撹拌速度を設定して撹拌開始（摂氏40度、速度100rpm）
+# Set the temperature and stirring speed and start stirring (40 °C, 100 rpm)
 device.start_stirring(40, 100)
 
-# 5分間撹拌
+# Stir for 5 minutes
 time.sleep(300)
 
-# 撹拌停止
+# Stop stirring
 device.stop_stirring()
 
-# 接続を閉じる
+# Close the connection
 device.close()
 ```
 
-### 温度制御とモニタリング
+### Temperature control and monitoring
 
 ```python
-# 温度40℃、撹拌速度100rpmで10分間動作（グラフ表示あり）
+# Run for 10 minutes at 40 °C and 100 rpm (with a live plot)
 temperatures, times = device.set_temperature(40, 100, 10)
 
-# 温度40℃、撹拌速度100rpmで10分間動作（グラフ表示なし）
+# Run for 10 minutes at 40 °C and 100 rpm (without a plot)
 device.stirring_at_temperature(40, 100, 10)
 ```
 
-### 重量測定
+### Weighing
 
 ```python
-# 重量を測定
+# Measure the weight
 weight = device.measure_weight()
-print(f"測定された重量: {weight}")
+print(f"Measured weight: {weight}")
 ```
 
-### 実験パラメータを使用した制御
+### Control with experiment parameters
 
 ```python
 from src.devices.ika.ika_controller import IKAController, run_temperature_experiment
 
-# IKAコントローラーの初期化
+# Initialise the IKA controller
 device = IKAController(port='COM17')
 
-# 実験パラメータの定義
+# Define the experiment parameters
 params = {
-    "temperature": 45,        # 設定温度（℃）
-    "stabilize_speed": 200,   # 安定化フェーズでの撹拌速度（rpm）
-    "stabilize_minute": 5,    # 安定化フェーズの時間（分）
-    "stirring_speed": 150,    # 撹拌フェーズでの撹拌速度（rpm）
-    "stirring_minute": 15     # 撹拌フェーズの時間（分）
+    "temperature": 45,        # set temperature (°C)
+    "stabilize_speed": 200,   # stirring speed during the stabilisation phase (rpm)
+    "stabilize_minute": 5,    # duration of the stabilisation phase (minutes)
+    "stirring_speed": 150,    # stirring speed during the stirring phase (rpm)
+    "stirring_minute": 15     # duration of the stirring phase (minutes)
 }
 
-# 実験の実行
+# Run the experiment
 temperatures, times = run_temperature_experiment(device, params)
 
-# データをPandasデータフレームに変換してCSVに保存
+# Convert the data to a pandas DataFrame and save it as CSV
 import pandas as pd
 data = pd.DataFrame({
     "Time (minutes)": times,
@@ -88,68 +91,70 @@ data = pd.DataFrame({
 data.to_csv("experiment_data.csv", index=False)
 ```
 
-## 主要機能
+## Main functions
 
-### 接続管理
+### Connection management
 
-- `__init__(port, baudrate, timeout)` - コントローラーの初期化とシリアル接続
-- `is_connected()` - 接続状態を確認する
-- `send_command(command)` - コマンドを送信する
-- `close()` - シリアルポートを閉じる
+- `__init__(port, baudrate, timeout)` - initialise the controller and open the serial connection
+- `is_connected()` - check the connection state
+- `send_command(command)` - send a command
+- `close()` - close the serial port
 
-### デバイス制御
+### Device control
 
-- `reset_device()` - デバイスをリセットする
-- `start_pc_mode(X)` - PCモードを開始する（X：モード番号）
-- `stop_pc_mode(X)` - PCモードを停止する（X：モード番号）
-- `read_data(X)` - 装置からデータを読み取る（X：読み取りモード番号）
+- `reset_device()` - reset the device
+- `start_pc_mode(X)` - start PC mode (X: mode number)
+- `stop_pc_mode(X)` - stop PC mode (X: mode number)
+- `read_data(X)` - read data from the device (X: read-mode number)
 
-### 撹拌と温度制御
+### Stirring and temperature control
 
-- `set_stirring_speed(speed)` - 撹拌速度を設定する
-- `start_stirring(temperature, speed)` - 温度と撹拌速度を設定して撹拌開始
-- `stop_stirring()` - 撹拌と温度制御を停止する
-- `set_temperature(temperature, speed, wait_minute)` - 温度と撹拌速度を設定し、指定時間動作させる（グラフ表示あり）
-- `stirring_at_temperature(temperature, speed, wait_minute)` - 温度と撹拌速度を設定し、指定時間動作させる（グラフ表示なし）
+- `set_stirring_speed(speed)` - set the stirring speed
+- `start_stirring(temperature, speed)` - set the temperature and stirring speed and start stirring
+- `stop_stirring()` - stop stirring and temperature control
+- `set_temperature(temperature, speed, wait_minute)` - set the temperature and stirring speed and run for the given time (with a live plot)
+- `stirring_at_temperature(temperature, speed, wait_minute)` - set the temperature and stirring speed and run for the given time (without a plot)
 
-### 重量測定
+### Weighing
 
-- `check_weight_function_ready()` - 重量測定機能の準備状況を確認する
-- `wait_for_weight_function_ready(max_wait_time, check_interval)` - 重量測定機能が準備できるまで待機する
-- `measure_weight()` - 装置の計量機能で重量を測定する
+- `check_weight_function_ready()` - check whether the weighing function is ready
+- `wait_for_weight_function_ready(max_wait_time, check_interval)` - wait until the weighing function is ready
+- `measure_weight()` - measure the weight with the device's built-in weighing function
 
-### 実験ユーティリティ
+### Experiment utilities
 
-- `run_temperature_experiment(device, params)` - 温度実験を実行する関数
+- `run_temperature_experiment(device, params)` - run a temperature experiment
 
-## IKAコマンド仕様
+## IKA command reference
 
-以下に主要なIKAコマンドを示します：
+The main IKA commands are:
 
-- `RESET` - デバイスをリセットする
-- `START_X` - PCモードXを開始する（X：モード番号）
-- `STOP_X` - PCモードXを停止する（X：モード番号）
-- `IN_PV_X` - モードXの現在値を読み取る（X：モード番号）
-- `OUT_SP_X Y` - モードXの設定値をYに設定する（X：モード番号、Y：設定値）
-- `STATUS_X` - モードXの状態を取得する（X：モード番号）
+- `RESET` - reset the device
+- `START_X` - start PC mode X (X: mode number)
+- `STOP_X` - stop PC mode X (X: mode number)
+- `IN_PV_X` - read the current value of mode X (X: mode number)
+- `OUT_SP_X Y` - set the setpoint of mode X to Y (X: mode number, Y: setpoint)
+- `STATUS_X` - get the status of mode X (X: mode number)
 
-### モード番号
+### Mode numbers
 
-- `2` - 温度制御モード
-- `4` - 撹拌速度制御モード
-- `90` - 重量測定モード
+- `2` - temperature control
+- `4` - stirring-speed control
+- `90` - weighing
 
-## データ記録とグラフ表示
+## Data recording and plotting
 
-`set_temperature()`メソッドは実験中の温度データをリアルタイムでグラフ表示し、実験終了後にデータを返します。このデータはCSVファイルに保存するなど、さらなる分析に利用できます。
+The `set_temperature()` method plots the temperature data live during the experiment and
+returns the data when it finishes. The data can be saved to a CSV file or used for further
+analysis.
 
 ```python
-# データをCSVに保存
+# Save the data to CSV
 import pandas as pd
 import os
 from datetime import datetime
 
-# 現在の日時をフォルダ名として使用
+# Use the current date and time as the folder name
 current_time = datetime.now().strftime("%Y%m%d_%H%M")
 folder_name = f"data_{current_time}"
 os.makedirs(folder_name, exist_ok=True)
@@ -163,31 +168,39 @@ file_name = "temperature_data.csv"
 data.to_csv(os.path.join(folder_name, file_name), index=False)
 ```
 
-## 注意点
+## Notes
 
-- **重量測定機能は実験フローでは使っていません。** RET control-visc 内蔵の計量機能は
-  計量範囲 10–5000 g、精度 ±(0.3 % + 2) g（IKA 公表値）で、数 g の分注量を評価するには
-  粗すぎます。質量測定はすべて電子天秤（`src/devices/scale/`）で行います。
-  `measure_weight()` 等は RET control-visc でしか動作せず、互換性のために残してあるだけです。
-  撹拌・温度制御のコマンド（`OUT_SP_2`, `OUT_SP_4`, `START_x`, `STOP_x`, `IN_PV_x`）は
-  IKA の NAMUR コマンド共通なので、RS-232/USB 付きの安価な機種（例: IKA Plate (RCT digital)）
-  でも使えるはずです。ただし RCT digital での動作確認はまだ行っていません。
-- シリアルポート名（COM8など）は環境によって異なります。デバイスマネージャーなどで確認してください。
-- 温度制御は外部環境の影響を受けるため、設定温度に到達するまでに時間がかかる場合があります。
-- 長時間の実験では、データのバックアップを定期的に行うことをお勧めします。
-- 撹拌速度は0〜1000rpmの範囲で設定可能ですが、液体の粘度や容器によって適切な値は異なります。
+- **The weighing function is not used in the experimental flows.** The weighing function
+  built into the RET control-visc has a range of 10–5000 g and an accuracy of
+  ±(0.3 % + 2) g (IKA's published figures), which is far too coarse for judging dispensed
+  amounts of a few grams. All mass measurements are made with the electronic balance
+  (`src/devices/scale/`). `measure_weight()` and related methods only work on the RET
+  control-visc and are kept for compatibility only. The stirring and temperature commands
+  (`OUT_SP_2`, `OUT_SP_4`, `START_x`, `STOP_x`, `IN_PV_x`) are IKA's common NAMUR commands,
+  so they should also work on cheaper models with RS-232/USB (e.g. the IKA Plate (RCT
+  digital)). Operation on the RCT digital has not been verified yet, however.
+- The serial port name (e.g. COM8) differs between machines. Check it in Device Manager or
+  the equivalent.
+- Temperature control is affected by the surroundings, so reaching the set temperature can
+  take some time.
+- For long experiments, back up the data regularly.
+- The stirring speed can be set from 0 to 1000 rpm, but the appropriate value depends on
+  the viscosity of the liquid and the vessel.
 
-## 依存関係
+## Dependencies
 
-- `serial` - シリアル通信
-- `time` - 時間制御
-- `matplotlib` - グラフ表示
-- `pandas` - データ処理（オプション）
-- `datetime` - 日時処理
-- `os` - ファイル操作
+- `serial` - serial communication
+- `time` - timing
+- `matplotlib` - plotting
+- `pandas` - data handling (optional)
+- `datetime` - date and time handling
+- `os` - file operations
 
-## トラブルシューティング
+## Troubleshooting
 
-- 接続エラーが発生した場合、正しいポート名を指定しているか、デバイスの電源が入っているかを確認してください。
-- グラフ表示に問題がある場合、`matplotlib.use("TkAgg")`を環境に合わせて変更してください（例：`Qt5Agg`）。
-- 温度が安定しない場合、周囲環境や使用する液体の量、容器の材質を確認してください。
+- On a connection error, check that the port name is correct and that the device is
+  switched on.
+- If plotting misbehaves, change `matplotlib.use("TkAgg")` to suit your environment
+  (e.g. `Qt5Agg`).
+- If the temperature does not stabilise, check the surroundings, the amount of liquid and
+  the material of the vessel.

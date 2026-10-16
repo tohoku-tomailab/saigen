@@ -20,11 +20,7 @@ workspace limits in `config.yaml` before a command is sent.
 | `client.py` | `MaxArmClient` (pyserial): connect without reset, transactions, heartbeat, STOP from any thread |
 | `deploy_firmware.py` | **Human-run** backup / install / restore tool (raw REPL) |
 
-> **警告 / WARNING — the arm can move when the board resets.**
-> 工場出荷の `main.py` は起動のたびに `arm.go_home()` を実行します。電源投入、USB の
-> DTR/RTS の変化（ESP32 の自動リセット回路）、Ctrl-D ソフトリセットのいずれでも
-> アームが原点へ動きます。SAIGEN ファームウェアは起動時にアームを動かしませんが、
-> インストール前・復元後は工場出荷のプログラムが動きます。
+> **WARNING — the arm can move when the board resets.**
 > Hiwonder's factory `main.py` calls `arm.go_home()` at every boot — power-on,
 > a DTR/RTS transition on the USB port (the ESP32 auto-reset circuit) or a Ctrl-D
 > soft reset. The SAIGEN firmware never moves the arm at boot, but before it is
