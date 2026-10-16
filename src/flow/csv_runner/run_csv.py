@@ -424,7 +424,7 @@ async def run_two_solution_mixing(
     report = run_flow.require_preflight(steps, validator, log=logger, robot_ports=robot_ports)
 
     (robot_ids, picus2_robots, needs_scale, needs_camera,
-     needs_microscope, needs_microscope_serial) = run_flow.plan_resources(steps)
+     needs_microscope, needs_microscope_serial, needs_dmm) = run_flow.plan_resources(steps)
 
     exp_logger = ExperimentLogger(
         workflow.name, workflow.description, csv_path, base_dir=LOGS_DIR,
@@ -488,10 +488,11 @@ async def run_two_solution_mixing(
     async def body():
         for rid in robot_ids:
             await session.add_robot(rid, use_picus2=(rid in picus2_robots))
-        if needs_scale or needs_camera or needs_microscope or needs_microscope_serial:
+        if needs_scale or needs_camera or needs_microscope or needs_microscope_serial or needs_dmm:
             await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
                                      use_microscope=needs_microscope,
-                                     use_microscope_serial=needs_microscope_serial)
+                                     use_microscope_serial=needs_microscope_serial,
+                                     use_dmm=needs_dmm)
 
         logger.info("=== two-solution mixing started ===")
         total = len(steps)

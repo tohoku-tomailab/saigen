@@ -170,14 +170,15 @@ def test_executor_guard_ignores_robots_without_supported_actions():
 # ----------------------------------------------------------------------
 # plan_resources / preflight
 # ----------------------------------------------------------------------
-def test_plan_resources_signature_unchanged():
+def test_plan_resources_signature():
+    # 7 values since the Keithley 2002 DMM (needs_dmm); every runner unpacks all of them
     result = run_flow.plan_resources([
         {"action": "suction", "robot_id": 4}, {"action": "aspirate", "robot_id": 1},
         {"action": "measure_weight"},
     ])
-    assert len(result) == 6
-    robot_ids, picus2, scale, camera, micro, micro_serial = result
-    assert robot_ids == [1, 4] and picus2 == {1} and scale and not camera
+    assert len(result) == 7
+    robot_ids, picus2, scale, camera, micro, micro_serial, dmm = result
+    assert robot_ids == [1, 4] and picus2 == {1} and scale and not camera and not dmm
 
 
 def test_preflight_capabilities():

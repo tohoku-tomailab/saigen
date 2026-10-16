@@ -8,8 +8,8 @@ L2層: 実験ログ管理クラス（ExperimentLogger）
         run.log          全ログ（コンソール出力と同じ内容をファイルにも保存）
         <入力ファイル>   実行に使った入力ファイルのコピー（JSON/CSV、元のファイル名を保持）
         metadata.json    実行メタデータ（開始/終了時刻・使用ロボット・結果ステータス等）
-        measurements.csv 各ステップの構造化記録（重量・画像パス・成否・所要時間）
-        summary.md       天秤の測定値と画像を時系列でひも付けた人間可読レポート
+        measurements.csv 各ステップの構造化記録（重量・DMM 測定値・画像パス・成否・所要時間）
+        summary.md       天秤・DMM の測定値と画像を時系列でひも付けた人間可読レポート
         images/          このワークフローで撮影した画像（自動でこのフォルダへ束ねる）
 
 実行モード（"mock" / "real"）は metadata.json の ``mode``、measurements.csv の
@@ -26,11 +26,19 @@ L2層: 実験ログ管理クラス（ExperimentLogger）
 import csv
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import time
 from datetime import datetime
+
+
+def _full_precision(value) -> str:
+    """DMM の値を丸めずに文字列化する（8.5 桁の分解能を CSV で失わない）"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return ""
+    return repr(float(value))
 
 
 #: 実行モードの表記（metadata / CSV / summary で共通）
@@ -177,7 +185,8 @@ class ExperimentLogger:
             iteration: ループ反復番号（ループ外は None）
             status: "ok" or "error"
             duration: 所要秒数
-            result: execute_step の戻り値（{"weight":..} / {"image_path":..} 等）
+            result: execute_step の戻り値（{"weight":..} / {"image_path":..} /
+                {"dmm_value":.., "dmm_unit":..} 等）
             error: 例外メッセージ（失敗時）
         """
         now = datetime.now()
@@ -188,6 +197,7 @@ class ExperimentLogger:
         nominal_time = result.get("nominal_time_s")
         focus_position = result.get("focus_position")
         focus_converged = result.get("focus_converged")
+        dmm_value = result.get("dmm_value")
         # 撮影ステップが「画像なし」で成功扱いになるのを防ぐ（executor も例外に
         # するが、戻り値だけを渡す呼び出し側があっても記録を誤らせない）
         if status == "ok" and "image_path" in result and not image_path:
@@ -210,6 +220,13 @@ class ExperimentLogger:
             "image_path": image_path or "",
             "focus_position": str(focus_position) if isinstance(focus_position, int) else "",
             "focus_converged": ("" if focus_converged is None else ("True" if focus_converged else "False")),
+            "dmm_value": _full_precision(dmm_value),
+            "dmm_unit": result.get("dmm_unit") or "",
+            "dmm_function": result.get("dmm_function") or "",
+            "dmm_range": _full_precision(result.get("dmm_range")),
+            "dmm_nplc": _full_precision(result.get("dmm_nplc")),
+            "dmm_valid_samples": (str(result["dmm_valid_samples"])
+                                  if isinstance(result.get("dmm_valid_samples"), int) else ""),
             "error": error or "",
         }
         self.records.append(record)
@@ -225,6 +242,13 @@ class ExperimentLogger:
             self.events.append({
                 "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
                 "kind": "image", "detail": image_path,
+                "step_index": index, "iteration": record["iteration"],
+            })
+        if record["dmm_value"]:
+            self.events.append({
+                "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
+                "kind": "dmm",
+                "detail": f"{record['dmm_value']} {record['dmm_unit']} ({record['dmm_function']})",
                 "step_index": index, "iteration": record["iteration"],
             })
 
@@ -264,7 +288,8 @@ class ExperimentLogger:
         fields = ["timestamp", "mode", "elapsed_s", "step_index", "total_steps",
                   "iteration", "action", "robot_id", "status", "duration_s",
                   "weight_g", "nominal_time_s", "image_path", "focus_position",
-                  "focus_converged", "error"]
+                  "focus_converged", "dmm_value", "dmm_unit", "dmm_function",
+                  "dmm_range", "dmm_nplc", "dmm_valid_samples", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -274,6 +299,7 @@ class ExperimentLogger:
     def _write_metadata(self):
         weights = [r for r in self.records if r["weight_g"] != ""]
         images = [r for r in self.records if r["image_path"] != ""]
+        dmm_readings = [r for r in self.records if r["dmm_value"] != ""]
         meta = {
             "name": self.name,
             "description": self.description,
@@ -293,6 +319,7 @@ class ExperimentLogger:
             # JSON のキーは文字列になる: {"4": "maxarm"}
             "robot_types": {str(rid): t for rid, t in sorted(self.robot_types.items())},
             "weight_measurements": len(weights),
+            "dmm_measurements": len(dmm_readings),
             "images_captured": len(images),
             "sensor_recording": self.recording,
             "output_files": {
@@ -312,6 +339,7 @@ class ExperimentLogger:
                             self.status, self.status)
         weights = [e for e in self.events if e["kind"] == "weight"]
         images = [e for e in self.events if e["kind"] == "image"]
+        dmm_events = [e for e in self.events if e["kind"] == "dmm"]
 
         lines = []
         lines.append(f"# 実験レポート: {self.name}")
@@ -335,7 +363,8 @@ class ExperimentLogger:
             if self.robot_types:
                 lines.append("- **ロボット種別**: " + ", ".join(
                     f"Robot {rid} = {t}" for rid, t in sorted(self.robot_types.items())))
-        lines.append(f"- **重量測定**: {len(weights)} 回 / **撮影画像**: {len(images)} 枚")
+        lines.append(f"- **重量測定**: {len(weights)} 回 / **撮影画像**: {len(images)} 枚"
+                     + (f" / **DMM 測定**: {len(dmm_events)} 回" if dmm_events else ""))
         if self.error:
             lines.append(f"- **エラー**: {self.error}")
         lines.append("")
@@ -353,7 +382,7 @@ class ExperimentLogger:
             lines.append("| 経過(s) | 時刻 | 種別 | ステップ | 反復 | 内容 |")
             lines.append("|--------:|------|------|---------:|------|------|")
             for e in self.events:
-                kind = "⚖️ 重量" if e["kind"] == "weight" else "📷 画像"
+                kind = {"weight": "⚖️ 重量", "image": "📷 画像", "dmm": "🔌 DMM"}.get(e["kind"], e["kind"])
                 detail = e["detail"]
                 if e["kind"] == "image":
                     rel = os.path.relpath(detail, self.dir) if os.path.isabs(detail) else detail
@@ -361,7 +390,7 @@ class ExperimentLogger:
                 lines.append(f"| {e['elapsed_s']:.1f} | {e['timestamp'].split(' ')[1]} "
                              f"| {kind} | {e['step_index']} | {e['iteration']} | {detail} |")
         else:
-            lines.append("（重量測定・画像撮影はありませんでした）")
+            lines.append("（重量測定・DMM 測定・画像撮影はありませんでした）")
         lines.append("")
 
         # 重量測定の抜粋（解析しやすいように数値だけ再掲）
@@ -375,6 +404,19 @@ class ExperimentLogger:
                 lines.append(f"| {i} | {e['elapsed_s']:.1f} | {e['iteration']} | {grams} |")
             lines.append("")
 
+        # DMM 測定値の抜粋（丸めない値・単位・機能）
+        if dmm_events:
+            dmm_rows = [r for r in self.records if r["dmm_value"] != ""]
+            lines.append("## DMM 測定値")
+            lines.append("")
+            lines.append("| # | 経過(s) | 反復 | 機能 | 値 | 単位 | レンジ | NPLC | 有効回数 |")
+            lines.append("|---|--------:|------|------|---:|------|------:|-----:|------:|")
+            for i, r in enumerate(dmm_rows, 1):
+                lines.append(f"| {i} | {r['elapsed_s']:.1f} | {r['iteration']} | {r['dmm_function']} "
+                             f"| {r['dmm_value']} | {r['dmm_unit']} | {r['dmm_range']} "
+                             f"| {r['dmm_nplc']} | {r['dmm_valid_samples']} |")
+            lines.append("")
+
         # 全ステップの実行記録
         lines.append("## 全ステップ実行記録")
         lines.append("")
@@ -386,6 +428,8 @@ class ExperimentLogger:
                 note = f"{r['weight_g']} g"
             elif r["image_path"]:
                 note = os.path.basename(r["image_path"])
+            elif r.get("dmm_value"):
+                note = f"{r['dmm_value']} {r['dmm_unit']}"
             elif r.get("focus_position"):
                 note = f"lens {r['focus_position']}"
                 if r.get("focus_converged") == "False":

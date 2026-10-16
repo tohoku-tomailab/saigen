@@ -97,6 +97,9 @@ SYSTEM_PROMPT = """
 - measure_weight: {"action": "measure_weight", "stabilization_count": 3} (重量測定)
 - tare_scale: {"action": "tare_scale", "delay": 1.0} (風袋引き)
 
+### デジタルマルチメータ操作（Keithley 2002, GPIB）※共有デバイスのためrobot_id不要
+- measure_dmm: {"action": "measure_dmm", "function": "dc_voltage", "samples": 3, "nplc": 1.0} (DMM 測定。function: "dc_voltage"/"ac_voltage" (V), "dc_current"/"ac_current" (A), "resistance_2w"/"resistance_4w" (Ohm)。samples: 1-10 回の中央値, nplc: 0.01-50 (大きいほど低ノイズで遅い), range: 固定レンジ (省略でオートレンジ))
+
 ### ユーティリティ
 - wait: {"action": "wait", "robot_id": 1, "seconds": 2.0}
 

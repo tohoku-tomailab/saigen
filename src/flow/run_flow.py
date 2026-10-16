@@ -14,6 +14,9 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
         --robot2-dobot COM5 --robot2-picus2 COM6 \
         --scale-port COM8
 
+    # Keithley 2002 DMM（GPIB）の VISA リソースは --dmm-resource
+    python -m src.flow.run_flow examples/keithley2002/measure_dc_voltage.json --mock
+
     # MaxArm（robot 4, config.yaml の type: maxarm）のポートは --robot4-maxarm
     python -m src.flow.run_flow examples/maxarm/pick_and_place.json --mock
 
@@ -30,7 +33,7 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
     3. 実行ごとのログフォルダを作る（logs/<日付>/<フロー名>_<時刻>/）
     4. ExperimentSession の安全枠（初期化 → 実行 → 中断時は緊急停止 /
        エラー時はホーム復帰 → 切断）の中でステップを順に実行する
-    5. 各ステップの結果（重量・画像パス）を measurements.csv / summary.md に残し、
+    5. 各ステップの結果（重量・画像パス・DMM 測定値）を measurements.csv / summary.md に残し、
        dispense と直後の measure_weight を対応させた分注精度 CSV も出力する
 
 接続ポートの優先順位:
@@ -60,7 +63,7 @@ from pydantic import ValidationError
 from src import config as lab_config
 from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS
+from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS, DMM_ACTIONS
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, robot_type, validator_for_robot
 from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
@@ -260,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="capture_microscope 用の顕微鏡カメラ index（既定: MICROSCOPE_INDEX / config.yaml）")
     p.add_argument("--microscope-port", default=None,
                    help="顕微鏡 LED 制御用シリアルポート（既定: MICROSCOPE_PORT / config.yaml。空なら LED 制御なし）")
+    p.add_argument("--dmm-resource", default=None,
+                   help="Keithley 2002 DMM の VISA リソース（例 GPIB0::16::INSTR。"
+                        "既定: DMM_RESOURCE / config.yaml）")
     record = p.add_mutually_exclusive_group()
     record.add_argument("--record", dest="record", action="store_true", default=None,
                         help="センサーCSV・動画の録画を行う（実機実行時の既定）")
@@ -316,6 +322,10 @@ def resolve_ports(args) -> Tuple[dict, dict]:
         shared_config["microscope_port"] = cli_port
     elif os.getenv("MICROSCOPE_PORT"):
         shared_config["microscope_port"] = os.getenv("MICROSCOPE_PORT")
+    # CSV ランナーは自前のパーサーでこの関数を呼ぶので getattr で読む
+    dmm = getattr(args, "dmm_resource", None) or os.getenv("DMM_RESOURCE")
+    if dmm:
+        shared_config["dmm_resource"] = dmm
 
     return robot_ports, shared_config
 
@@ -617,8 +627,13 @@ def require_preflight(steps: list, validator=None, log=None, **kwargs) -> Prefli
     return report
 
 
-def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
-    """フローが必要とするロボット・共有デバイスを洗い出す。"""
+def plan_resources(steps: list) -> Tuple[list, set, bool, bool, bool, bool, bool]:
+    """フローが必要とするロボット・共有デバイスを洗い出す。
+
+    Returns:
+        (robot_ids, picus2_robots, needs_scale, needs_camera, needs_microscope,
+        needs_microscope_serial, needs_dmm)。フローに出てこないデバイスは開かない
+    """
     actions = {s.get("action") for s in steps}
     robot_ids = set()
     picus2_robots = set()
@@ -634,8 +649,9 @@ def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
     needs_camera = "capture_and_save" in actions
     needs_microscope = bool(actions & MICROSCOPE_CAMERA_ACTIONS)          # 顕微鏡カメラ
     needs_microscope_serial = bool(actions & MICROSCOPE_SERIAL_ACTIONS)   # 顕微鏡の制御ポート
+    needs_dmm = bool(actions & DMM_ACTIONS)                               # Keithley 2002
     return (sorted(robot_ids), picus2_robots, needs_scale, needs_camera,
-            needs_microscope, needs_microscope_serial)
+            needs_microscope, needs_microscope_serial, needs_dmm)
 
 
 def _fmt_params(step: dict) -> str:
@@ -663,8 +679,9 @@ async def run(args) -> int:
         return 2
 
     (robot_ids, picus2_robots, needs_scale, needs_camera,
-     needs_microscope, needs_microscope_serial) = plan_resources(steps)
-    needs_shared = needs_scale or needs_camera or needs_microscope or needs_microscope_serial
+     needs_microscope, needs_microscope_serial, needs_dmm) = plan_resources(steps)
+    needs_shared = (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
+                    or needs_dmm)
     robot_types = report.robot_types
 
     # 実機実行では既定で録画する。Mock モードでは常に録画しない。
@@ -691,7 +708,8 @@ async def run(args) -> int:
     if needs_shared:
         parts = [n for n, need in (("天秤", needs_scale), ("カメラ", needs_camera),
                                    ("顕微鏡カメラ", needs_microscope),
-                                   ("顕微鏡制御ポート", needs_microscope_serial)) if need]
+                                   ("顕微鏡制御ポート", needs_microscope_serial),
+                                   ("DMM", needs_dmm)) if need]
         logger.info(f"共有デバイス: {', '.join(parts)}")
 
     # 録画セッション開始（CSV: ダッシュボード経由 / 動画: ローカルスレッド）
@@ -732,7 +750,8 @@ async def run(args) -> int:
         if needs_shared:
             await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
                                      use_microscope=needs_microscope,
-                                     use_microscope_serial=needs_microscope_serial)
+                                     use_microscope_serial=needs_microscope_serial,
+                                     use_dmm=needs_dmm)
 
         logger.info("=== フロー実行開始 ===")
         total = len(steps)

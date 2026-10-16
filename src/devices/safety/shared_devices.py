@@ -12,6 +12,7 @@ L1層: 共有デバイス管理クラス（SharedDevices）
 
 import asyncio
 import logging
+import statistics
 import threading
 from typing import Optional
 
@@ -46,6 +47,7 @@ class SharedDevices:
                  use_camera: bool = False,
                  use_microscope: bool = False,
                  use_microscope_serial: bool = False,
+                 use_dmm: bool = False,
                  **device_configs):
         """
         SharedDevicesを初期化
@@ -57,6 +59,8 @@ class SharedDevices:
                 （capture_microscope / microscope_focus）
             use_microscope_serial: 顕微鏡の制御ポート（LED・フォーカスモーター）を使用するか
                 （microscope_led / microscope_focus）。microscope_port が必要
+            use_dmm: Keithley 2002 デジタルマルチメータ（GPIB）を使用するか
+                （measure_dmm）。dmm_resource が必要
             **device_configs: デバイス固有の設定
                 - scale_port: str (デフォルト: 'COM4') - BCE8221天秤のCOMポート
                 - camera_index: int (デフォルト: 1) - Webcamのデバイスインデックス
@@ -65,24 +69,39 @@ class SharedDevices:
                   (UM22 系の CP210x。空なら LED 制御なし、撮影のみ)
                 - microscope_resolution: str (デフォルト: '3840x2160') - 顕微鏡の撮影解像度
                   ("幅x高さ"。データ量を抑えるなら "1280x720" など)
+                - dmm_resource: str (デフォルト: '') - Keithley 2002 の VISA リソース
+                  (例 'GPIB0::16::INSTR')
+                - dmm_timeout_ms: int (デフォルト: 10000) - DMM の 1 回の I/O の上限
         """
         # デバイス使用フラグ
         self.use_scale = use_scale
         self.use_camera = use_camera
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
+        self.use_dmm = use_dmm
 
         # デバイスインスタンス（初期化前はNone）
         self.scale = None
         self.camera = None
         self.microscope = None
         self.microscope_serial = None
+        self.dmm = None
+
+        # DMM の I/O はワーカースレッドで行い、ロックで直列化する（測定・切断が
+        # 同時にバスを触らない）。ハンドルを閉じるのは常にロックを持つ側:
+        # cleanup() はロックを待ち、待ちきれなければ _dmm_closing を見た
+        # ワーカーが通信を終えたところで閉じる（排他を破って閉じることはない）
+        self._dmm_lock = threading.Lock()
+        self._dmm_closing = threading.Event()
 
         # デバイス設定
         self.device_configs = device_configs
 
         # 待機時間設定
         self.wait_after_scale = device_configs.get('wait_after_scale', 2.0)
+        self.wait_after_dmm = float(device_configs.get('wait_after_dmm') or 0.0)
+        # cleanup() が DMM ワーカーの通信終了を待つ上限（秒）。超えたらワーカーに任せる
+        self.dmm_close_wait_s = self._dmm_timeout_ms() / 1000.0 * 2 + 5.0
 
         # 初期化フラグ
         self._initialized = False
@@ -113,6 +132,11 @@ class SharedDevices:
                     return False
             if self.use_microscope_serial:
                 if not await self._initialize_microscope_serial():
+                    return False
+
+            # DMM（Keithley 2002, GPIB）の初期化
+            if self.use_dmm:
+                if not await self._initialize_dmm():
                     return False
 
             self._initialized = True
@@ -211,6 +235,54 @@ class SharedDevices:
             logger.error(f"デジタル顕微鏡（制御ポート）初期化エラー: {e}")
             return False
 
+    def _dmm_timeout_ms(self) -> int:
+        return int(self.device_configs.get('dmm_timeout_ms') or 10000)
+
+    async def _initialize_dmm(self) -> bool:
+        """Keithley 2002 を開き、*IDN? で機種を確認する。失敗時はハンドルを残さない
+
+        I/O はワーカースレッドで行う。初期化中に中断されても、開いたハンドルは
+        cleanup()（またはそれを待ちきれなかった場合はワーカー自身）が閉じる。
+        """
+        resource = self.device_configs.get('dmm_resource') or ""
+        if not resource:
+            logger.error("DMM の VISA リソースが未設定です "
+                         "(config.yaml の shared_devices.dmm_resource を設定してください。"
+                         "例: GPIB0::16::INSTR)")
+            return False
+        timeout_ms = self._dmm_timeout_ms()
+
+        def _open():
+            from src.devices.keithley2002 import Keithley2002
+            with self._dmm_lock:
+                if self._dmm_closing.is_set():
+                    raise RuntimeError("切断処理が始まっているため DMM を開きません")
+                self.dmm = Keithley2002(resource, timeout_ms=timeout_ms)
+                self.dmm.abort_check = self._dmm_closing.is_set
+                try:
+                    self.dmm.clear_status()
+                    idn = self.dmm.identify()
+                    self.dmm.check_errors("接続確認")
+                    line_sync = self.dmm.line_sync()
+                except BaseException:
+                    self._release_dmm_locked()
+                    raise
+                finally:
+                    if self._dmm_closing.is_set():
+                        self._release_dmm_locked()
+                return idn, line_sync
+
+        try:
+            logger.info(f"Keithley 2002（{resource}）を初期化中...")
+            idn, line_sync = await asyncio.to_thread(_open)
+            # ライン同期は機器全体の設定で :CONFigure では変わらない。触らずに記録する
+            logger.info(f"✓ Keithley 2002 初期化完了: {idn}"
+                        f"（ライン同期 {'ON' if line_sync else 'OFF'}）")
+            return True
+        except Exception as e:
+            logger.error(f"Keithley 2002 初期化エラー（{resource}）: {e}")
+            return False
+
     @staticmethod
     def _release_quietly(device) -> None:
         """初期化に失敗したデバイスのハンドルをベストエフォートで閉じる"""
@@ -289,6 +361,144 @@ class SharedDevices:
         except Exception as e:
             logger.error(f"風袋引きエラー: {e}")
             raise
+
+    # ========================================
+    # DMM（Keithley 2002）操作
+    # ========================================
+
+    async def measure_dmm(self, function: str = "dc_voltage", samples: int = 3,
+                          nplc: float = 1.0, range_: Optional[float] = None) -> dict:
+        """
+        Keithley 2002 で測定する（samples 回測って中央値）
+
+        Args:
+            function: 測定機能（dc_voltage / ac_voltage / dc_current / ac_current /
+                resistance_2w / resistance_4w）
+            samples: 測定回数。有効値の中央値を返す（偶数個なら中央 2 値の平均）
+            nplc: 積分時間（電源周期の倍数、0.01〜50）
+            range_: 固定レンジ（その機能の単位）。None ならオートレンジ
+
+        Returns:
+            dict: ``dmm_value``（中央値）, ``dmm_unit``, ``dmm_function``,
+            ``dmm_range``（機器から読み返したレンジ）, ``dmm_nplc``,
+            ``dmm_valid_samples``（有効だった回数）
+
+        Raises:
+            RuntimeError: DMM が初期化されていない場合
+            ValueError: 有効な測定値が 1 つも得られなかった場合
+            Keithley2002Error: 機器が設定を受け付けなかった場合
+
+        ``dmm_range`` は最後の読み取りの後に読み返したレンジ（オートレンジでは
+        最後のサンプルで使われたレンジ）。
+
+        中断（Ctrl+C / GUI の Stop）では読み取り中のワーカーを待たずに再送出する
+        （session の緊急停止を遅らせない）。ワーカーは進行中の 1 回の I/O
+        （上限 dmm_timeout_ms）を終えたところで残りを打ち切り、cleanup() は
+        ロックを取ってそれを待ってから GTL・切断する。
+        """
+        if not self.use_dmm or self.dmm is None or self._dmm_closing.is_set():
+            raise RuntimeError("Keithley 2002 が初期化されていません")
+        dmm = self.dmm
+        stop = threading.Event()        # この測定だけの打ち切り要求
+
+        def _run():
+            from src.devices.keithley2002 import Keithley2002Aborted
+            with self._dmm_lock:
+                if self.dmm is not dmm or self._dmm_closing.is_set():
+                    return None, [], True
+                # 打ち切り要求は write / query の直前に見る（configure の途中、
+                # 最後の読み取りの後の読み返しの前も含め、すべての I/O 境界）
+                dmm.abort_check = lambda: stop.is_set() or self._dmm_closing.is_set()
+                try:
+                    settings = dmm.configure(function, range_=range_, nplc=nplc)
+                    values = []
+                    for _ in range(int(samples)):
+                        value = dmm.read()
+                        if value is not None:
+                            values.append(value)
+                    settings.update(dmm.read_settings(function))
+                    return settings, values, False
+                except Keithley2002Aborted:
+                    return None, [], True
+                finally:
+                    dmm.abort_check = self._dmm_closing.is_set
+                    if self._dmm_closing.is_set():
+                        self._release_dmm_locked()
+
+        try:
+            settings, values, stopped = await asyncio.to_thread(_run)
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+        except Exception as e:
+            logger.error(f"DMM 測定エラー: {e}")
+            raise
+        if stopped:
+            raise RuntimeError("DMM 測定が中断されました")
+        if not values:
+            raise ValueError(f"DMM から有効な測定値を取得できませんでした（{samples} 回）")
+
+        median = statistics.median(values)
+        unit = settings["unit"]
+        logger.info(f"✓ DMM 測定 {function}: {median!r} {unit}"
+                    f"（有効 {len(values)}/{samples} 回, range {settings.get('range')}, "
+                    f"NPLC {settings.get('nplc')}）")
+        if self.wait_after_dmm > 0:
+            await asyncio.sleep(self.wait_after_dmm)
+        return {
+            "dmm_value": median,
+            "dmm_unit": unit,
+            "dmm_function": function,
+            "dmm_range": settings.get("range"),
+            "dmm_nplc": settings.get("nplc"),
+            "dmm_valid_samples": len(values),
+        }
+
+    def _release_dmm_locked(self) -> bool:
+        """GTL で前面操作に戻して閉じる。呼び出し側が _dmm_lock を持っていること
+
+        送出しない（cleanup() から委ねられたワーカーが呼ぶと、例外の受け手がいない）。
+        close() に失敗したらエラーをログに残し、ハンドルを ``self.dmm`` に残す
+        （次の cleanup() で再試行できる）。
+
+        Returns:
+            bool: 閉じた（または開いていなかった）なら True
+        """
+        dmm = self.dmm
+        if dmm is None:
+            return True
+        try:
+            dmm.local()
+        except Exception as e:  # noqa: BLE001 - 閉じることを優先する
+            logger.warning(f"Keithley 2002 を前面操作に戻せません（GTL）: {e}")
+        try:
+            dmm.close()
+        except Exception as e:  # noqa: BLE001 - 記録してハンドルを残す
+            logger.error(f"Keithley 2002 を閉じられません（次の cleanup() で再試行します）: {e}")
+            return False
+        self.dmm = None
+        logger.info("✓ Keithley 2002 切断完了")
+        return True
+
+    async def _close_dmm(self):
+        """DMM を閉じる。通信中のワーカーがいればその I/O が終わるのを待つ
+
+        待ちきれない場合もハンドルには触らない（通信中に閉じない）。
+        _dmm_closing を見たワーカーが、通信を終えた時点で GTL・切断する。
+        """
+        self._dmm_closing.set()
+
+        def _close():
+            if not self._dmm_lock.acquire(timeout=self.dmm_close_wait_s):
+                logger.warning("DMM の通信が終わっていません。通信を終えたワーカーが GTL・切断します")
+                return True
+            try:
+                return self._release_dmm_locked()
+            finally:
+                self._dmm_lock.release()
+
+        if not await asyncio.to_thread(_close):
+            raise RuntimeError("Keithley 2002 を閉じられませんでした（ハンドルは保持しています）")
 
     # ========================================
     # カメラ操作
@@ -522,6 +732,14 @@ class SharedDevices:
                 logger.info("✓ デジタル顕微鏡 制御ポート切断完了")
         except Exception as e:
             logger.error(f"デジタル顕微鏡 制御ポート切断エラー: {e}")
+
+        try:
+            # self.dmm ではなく use_dmm で判定する: 初期化ワーカーがまだ動いていても
+            # _close_dmm はロックを取ってから開いたハンドルを閉じる
+            if self.use_dmm:
+                await self._close_dmm()
+        except Exception as e:
+            logger.error(f"Keithley 2002 切断エラー: {e}")
 
         logger.info("=== SharedDevices 全デバイス切断完了 ===")
 

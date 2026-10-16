@@ -254,7 +254,7 @@ def test_executor_routes_microscope_led():
 
 
 def test_plan_resources_led_needs_microscope():
-    ids, picus, scale, camera, microscope, serial = run_flow.plan_resources(
+    ids, picus, scale, camera, microscope, serial, dmm = run_flow.plan_resources(
         [{"action": "microscope_led", "on": False}])
     assert (ids, scale, camera, microscope, serial) == ([], False, False, False, True)
 

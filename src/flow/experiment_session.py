@@ -240,27 +240,32 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
 
 
 def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
-                           use_microscope_serial=False):
+                           use_microscope_serial=False, use_dmm=False):
     """実機 SharedDevices を生成する既定ファクトリ"""
     return SharedDevices(
         use_scale=use_scale,
         use_camera=use_camera,
         use_microscope=use_microscope,
         use_microscope_serial=use_microscope_serial,
+        use_dmm=use_dmm,
         scale_port=config["scale_port"],
         camera_index=config["camera_index"],
         microscope_index=config.get("microscope_index", 2),
         microscope_port=config.get("microscope_port", ""),
         microscope_resolution=config.get("microscope_resolution", ""),
+        dmm_resource=config.get("dmm_resource", ""),
+        dmm_timeout_ms=config.get("dmm_timeout_ms", 10000),
+        wait_after_dmm=config.get("wait_after_dmm", 0.0),
     )
 
 
 def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
-                        use_microscope_serial=False):
+                        use_microscope_serial=False, use_dmm=False):
     """MockSharedDevices を生成するファクトリ"""
     return MockSharedDevices(use_scale=use_scale, use_camera=use_camera,
                              use_microscope=use_microscope,
-                             use_microscope_serial=use_microscope_serial)
+                             use_microscope_serial=use_microscope_serial,
+                             use_dmm=use_dmm)
 
 
 class ExperimentSession:
@@ -455,14 +460,35 @@ class ExperimentSession:
         robot.set_current_position_as_home()
 
     async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
-                         use_microscope: bool = False, use_microscope_serial: bool = False):
-        """設定の値で共有デバイスを生成・初期化して登録する"""
-        shared = self.shared_factory(
-            use_scale=use_scale, use_camera=use_camera, use_microscope=use_microscope,
-            use_microscope_serial=use_microscope_serial,
-            config=self.shared_config(),
-        )
-        if not await shared.initialize():
+                         use_microscope: bool = False, use_microscope_serial: bool = False,
+                         use_dmm: bool = False):
+        """設定の値で共有デバイスを生成・初期化して登録する
+
+        初期化が途中で失敗した場合（天秤は開いたが DMM が開けない等）は、開いた分を
+        切断してから送出する。``self.shared`` に登録されるのは成功時だけなので、
+        ここで閉じないと cleanup() の対象から漏れる。
+
+        初期化中の中断（Ctrl+C / キャンセル）では切断を待たない: DMM の初期化
+        ワーカーが GPIB の応答を待っている間などに切断を待つと、run() の緊急停止が
+        遅れる。登録だけして再送出し、run() が緊急停止した後の cleanup() で閉じる。
+        切断中の中断も通常のエラー（= ホーム復帰）にはせず、中断として再送出する。
+        """
+        kwargs = dict(use_scale=use_scale, use_camera=use_camera, use_microscope=use_microscope,
+                      use_microscope_serial=use_microscope_serial)
+        if use_dmm:
+            # use_dmm を知らない差し替えファクトリ（テスト・GUI）も動くよう、要るときだけ渡す
+            kwargs["use_dmm"] = True
+        shared = self.shared_factory(config=self.shared_config(), **kwargs)
+        try:
+            ok = await shared.initialize()
+        except Exception:
+            await self._discard_shared("共有デバイス（初期化エラー）", shared)
+            raise
+        except BaseException:
+            self.shared = shared        # 緊急停止の後で cleanup() が閉じる
+            raise
+        if not ok:
+            await self._discard_shared("共有デバイス（初期化失敗）", shared)
             raise RuntimeError("共有デバイスの初期化に失敗しました")
         self.shared = shared
         logger.info("共有デバイス初期化完了")
@@ -519,6 +545,15 @@ class ExperimentSession:
                 await robot.go_home()
             except Exception as e:
                 logger.error(f"Robot {rid} のホーム復帰に失敗しました: {e}")
+
+    async def _discard_shared(self, name, shared):
+        """初期化に失敗した共有デバイスを切断する。切断中の中断は中断として送出する"""
+        err = await self._cleanup_one(name, shared)
+        if err is not None and not isinstance(err, Exception):
+            # Ctrl+C / キャンセル: 呼び出し側の RuntimeError（= ホーム復帰）に化けさせない。
+            # 切断の残りは run() の cleanup() に任せる
+            self.shared = shared
+            raise err
 
     @staticmethod
     async def _cleanup_one(name, device):

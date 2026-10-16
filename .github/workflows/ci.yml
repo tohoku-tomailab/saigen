@@ -67,7 +67,7 @@ jobs:
 
       - name: Validate example flows against the schema
         run: |
-          for f in examples/zif8/*.json examples/microscope/*.json examples/maxarm/*.json; do
+          for f in examples/zif8/*.json examples/microscope/*.json examples/maxarm/*.json examples/keithley2002/*.json; do
             echo "::group::$f"
             python -m src.flow.run_flow "$f" --validate-only
             echo "::endgroup::"
@@ -78,6 +78,7 @@ jobs:
           python -m src.flow.run_flow \
             examples/zif8/zif8_two_solution_mixing_speed5.json --mock
           python -m src.flow.run_flow examples/maxarm/pick_and_place.json --mock
+          python -m src.flow.run_flow examples/keithley2002/measure_dc_voltage.json --mock
 
       - name: Recompute the dispensing-stability statistics
         run: python examples/dispensing_stability/stats.py

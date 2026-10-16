@@ -289,7 +289,7 @@ def test_logger_writes_focus_position_column(tmp_path):
 
 
 def test_plan_resources_focus_needs_microscope():
-    ids, picus, scale, camera, microscope, serial = run_flow.plan_resources([{"action": "microscope_focus"}])
+    ids, picus, scale, camera, microscope, serial, dmm = run_flow.plan_resources([{"action": "microscope_focus"}])
     assert (ids, scale, camera, microscope) == ([], False, False, True)
 
 

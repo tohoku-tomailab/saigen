@@ -279,6 +279,11 @@ def settings_to_session_args(settings: dict):
     connection settings come from ``config.yaml`` as well. Sidebar ports are
     used only when the sidebar type matches the configured type.
 
+    The shared-device settings start from ``config.yaml`` as well and only the
+    fields the sidebar edits (``scale_port``, ``camera_index``) are overlaid, so
+    the microscope and DMM settings, which have no sidebar field, still reach
+    the devices.
+
     Returns:
         ``(robot_ports, shared_config)`` in the shape ExperimentSession expects.
     """
@@ -309,11 +314,25 @@ def settings_to_session_args(settings: dict):
                                        if cfg.get("use_picus2", True) else "")
         robot_ports[int(rid)] = entry
     shared = settings.get("shared") or {}
-    shared_config = {
-        "scale_port": shared.get("scale_port", ""),
-        "camera_index": int(shared.get("camera_index", 0) or 0),
-    }
+    shared_config = dict(lab_config.get_shared_devices())
+    shared_config["scale_port"] = shared.get("scale_port", shared_config.get("scale_port", ""))
+    shared_config["camera_index"] = int(
+        shared.get("camera_index", shared_config.get("camera_index", 0)) or 0)
     return robot_ports, shared_config
+
+
+def change_dmm_function(step: dict, function: str) -> dict:
+    """Set a ``measure_dmm`` step's function and drop its fixed range.
+
+    A range is in the unit of the function (V, A or Ohm), so a value kept across a
+    change of function is meaningless and usually out of bounds (20 V -> 20 A),
+    which would leave the step invalid and read-only in the GUI. The step falls
+    back to autorange; the user sets a new fixed range if needed.
+    """
+    if step.get("function", "dc_voltage") != function:
+        step.pop("range", None)
+    step["function"] = function
+    return step
 
 
 # ======================================================================
@@ -569,7 +588,7 @@ class FlowRunner:
         steps = self.steps
         total = len(steps)
         (robot_ids, picus2_robots, needs_scale, needs_camera,
-         needs_microscope, needs_microscope_serial) = plan_resources(steps)
+         needs_microscope, needs_microscope_serial, needs_dmm) = plan_resources(steps)
 
         exp_logger = ExperimentLogger(
             self.workflow.name,
@@ -629,10 +648,12 @@ class FlowRunner:
             for rid in robot_ids:
                 await session.add_robot(rid, use_picus2=(rid in picus2_robots))
                 check_stop()
-            if needs_scale or needs_camera or needs_microscope or needs_microscope_serial:
+            if (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
+                    or needs_dmm):
                 await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
                                          use_microscope=needs_microscope,
-                                         use_microscope_serial=needs_microscope_serial)
+                                         use_microscope_serial=needs_microscope_serial,
+                                         use_dmm=needs_dmm)
 
             for i, step in enumerate(steps, 1):
                 # Cancellation is checked between steps as well, so a Stop

@@ -18,11 +18,14 @@ _default_logger = logging.getLogger(__name__)
 
 # 共有デバイス用アクション（robot_idに依存しない）
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
-                         "capture_microscope", "microscope_led", "microscope_focus"}
+                         "capture_microscope", "microscope_led", "microscope_focus",
+                         "measure_dmm"}
 MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
 # 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
 MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}
 MICROSCOPE_SERIAL_ACTIONS = {"microscope_led", "microscope_focus"}
+# Keithley 2002 DMM（GPIB）が要るアクション
+DMM_ACTIONS = {"measure_dmm"}
 
 # ループ制御アクション（実行時にスキップ）
 LOOP_CONTROL_ACTIONS = {"loop_start", "loop_end"}
@@ -177,6 +180,20 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
         delay = step.get("delay", 1.0) if isinstance(step, dict) else step.delay
         await shared_devices.tare_scale(delay)
         return None
+
+    # ===== DMM 操作（Keithley 2002） =====
+    elif action == "measure_dmm":
+        if isinstance(step, dict):
+            kwargs = {"function": step.get("function", "dc_voltage"),
+                      "samples": step.get("samples", 3),
+                      "nplc": step.get("nplc", 1.0),
+                      "range_": step.get("range")}
+        else:
+            kwargs = {"function": step.function, "samples": step.samples,
+                      "nplc": step.nplc, "range_": step.range}
+        result = await shared_devices.measure_dmm(**kwargs)
+        logger.info(f"  DMM: {result['dmm_value']!r} {result['dmm_unit']} ({result['dmm_function']})")
+        return result
 
     else:
         # 未知のアクションを警告だけで読み飛ばすと、後続ステップが想定外の

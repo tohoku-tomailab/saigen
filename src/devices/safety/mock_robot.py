@@ -434,13 +434,18 @@ class MockSharedDevices:
 
     #: measure_weight が返すモック測定値 (g)
     MOCK_WEIGHT = 4.98
+    #: measure_dmm が返すモック測定値（単位は測定機能による）
+    MOCK_DMM_VALUE = 1.234
 
     def __init__(self, use_scale: bool = False, use_camera: bool = False,
-                 use_microscope: bool = False, use_microscope_serial: bool = False, **_ignored):
+                 use_microscope: bool = False, use_microscope_serial: bool = False,
+                 use_dmm: bool = False, **_ignored):
         self.use_scale = use_scale
         self.use_camera = use_camera
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
+        self.use_dmm = use_dmm
+        self._dmm_open = False          # 実機と同じく initialize() 〜 cleanup() の間だけ測れる
         self._captures = 0
         self._microscope_captures = 0
         self.microscope_led_on = True
@@ -449,6 +454,7 @@ class MockSharedDevices:
 
     async def initialize(self) -> bool:
         logger.info("=== [MOCK] 共有デバイス初期化 (成功) ===")
+        self._dmm_open = self.use_dmm
         return True
 
     async def measure_weight(self, stabilization_count: int = 3) -> float:
@@ -456,6 +462,34 @@ class MockSharedDevices:
         await asyncio.sleep(0.1)
         logger.info(f"✓ [MOCK] 重量測定完了: {self.MOCK_WEIGHT:.3f}g")
         return self.MOCK_WEIGHT
+
+    async def measure_dmm(self, function: str = "dc_voltage", samples: int = 3,
+                          nplc: float = 1.0, range_: Optional[float] = None) -> dict:
+        # 実機と同じ契約: 未初期化は RuntimeError、有効値なし（samples < 1）は ValueError、
+        # 引数はドライバの configure と同じ表で検査する
+        from src.devices.keithley2002 import FUNCTIONS, NPLC_MAX, NPLC_MIN
+        if not self.use_dmm or not self._dmm_open:
+            raise RuntimeError("Keithley 2002 が初期化されていません")
+        if int(samples) < 1:
+            raise ValueError(f"DMM から有効な測定値を取得できませんでした（{samples} 回）")
+        if function not in FUNCTIONS:
+            raise ValueError(f"未知の測定機能: {function!r}")
+        _, unit, max_range = FUNCTIONS[function]
+        if not (NPLC_MIN <= float(nplc) <= NPLC_MAX):
+            raise ValueError(f"nplc は {NPLC_MIN}〜{NPLC_MAX}: {nplc}")
+        if range_ is not None and not (0 < float(range_) <= max_range):
+            raise ValueError(f"{function} のレンジは 0 より大きく {max_range:g} {unit} 以下: {range_}")
+        logger.info(f"[MOCK] DMM 測定中（{function}, {samples}回, NPLC {nplc}）...")
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] DMM 測定完了: {self.MOCK_DMM_VALUE} {unit}")
+        return {
+            "dmm_value": self.MOCK_DMM_VALUE,
+            "dmm_unit": unit,
+            "dmm_function": function,
+            "dmm_range": float(range_) if range_ is not None else max_range,
+            "dmm_nplc": float(nplc),
+            "dmm_valid_samples": int(samples),
+        }
 
     async def tare_scale(self, delay: float = 1.0):
         logger.info("[MOCK] 電子天秤を風袋引き中...")
@@ -506,4 +540,5 @@ class MockSharedDevices:
         return {"focus_position": self.microscope_focus_position, "focus_converged": True}
 
     async def cleanup(self):
+        self._dmm_open = False
         logger.info("✓ [MOCK] 共有デバイスの仮想接続を切断")

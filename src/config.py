@@ -65,6 +65,11 @@ DEFAULTS = {
         "microscope_index": 2,
         "microscope_port": "",
         "microscope_resolution": "3840x2160",
+        # Keithley 2002 DMM: VISA resource, e.g. GPIB0::16::INSTR. Empty: a flow
+        # with measure_dmm refuses to start a real run until it is set.
+        "dmm_resource": "",
+        "dmm_timeout_ms": 10000,
+        "wait_after_dmm": 0.0,
     },
     "workspace": {
         "x_min": -300.0, "x_max": 300.0,
@@ -276,7 +281,7 @@ def get_robot_workspace(robot_id: int) -> dict:
 
 
 def get_shared_devices() -> dict:
-    """Settings for the shared devices (scale_port, camera_index, microscope_index)."""
+    """Settings for the shared devices (scale_port, camera_index, microscope_*, dmm_*)."""
     return dict(load_config()["shared_devices"])
 
 

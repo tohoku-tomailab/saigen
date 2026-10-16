@@ -1,0 +1,9 @@
+{
+  "name": "DC voltage with the Keithley 2002",
+  "description": "Measure a DC voltage three times with the Keithley 2002 DMM over GPIB: once on autorange at the default integration time, once on the fixed 20 V range at NPLC 10 (lower noise, slower), and once more on autorange. Each step takes the median of its samples and writes the value, unit, function, the range and NPLC read back from the instrument, and the number of valid samples to measurements.csv. The flow uses only the DMM, so no robot is opened. The VISA resource comes from config.yaml (shared_devices.dmm_resource, e.g. GPIB0::16::INSTR) or from --dmm-resource. To measure another quantity, set function to ac_voltage, dc_current, ac_current, resistance_2w or resistance_4w; the range is then in A or Ohm.",
+  "steps": [
+    {"action": "measure_dmm", "function": "dc_voltage", "samples": 3, "nplc": 1.0},
+    {"action": "measure_dmm", "function": "dc_voltage", "samples": 5, "nplc": 10.0, "range": 20.0},
+    {"action": "measure_dmm", "function": "dc_voltage", "samples": 3}
+  ]
+}

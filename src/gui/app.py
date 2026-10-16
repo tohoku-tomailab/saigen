@@ -33,6 +33,7 @@ except ImportError:
 
 from pydantic import ValidationError
 
+from src.devices.keithley2002 import FUNCTIONS as DMM_FUNCTIONS
 from src.flow.executor import SHARED_DEVICE_ACTIONS
 from src.flow.schema import PIPETTE_MIN_VOLUME_ML
 
@@ -142,6 +143,10 @@ ACTION_CONFIG = {
         "icon": "🔄", "label": "風袋引き", "category": "sensor",
         "defaults": {"delay": 1.0}
     },
+    "measure_dmm": {
+        "icon": "🔌", "label": "DMM測定", "category": "sensor",
+        "defaults": {"function": "dc_voltage", "samples": 3, "nplc": 1.0}
+    },
     # ループ制御
     "loop_start": {
         "icon": "🔁", "label": "ループ開始", "category": "loop",
@@ -169,7 +174,7 @@ CATEGORIES = {
     "peripheral": ("🔩 周辺機器", ["move_slider", "move_conveyer"]),
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
     "maxarm": ("🧲 MaxArm", ["suction"]),
-    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale"]),
+    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
 }
@@ -820,6 +825,10 @@ def get_param_summary(step):
         return f"測定: {step.get('stabilization_count', 3)}回"
     elif action == "tare_scale":
         return f"待機: {step.get('delay', 1.0)}秒"
+    elif action == "measure_dmm":
+        rng = step.get('range')
+        return (f"{escape(str(step.get('function', 'dc_voltage')))} {step.get('samples', 3)}回 "
+                f"NPLC {step.get('nplc', 1.0)} " + (f"レンジ {rng}" if rng is not None else "オート"))
     elif action == "go_home":
         return ""
     elif action == "loop_start":
@@ -839,11 +848,14 @@ def _bump_flow_rev():
     st.session_state.flow_rev = st.session_state.get("flow_rev", 0) + 1
 
 
-def _num(container, label, step, idx, param, kind, default, **kwargs):
+def _num(container, label, flow_step, idx, param, kind, default, **kwargs):
     """数値入力。表示値だけ既定値で補い、保存済みフローには書き込まない
-    （書き込むのはユーザーが値を変えたときの on_change だけ）。"""
+    （書き込むのはユーザーが値を変えたときの on_change だけ）。
+
+    フローのステップは ``flow_step``。``step`` という名前にすると、刻み幅の
+    ``step=0.1`` などを ``**kwargs`` で number_input に渡せない（引数が重複する）。"""
     key = _wkey(param, idx)
-    raw = step.get(param)
+    raw = flow_step.get(param)
     value = kind(default if raw is None else raw)
     container.number_input(label, value=value, key=key,
                            on_change=_update_step_param, args=(idx, param, key), **kwargs)
@@ -878,6 +890,33 @@ def _toggle_led_level(idx, key):
             step["level"] = 12
     else:
         step.pop("level", None)
+
+
+def _change_dmm_function(idx, key):
+    """測定機能の on_change: 単位が変わるので固定レンジを外す（オートに戻す）
+
+    キー付きウィジェットは既定値を変えても前の状態を保つので、「レンジを固定する」
+    のチェックとレンジ欄の状態もここで合わせる（表示と実行設定を食い違わせない）。
+    """
+    if is_running():
+        return
+    step = st.session_state.workflow_data["steps"][idx]
+    flow_runner.change_dmm_function(step, st.session_state[key])
+    st.session_state[_wkey("fix_range", idx)] = step.get("range") is not None
+    st.session_state.pop(_wkey("range", idx), None)
+
+
+def _toggle_dmm_range(idx, key):
+    """「レンジを固定する」の on_change: チェック時だけ range を書き込む"""
+    if is_running():
+        return
+    step = st.session_state.workflow_data["steps"][idx]
+    st.session_state.pop(_wkey("range", idx), None)   # レンジ欄は step の値から作り直す
+    if st.session_state[key]:
+        if step.get("range") is None:
+            step["range"] = DMM_FUNCTIONS[step.get("function", "dc_voltage")][2]
+    else:
+        step.pop("range", None)
 
 
 def render_step_params(step, idx):
@@ -973,6 +1012,25 @@ def render_step_params(step, idx):
     elif action == "tare_scale":
         _num(st, "待機時間(秒)", step, idx, "delay", float, 1.0,
              min_value=0.1, max_value=10.0, step=0.1)
+
+    elif action == "measure_dmm":
+        fn_key = _wkey("function", idx)
+        functions = list(DMM_FUNCTIONS)
+        current = step.get("function", "dc_voltage")
+        st.selectbox("測定機能（変えると固定レンジは解除）", options=functions,
+                     index=functions.index(current) if current in functions else 0,
+                     key=fn_key, on_change=_change_dmm_function, args=(idx, fn_key))
+        _num(st, "測定回数（中央値）", step, idx, "samples", int, 3, min_value=1, max_value=10)
+        _num(st, "NPLC（積分時間）", step, idx, "nplc", float, 1.0,
+             min_value=0.01, max_value=50.0, step=1.0)
+        _, unit, max_range = DMM_FUNCTIONS[step.get("function", "dc_voltage")]
+        rng_key = _wkey("fix_range", idx)
+        fixed = st.checkbox("レンジを固定する（外すとオート）", value=step.get("range") is not None,
+                            key=rng_key, on_change=_toggle_dmm_range, args=(idx, rng_key))
+        if fixed and step.get("range") is not None:
+            _num(st, f"レンジ ({unit}, 最大 {max_range:g})", step, idx, "range", float, max_range,
+                 min_value=1e-9, max_value=max_range)
+        st.caption("Keithley 2002（config.yaml の shared_devices.dmm_resource）")
 
     elif action == "loop_start":
         _num(st, "繰り返し回数", step, idx, "count", int, 10, min_value=1, max_value=1000)

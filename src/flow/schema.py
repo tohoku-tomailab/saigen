@@ -3,6 +3,8 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Literal, Union, List, Optional
 
+from src.devices.keithley2002.keithley2002 import FUNCTIONS as DMM_FUNCTIONS, NPLC_MAX, NPLC_MIN
+
 # ==========================================
 # 0. 共通の基底モデル
 # ==========================================
@@ -482,6 +484,57 @@ class ActionMicroscopeFocus(_StrictModel):
         return self
 
 # ==========================================
+# 1.65 個別のアクション定義 (共有デバイス: Keithley 2002 DMM)
+# ==========================================
+
+class ActionMeasureDMM(_StrictModel):
+    """
+    Keithley 2002 デジタルマルチメータ（GPIB）で測定
+    SharedDevices.measure_dmm(function, samples, nplc, range_) に対応
+
+    結果は measurements.csv の dmm_value / dmm_unit / dmm_function / dmm_range /
+    dmm_nplc / dmm_valid_samples 列に記録される。
+    config.yaml の shared_devices.dmm_resource（例 GPIB0::16::INSTR）が必要。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["measure_dmm"] = Field(
+        ...,
+        description="アクション識別子: DMM 測定"
+    )
+    function: Literal["dc_voltage", "ac_voltage", "dc_current", "ac_current",
+                      "resistance_2w", "resistance_4w"] = Field(
+        default="dc_voltage",
+        description="測定機能: 直流/交流電圧 (V)、直流/交流電流 (A)、2線式/4線式抵抗 (Ohm)"
+    )
+    samples: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="測定回数（有効値の中央値を記録）"
+    )
+    nplc: float = Field(
+        default=1.0,
+        ge=NPLC_MIN,
+        le=NPLC_MAX,
+        description="積分時間（電源周期の倍数）。大きいほど低ノイズで遅い"
+    )
+    range: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="固定レンジ（その機能の単位）。省略でオートレンジ"
+    )
+
+    @model_validator(mode="after")
+    def _range_within_function_limit(self):
+        _, unit, max_range = DMM_FUNCTIONS[self.function]
+        if self.range is not None and self.range > max_range:
+            raise ValueError(f"measure_dmm: {self.function} のレンジは {max_range:g} {unit} 以下です"
+                             f"（指定 {self.range:g}）")
+        return self
+
+# ==========================================
 # 1.7 個別のアクション定義 (共有デバイス: BCE8221電子天秤用)
 # ==========================================
 
@@ -600,6 +653,7 @@ LabRobotAction = Union[
     # 電子天秤操作（BCE8221）
     ActionMeasureWeight,
     ActionTareScale,
+    ActionMeasureDMM,
     # ユーティリティ
     ActionWait,
     # ループ制御

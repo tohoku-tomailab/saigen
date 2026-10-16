@@ -65,6 +65,9 @@ shared_devices:
   microscope_index: 2     # USB digital microscope (UVC, e.g. 400-CAM106) used by capture_microscope
   microscope_port: ""     # its control serial port (CP210x, e.g. COM10) for microscope_led; "" = no LED control
   microscope_resolution: "3840x2160"   # capture size; 4K is the sharpest and fastest mode (0.4-2 MB per JPEG). Use "1280x720" to keep data small
+  dmm_resource: ""        # Keithley 2002 DMM (GPIB) for measure_dmm: VISA resource such as GPIB0::16::INSTR (16 = factory address); "" = no DMM
+  dmm_timeout_ms: 10000   # upper limit of one DMM read; raise it for NPLC 50 with autorange or AC
+  wait_after_dmm: 0.0     # seconds to wait after each measure_dmm step before the next step
 
 # Dobot workspace limits. WorkspaceValidator checks every move against
 # these BEFORE the robot is commanded, for all robots (except where a
