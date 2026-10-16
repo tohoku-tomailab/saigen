@@ -171,14 +171,19 @@ def test_executor_guard_ignores_robots_without_supported_actions():
 # plan_resources / preflight
 # ----------------------------------------------------------------------
 def test_plan_resources_signature():
-    # 7 values since the Keithley 2002 DMM (needs_dmm); every runner unpacks all of them
-    result = run_flow.plan_resources([
+    # a NamedTuple read by name in every runner (it grew with each shared device)
+    plan = run_flow.plan_resources([
         {"action": "suction", "robot_id": 4}, {"action": "aspirate", "robot_id": 1},
         {"action": "measure_weight"},
     ])
-    assert len(result) == 7
-    robot_ids, picus2, scale, camera, micro, micro_serial, dmm = result
-    assert robot_ids == [1, 4] and picus2 == {1} and scale and not camera and not dmm
+    assert plan._fields == ("robot_ids", "picus2_robots", "needs_scale", "needs_camera",
+                            "needs_microscope", "needs_microscope_serial", "needs_dmm",
+                            "needs_lockin")
+    assert plan.robot_ids == [1, 4] and plan.picus2_robots == {1} and plan.needs_scale
+    assert not (plan.needs_camera or plan.needs_dmm or plan.needs_lockin)
+    assert plan.shared_kwargs() == dict(use_scale=True, use_camera=False, use_microscope=False,
+                                        use_microscope_serial=False, use_dmm=False,
+                                        use_lockin=False)
 
 
 def test_preflight_capabilities():

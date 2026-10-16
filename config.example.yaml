@@ -68,6 +68,9 @@ shared_devices:
   dmm_resource: ""        # Keithley 2002 DMM (GPIB) for measure_dmm: VISA resource such as GPIB0::16::INSTR (16 = factory address); "" = no DMM
   dmm_timeout_ms: 10000   # upper limit of one DMM read; raise it for NPLC 50 with autorange or AC
   wait_after_dmm: 0.0     # seconds to wait after each measure_dmm step before the next step
+  lockin_resource: ""     # NF LI5640 lock-in amplifier (GPIB, read-only) for measure_lockin: VISA resource such as GPIB0::<address>::INSTR; its address must differ from every other instrument on the bus; "" = no lock-in
+  lockin_timeout_ms: 5000 # upper limit of one LI5640 read or write
+  wait_after_lockin: 0.0  # seconds to wait AFTER each measure_lockin step (not a settling time before it)
 
 # Dobot workspace limits. WorkspaceValidator checks every move against
 # these BEFORE the robot is commanded, for all robots (except where a

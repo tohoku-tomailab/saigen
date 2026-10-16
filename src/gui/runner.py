@@ -587,8 +587,8 @@ class FlowRunner:
 
         steps = self.steps
         total = len(steps)
-        (robot_ids, picus2_robots, needs_scale, needs_camera,
-         needs_microscope, needs_microscope_serial, needs_dmm) = plan_resources(steps)
+        plan = plan_resources(steps)
+        robot_ids, picus2_robots = plan.robot_ids, plan.picus2_robots
 
         exp_logger = ExperimentLogger(
             self.workflow.name,
@@ -648,12 +648,8 @@ class FlowRunner:
             for rid in robot_ids:
                 await session.add_robot(rid, use_picus2=(rid in picus2_robots))
                 check_stop()
-            if (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
-                    or needs_dmm):
-                await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
-                                         use_microscope=needs_microscope,
-                                         use_microscope_serial=needs_microscope_serial,
-                                         use_dmm=needs_dmm)
+            if plan.needs_shared:
+                await session.add_shared(**plan.shared_kwargs())
 
             for i, step in enumerate(steps, 1):
                 # Cancellation is checked between steps as well, so a Stop
@@ -684,7 +680,8 @@ class FlowRunner:
                 except Exception as step_err:
                     duration = time.monotonic() - t0
                     exp_logger.record_step(i, total, action, rid, iteration,
-                                           "error", duration, error=str(step_err))
+                                           "error", duration, error=str(step_err),
+                                           diagnostics=getattr(step_err, "diagnostics", None))
                     self._emit(ProgressEvent(
                         kind="step", index=i, total=total, action=action, robot_id=rid,
                         iteration=iteration, status="error", duration=duration,

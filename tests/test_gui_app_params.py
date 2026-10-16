@@ -46,6 +46,7 @@ VALID_STEPS = [
     {"action": "measure_dmm", "function": "dc_voltage", "samples": 3, "nplc": 1.0,
      "range": 20.0},                                                                   # 22
     {"action": "rotate", "robot_id": 1, "angle": 90.0},                                # 23
+    {"action": "measure_lockin", "samples": 5, "interval": 0.5},                       # 24
 ]
 
 
@@ -74,7 +75,8 @@ def test_every_palette_block_renders_its_parameters():
     assert _errors(at) == []
     # the editors were drawn, not skipped (invalid steps are shown read-only)
     keys = {w.key for w in at.number_input}
-    for param, idx in (("delay", 21), ("volume", 9), ("timeout", 17), ("nplc", 22)):
+    for param, idx in (("delay", 21), ("volume", 9), ("timeout", 17), ("nplc", 22),
+                       ("interval", 24)):
         assert any(k and k.startswith(f"{param}_") and k.endswith(f"_{idx}") for k in keys), param
 
 

@@ -41,6 +41,13 @@ def _full_precision(value) -> str:
     return repr(float(value))
 
 
+def _json_cell(value) -> str:
+    """dict / list を CSV の 1 セルに入れる JSON 文字列にする（空なら ""）"""
+    if value is None or value == {} or value == []:
+        return ""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
 #: 実行モードの表記（metadata / CSV / summary で共通）
 MODES = ("mock", "real")
 _MODE_LABELS = {"mock": "MOCK（シミュレーション・実機なし）", "real": "REAL（実機）"}
@@ -119,6 +126,8 @@ class ExperimentLogger:
         # 構造化記録の蓄積先
         self.records = []          # 全ステップの記録
         self.events = []           # 重量測定・画像撮影など特筆すべきイベント
+        self.step_diagnostics = []  # 失敗したステップの診断データ（metadata.json へ）
+        self.lockin_settings = []   # 成功したロックイン読み取りのパネル設定（metadata.json へ）
         self.robots_used = set()
         self.picus2_robots = set()
         self.robot_types = {}      # robot_id -> "dobot" / "maxarm"
@@ -174,7 +183,7 @@ class ExperimentLogger:
         self.recording = dict(info) if info is not None else None
 
     def record_step(self, index, total, action, robot_id, iteration,
-                    status, duration, result=None, error=None):
+                    status, duration, result=None, error=None, diagnostics=None):
         """1ステップの実行結果を記録
 
         Args:
@@ -188,6 +197,9 @@ class ExperimentLogger:
             result: execute_step の戻り値（{"weight":..} / {"image_path":..} /
                 {"dmm_value":.., "dmm_unit":..} 等）
             error: 例外メッセージ（失敗時）
+            diagnostics: 失敗の診断データ（例外の ``diagnostics`` 属性。ロックインの
+                設定変化の前後・差分、捨てたサンプルの理由など）。CSV の diagnostics 列、
+                時系列イベント、metadata.json の step_diagnostics に残す
         """
         now = datetime.now()
         elapsed = time.monotonic() - self._t0
@@ -227,9 +239,31 @@ class ExperimentLogger:
             "dmm_nplc": _full_precision(result.get("dmm_nplc")),
             "dmm_valid_samples": (str(result["dmm_valid_samples"])
                                   if isinstance(result.get("dmm_valid_samples"), int) else ""),
+            "lockin_data1": _full_precision(result.get("lockin_data1")),
+            "lockin_data1_kind": result.get("lockin_data1_kind") or "",
+            "lockin_data1_unit": result.get("lockin_data1_unit") or "",
+            "lockin_data2": _full_precision(result.get("lockin_data2")),
+            "lockin_data2_kind": result.get("lockin_data2_kind") or "",
+            "lockin_data2_unit": result.get("lockin_data2_unit") or "",
+            "lockin_freq": _full_precision(result.get("lockin_freq")),
+            "lockin_sensitivity": result.get("lockin_sensitivity") or "",
+            "lockin_time_constant": result.get("lockin_time_constant") or "",
+            "lockin_valid_samples": (str(result["lockin_valid_samples"])
+                                     if isinstance(result.get("lockin_valid_samples"), int) else ""),
+            "lockin_invalid": _json_cell(result.get("lockin_invalid")),
+            "lockin_settings": _json_cell(result.get("lockin_settings")),
+            "diagnostics": _json_cell(diagnostics),
             "error": error or "",
         }
         self.records.append(record)
+        if diagnostics:
+            self.step_diagnostics.append({"step_index": index, "action": action,
+                                          "iteration": record["iteration"],
+                                          "error": error or "", "diagnostics": diagnostics})
+        if status == "ok" and isinstance(result.get("lockin_settings"), dict):
+            # 成功した読み取りのパネル設定も構造のまま残す（CSV の JSON 文字列を解析させない）
+            self.lockin_settings.append({"step_index": index, "iteration": record["iteration"],
+                                         "settings": result["lockin_settings"]})
 
         # 特筆イベント（時系列レポート用）
         if weight is not None:
@@ -249,6 +283,27 @@ class ExperimentLogger:
                 "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
                 "kind": "dmm",
                 "detail": f"{record['dmm_value']} {record['dmm_unit']} ({record['dmm_function']})",
+                "step_index": index, "iteration": record["iteration"],
+            })
+        if record["lockin_data1"]:
+            self.events.append({
+                "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
+                "kind": "lockin",
+                "detail": (f"{record['lockin_data1_kind']} {record['lockin_data1']} "
+                           f"{record['lockin_data1_unit']}, {record['lockin_data2_kind']} "
+                           f"{record['lockin_data2']} {record['lockin_data2_unit']}, "
+                           f"{record['lockin_freq']} Hz"),
+                "step_index": index, "iteration": record["iteration"],
+            })
+        if diagnostics:
+            keys = ", ".join(sorted(diagnostics.get("settings_diff", {}))) or ""
+            invalid = diagnostics.get("invalid") or {}
+            parts = ([f"設定の変化: {keys}"] if keys else []) + (
+                [f"捨てたサンプル: {_json_cell(invalid)}"] if invalid else [])
+            self.events.append({
+                "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
+                "kind": "diagnostics",
+                "detail": "; ".join(parts) or (error or "診断データあり（metadata.json）"),
                 "step_index": index, "iteration": record["iteration"],
             })
 
@@ -289,7 +344,12 @@ class ExperimentLogger:
                   "iteration", "action", "robot_id", "status", "duration_s",
                   "weight_g", "nominal_time_s", "image_path", "focus_position",
                   "focus_converged", "dmm_value", "dmm_unit", "dmm_function",
-                  "dmm_range", "dmm_nplc", "dmm_valid_samples", "error"]
+                  "dmm_range", "dmm_nplc", "dmm_valid_samples",
+                  "lockin_data1", "lockin_data1_kind", "lockin_data1_unit",
+                  "lockin_data2", "lockin_data2_kind", "lockin_data2_unit",
+                  "lockin_freq", "lockin_sensitivity", "lockin_time_constant",
+                  "lockin_valid_samples", "lockin_invalid", "lockin_settings",
+                  "diagnostics", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -300,6 +360,7 @@ class ExperimentLogger:
         weights = [r for r in self.records if r["weight_g"] != ""]
         images = [r for r in self.records if r["image_path"] != ""]
         dmm_readings = [r for r in self.records if r["dmm_value"] != ""]
+        lockin_readings = [r for r in self.records if r["lockin_data1"] != ""]
         meta = {
             "name": self.name,
             "description": self.description,
@@ -320,6 +381,11 @@ class ExperimentLogger:
             "robot_types": {str(rid): t for rid, t in sorted(self.robot_types.items())},
             "weight_measurements": len(weights),
             "dmm_measurements": len(dmm_readings),
+            "lockin_measurements": len(lockin_readings),
+            # 失敗したステップの診断データ（ロックインの設定変化の前後など）
+            "step_diagnostics": self.step_diagnostics,
+            # 成功したロックイン読み取りごとのパネル設定（感度・時定数・表示など）
+            "lockin_settings": self.lockin_settings,
             "images_captured": len(images),
             "sensor_recording": self.recording,
             "output_files": {
@@ -340,6 +406,7 @@ class ExperimentLogger:
         weights = [e for e in self.events if e["kind"] == "weight"]
         images = [e for e in self.events if e["kind"] == "image"]
         dmm_events = [e for e in self.events if e["kind"] == "dmm"]
+        lockin_events = [e for e in self.events if e["kind"] == "lockin"]
 
         lines = []
         lines.append(f"# 実験レポート: {self.name}")
@@ -364,7 +431,8 @@ class ExperimentLogger:
                 lines.append("- **ロボット種別**: " + ", ".join(
                     f"Robot {rid} = {t}" for rid, t in sorted(self.robot_types.items())))
         lines.append(f"- **重量測定**: {len(weights)} 回 / **撮影画像**: {len(images)} 枚"
-                     + (f" / **DMM 測定**: {len(dmm_events)} 回" if dmm_events else ""))
+                     + (f" / **DMM 測定**: {len(dmm_events)} 回" if dmm_events else "")
+                     + (f" / **ロックイン測定**: {len(lockin_events)} 回" if lockin_events else ""))
         if self.error:
             lines.append(f"- **エラー**: {self.error}")
         lines.append("")
@@ -382,7 +450,8 @@ class ExperimentLogger:
             lines.append("| 経過(s) | 時刻 | 種別 | ステップ | 反復 | 内容 |")
             lines.append("|--------:|------|------|---------:|------|------|")
             for e in self.events:
-                kind = {"weight": "⚖️ 重量", "image": "📷 画像", "dmm": "🔌 DMM"}.get(e["kind"], e["kind"])
+                kind = {"weight": "⚖️ 重量", "image": "📷 画像", "dmm": "🔌 DMM",
+                        "lockin": "📈 ロックイン", "diagnostics": "⚠️ 診断"}.get(e["kind"], e["kind"])
                 detail = e["detail"]
                 if e["kind"] == "image":
                     rel = os.path.relpath(detail, self.dir) if os.path.isabs(detail) else detail
@@ -390,7 +459,7 @@ class ExperimentLogger:
                 lines.append(f"| {e['elapsed_s']:.1f} | {e['timestamp'].split(' ')[1]} "
                              f"| {kind} | {e['step_index']} | {e['iteration']} | {detail} |")
         else:
-            lines.append("（重量測定・DMM 測定・画像撮影はありませんでした）")
+            lines.append("（重量測定・DMM 測定・ロックイン測定・画像撮影はありませんでした）")
         lines.append("")
 
         # 重量測定の抜粋（解析しやすいように数値だけ再掲）
@@ -417,6 +486,23 @@ class ExperimentLogger:
                              f"| {r['dmm_nplc']} | {r['dmm_valid_samples']} |")
             lines.append("")
 
+        # ロックインアンプの読み取り値（丸めない値・表示の種類・単位）
+        if lockin_events:
+            rows = [r for r in self.records if r["lockin_data1"] != ""]
+            lines.append("## ロックイン測定値")
+            lines.append("")
+            lines.append("| # | 経過(s) | 反復 | DATA1 | 単位 | DATA2 | 単位 | 周波数(Hz) "
+                         "| 感度 | 時定数 | 有効回数 |")
+            lines.append("|---|--------:|------|------:|------|------:|------|-----------:"
+                         "|------|--------|------:|")
+            for i, r in enumerate(rows, 1):
+                lines.append(f"| {i} | {r['elapsed_s']:.1f} | {r['iteration']} "
+                             f"| {r['lockin_data1_kind']} {r['lockin_data1']} | {r['lockin_data1_unit']} "
+                             f"| {r['lockin_data2_kind']} {r['lockin_data2']} | {r['lockin_data2_unit']} "
+                             f"| {r['lockin_freq']} | {r['lockin_sensitivity']} "
+                             f"| {r['lockin_time_constant']} | {r['lockin_valid_samples']} |")
+            lines.append("")
+
         # 全ステップの実行記録
         lines.append("## 全ステップ実行記録")
         lines.append("")
@@ -430,6 +516,9 @@ class ExperimentLogger:
                 note = os.path.basename(r["image_path"])
             elif r.get("dmm_value"):
                 note = f"{r['dmm_value']} {r['dmm_unit']}"
+            elif r.get("lockin_data1"):
+                note = (f"{r['lockin_data1_kind']} {r['lockin_data1']} {r['lockin_data1_unit']}, "
+                        f"{r['lockin_data2_kind']} {r['lockin_data2']} {r['lockin_data2_unit']}")
             elif r.get("focus_position"):
                 note = f"lens {r['focus_position']}"
                 if r.get("focus_converged") == "False":

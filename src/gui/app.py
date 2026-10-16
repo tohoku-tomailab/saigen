@@ -147,6 +147,10 @@ ACTION_CONFIG = {
         "icon": "🔌", "label": "DMM測定", "category": "sensor",
         "defaults": {"function": "dc_voltage", "samples": 3, "nplc": 1.0}
     },
+    "measure_lockin": {
+        "icon": "📈", "label": "ロックイン測定", "category": "sensor",
+        "defaults": {"samples": 5, "interval": 0.0}
+    },
     # ループ制御
     "loop_start": {
         "icon": "🔁", "label": "ループ開始", "category": "loop",
@@ -174,7 +178,7 @@ CATEGORIES = {
     "peripheral": ("🔩 周辺機器", ["move_slider", "move_conveyer"]),
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
     "maxarm": ("🧲 MaxArm", ["suction"]),
-    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm"]),
+    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm", "measure_lockin"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
 }
@@ -829,6 +833,8 @@ def get_param_summary(step):
         rng = step.get('range')
         return (f"{escape(str(step.get('function', 'dc_voltage')))} {step.get('samples', 3)}回 "
                 f"NPLC {step.get('nplc', 1.0)} " + (f"レンジ {rng}" if rng is not None else "オート"))
+    elif action == "measure_lockin":
+        return f"{step.get('samples', 5)}回 間隔 {step.get('interval', 0.0)}秒"
     elif action == "go_home":
         return ""
     elif action == "loop_start":
@@ -1031,6 +1037,13 @@ def render_step_params(step, idx):
             _num(st, f"レンジ ({unit}, 最大 {max_range:g})", step, idx, "range", float, max_range,
                  min_value=1e-9, max_value=max_range)
         st.caption("Keithley 2002（config.yaml の shared_devices.dmm_resource）")
+
+    elif action == "measure_lockin":
+        _num(st, "読み取り回数（中央値）", step, idx, "samples", int, 5, min_value=1, max_value=100)
+        _num(st, "読み取り間隔(秒)", step, idx, "interval", float, 0.0,
+             min_value=0.0, max_value=60.0, step=0.1)
+        st.caption("NF LI5640（config.yaml の shared_devices.lockin_resource）。感度・時定数・"
+                   "表示は前面パネルで設定し、整定を待ってから実行してください")
 
     elif action == "loop_start":
         _num(st, "繰り返し回数", step, idx, "count", int, 10, min_value=1, max_value=1000)

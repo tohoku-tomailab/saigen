@@ -14,7 +14,10 @@ import asyncio
 import logging
 import statistics
 import threading
+import time
 from typing import Optional
+
+from src.devices.li5640.li5640 import OPCR_AUTO_SENSITIVITY, OPCR_AUTO_SETUP
 
 # ロギング設定
 logger = logging.getLogger(__name__)
@@ -48,6 +51,7 @@ class SharedDevices:
                  use_microscope: bool = False,
                  use_microscope_serial: bool = False,
                  use_dmm: bool = False,
+                 use_lockin: bool = False,
                  **device_configs):
         """
         SharedDevicesを初期化
@@ -61,6 +65,8 @@ class SharedDevices:
                 （microscope_led / microscope_focus）。microscope_port が必要
             use_dmm: Keithley 2002 デジタルマルチメータ（GPIB）を使用するか
                 （measure_dmm）。dmm_resource が必要
+            use_lockin: NF LI5640 ロックインアンプ（GPIB、読み取り専用）を使用するか
+                （measure_lockin）。lockin_resource が必要
             **device_configs: デバイス固有の設定
                 - scale_port: str (デフォルト: 'COM4') - BCE8221天秤のCOMポート
                 - camera_index: int (デフォルト: 1) - Webcamのデバイスインデックス
@@ -72,6 +78,10 @@ class SharedDevices:
                 - dmm_resource: str (デフォルト: '') - Keithley 2002 の VISA リソース
                   (例 'GPIB0::16::INSTR')
                 - dmm_timeout_ms: int (デフォルト: 10000) - DMM の 1 回の I/O の上限
+                - lockin_resource: str (デフォルト: '') - LI5640 の VISA リソース
+                - lockin_timeout_ms: int (デフォルト: 5000) - LI5640 の 1 回の I/O の上限
+                - wait_after_lockin: float (デフォルト: 0) - measure_lockin の後の待機秒
+                  （測定の後の間隔。測定前の整定待ちではない）
         """
         # デバイス使用フラグ
         self.use_scale = use_scale
@@ -79,6 +89,7 @@ class SharedDevices:
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
         self.use_dmm = use_dmm
+        self.use_lockin = use_lockin
 
         # デバイスインスタンス（初期化前はNone）
         self.scale = None
@@ -86,6 +97,9 @@ class SharedDevices:
         self.microscope = None
         self.microscope_serial = None
         self.dmm = None
+        self.lockin = None
+        # 接続時に読んだ LI5640 の OTYP（切断時に戻す）。読む前に失敗したら None
+        self._lockin_saved_otyp = None
 
         # DMM の I/O はワーカースレッドで行い、ロックで直列化する（測定・切断が
         # 同時にバスを触らない）。ハンドルを閉じるのは常にロックを持つ側:
@@ -93,6 +107,9 @@ class SharedDevices:
         # ワーカーが通信を終えたところで閉じる（排他を破って閉じることはない）
         self._dmm_lock = threading.Lock()
         self._dmm_closing = threading.Event()
+        # LI5640 も同じ規則（機器ごとのロック。同じ GPIB バスでも宛先は別の機器）
+        self._lockin_lock = threading.Lock()
+        self._lockin_closing = threading.Event()
 
         # デバイス設定
         self.device_configs = device_configs
@@ -102,6 +119,8 @@ class SharedDevices:
         self.wait_after_dmm = float(device_configs.get('wait_after_dmm') or 0.0)
         # cleanup() が DMM ワーカーの通信終了を待つ上限（秒）。超えたらワーカーに任せる
         self.dmm_close_wait_s = self._dmm_timeout_ms() / 1000.0 * 2 + 5.0
+        self.wait_after_lockin = float(device_configs.get('wait_after_lockin') or 0.0)
+        self.lockin_close_wait_s = self._lockin_timeout_ms() / 1000.0 * 2 + 5.0
 
         # 初期化フラグ
         self._initialized = False
@@ -137,6 +156,11 @@ class SharedDevices:
             # DMM（Keithley 2002, GPIB）の初期化
             if self.use_dmm:
                 if not await self._initialize_dmm():
+                    return False
+
+            # ロックインアンプ（NF LI5640, GPIB）の初期化
+            if self.use_lockin:
+                if not await self._initialize_lockin():
                     return False
 
             self._initialized = True
@@ -281,6 +305,60 @@ class SharedDevices:
             return True
         except Exception as e:
             logger.error(f"Keithley 2002 初期化エラー（{resource}）: {e}")
+            return False
+
+    def _lockin_timeout_ms(self) -> int:
+        return int(self.device_configs.get('lockin_timeout_ms') or 5000)
+
+    async def _initialize_lockin(self) -> bool:
+        """LI5640 を開き、機種・エラーキュー・連続出力の停止を確かめ、OTYP を覚える
+
+        失敗時はハンドルを残さない（OTYP を読む前なら復元もしない）。I/O は
+        ワーカースレッドで行い、中断されても cleanup()（またはワーカー自身）が閉じる。
+        """
+        resource = self.device_configs.get('lockin_resource') or ""
+        if not resource:
+            logger.error("ロックインアンプの VISA リソースが未設定です "
+                         "(config.yaml の shared_devices.lockin_resource を設定してください。"
+                         "例: GPIB0::<アドレス>::INSTR)")
+            return False
+        timeout_ms = self._lockin_timeout_ms()
+
+        def _open():
+            from src.devices.li5640 import LI5640, LI5640Error
+            with self._lockin_lock:
+                if self._lockin_closing.is_set():
+                    raise RuntimeError("切断処理が始まっているため LI5640 を開きません")
+                self.lockin = LI5640(resource, timeout_ms=timeout_ms)
+                self.lockin.abort_check = self._lockin_closing.is_set
+                try:
+                    self.lockin.clear_status()
+                    idn = self.lockin.identify()
+                    self.lockin.check_errors("接続確認")
+                    if self.lockin.continuous_output():
+                        raise LI5640Error("連続データ出力（OSTR 1）が動いています。"
+                                          "前面パネルの操作か別のソフトで止めてから実行してください"
+                                          "（SAIGEN は止めるコマンドを送りません）")
+                    self._lockin_saved_otyp = self.lockin.output_type()
+                except BaseException:
+                    self._release_lockin_locked()
+                    raise
+                finally:
+                    if self._lockin_closing.is_set():
+                        self._release_lockin_locked()
+                return idn, self._lockin_saved_otyp
+
+        try:
+            logger.info(f"LI5640（{resource}）を初期化中...")
+            idn, otyp = await asyncio.to_thread(_open)
+            logger.info(f"✓ LI5640 初期化完了: {idn}（OTYP {otyp} を切断時に戻します）")
+            return True
+        except asyncio.CancelledError:
+            # 中断されたら、ワーカーは次の問い合わせを送らない（切断は cleanup() が行う）
+            self._lockin_closing.set()
+            raise
+        except Exception as e:
+            logger.error(f"LI5640 初期化エラー（{resource}）: {e}")
             return False
 
     @staticmethod
@@ -499,6 +577,191 @@ class SharedDevices:
 
         if not await asyncio.to_thread(_close):
             raise RuntimeError("Keithley 2002 を閉じられませんでした（ハンドルは保持しています）")
+
+    # ========================================
+    # ロックインアンプ（NF LI5640）操作
+    # ========================================
+
+    async def measure_lockin(self, samples: int = 5, interval: float = 0.0) -> dict:
+        """
+        LI5640 のパネル表示値（DATA1 / DATA2）と参照周波数を samples 回読み、中央値を返す
+
+        測定設定は変えない（送る設定は OTYP だけ。切断時に戻す）。読み取りの前後で
+        パネル設定を読み、違っていればステップを失敗にする（途中で変えて戻された
+        場合は検出できない）。値の意味（X / R / θ ...、単位）はその設定から決める。
+
+        Args:
+            samples: 読み取り回数（1〜100）
+            interval: 読み取りの間隔（秒）。整定待ちではない（測定前の整定は人が待つ）
+
+        Returns:
+            dict: ``lockin_data1`` / ``lockin_data2``（有効サンプルの中央値。θ は円弧上の
+            中央値）, ``lockin_data{1,2}_kind`` / ``_unit``, ``lockin_freq``（Hz）,
+            ``lockin_sensitivity``, ``lockin_time_constant``, ``lockin_valid_samples``,
+            ``lockin_invalid``（捨てた理由ごとの数）, ``lockin_settings``（設定の dict）
+
+        Raises:
+            RuntimeError: 初期化されていない・中断された
+            LockinStepError: 設定の変化、有効サンプルなし、θ が曖昧（``diagnostics`` 付き）
+            LI5640Error: 機器のエラー・解釈できない設定値。I/O エラーはそのまま送出
+        """
+        from src.devices.li5640 import LockinStepError
+        from src.devices.li5640.li5640 import (describe, format_si, invalid_reason,
+                                               sensitivity_value, snapshot_diff, theta_median,
+                                               time_constant_value)
+        if not self.use_lockin or self.lockin is None or self._lockin_closing.is_set():
+            raise RuntimeError("LI5640 が初期化されていません")
+        samples = int(samples)
+        interval = float(interval)
+        if samples < 1:
+            raise ValueError(f"samples は 1 以上: {samples}")
+        lia = self.lockin
+        stop = threading.Event()        # この測定だけの打ち切り要求
+
+        def _stopped() -> bool:
+            return stop.is_set() or self._lockin_closing.is_set()
+
+        def _run():
+            from src.devices.li5640 import READ_OUTPUT_TYPE, LI5640Aborted
+            with self._lockin_lock:
+                if self.lockin is not lia or self._lockin_closing.is_set():
+                    return None
+                lia.abort_check = _stopped
+                try:
+                    lia.set_output_type(READ_OUTPUT_TYPE)
+                    before = lia.snapshot()
+                    reads = []
+                    for i in range(samples):
+                        if i and interval > 0:
+                            # 中断・切断要求を 0.1 秒ごとに見ながら待つ
+                            deadline = time.monotonic() + interval
+                            while (left := deadline - time.monotonic()) > 0:
+                                if stop.wait(min(0.1, left)) or _stopped():
+                                    return None
+                        reads.append(lia.read_sample())
+                    after = lia.snapshot()
+                    return before, after, reads
+                except LI5640Aborted:
+                    return None
+                finally:
+                    lia.abort_check = self._lockin_closing.is_set
+                    if self._lockin_closing.is_set():
+                        self._release_lockin_locked()
+
+        try:
+            outcome = await asyncio.to_thread(_run)
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+        except Exception as e:
+            logger.error(f"LI5640 測定エラー: {e}")
+            raise
+        if outcome is None:
+            raise RuntimeError("LI5640 の測定が中断されました")
+        before, after, reads = outcome
+
+        # サンプルの分類を先に済ませ、どの失敗の診断にも捨てた理由の件数を入れる
+        desc = describe(before)
+        valid = []
+        invalid = {}
+        for sample, warning, _raw in reads:
+            reason = invalid_reason(sample, warning, desc)
+            if reason is None:
+                valid.append(sample)
+            else:
+                invalid[reason] = invalid.get(reason, 0) + 1
+        diagnostics = {"settings_before": before, "settings_after": after,
+                       "samples": samples, "interval_s": interval,
+                       "invalid": invalid, "display": desc}
+        diff = snapshot_diff(before, after)
+        if diff:
+            diagnostics["settings_diff"] = diff
+            logger.error(f"LI5640 の設定が測定中に変わりました: {diff}")
+            raise LockinStepError(f"LI5640 の設定が測定中に変わりました: {sorted(diff)}", diagnostics)
+        if before["opcr"] & (OPCR_AUTO_SETUP | OPCR_AUTO_SENSITIVITY):
+            raise LockinStepError(f"LI5640 で自動設定が実行中です（OPCR {before['opcr']}）",
+                                  diagnostics)
+        if invalid:
+            logger.warning(f"LI5640: {sum(invalid.values())}/{samples} 回のサンプルを捨てました {invalid}")
+        if not valid:
+            raise LockinStepError(f"LI5640 から有効なサンプルを取得できませんでした"
+                                  f"（{samples} 回: {invalid}）", diagnostics)
+
+        data1 = statistics.median(s["data1"] for s in valid)
+        if desc["data2_kind"] == "THETA":
+            data2 = theta_median([s["data2"] for s in valid])
+            if data2 is None:
+                raise LockinStepError("LI5640 の位相が幅 180° 以上に散らばっていて、"
+                                      "中央値を決められません", diagnostics)
+        else:
+            data2 = statistics.median(s["data2"] for s in valid)
+        freq = statistics.median(s["freq"] for s in valid)
+
+        current = before["isrc"] in (2, 3)
+        sens_code = before["isen"] if current else before["vsen"]
+        sens_unit = ("A" if current else "V") + ("/√Hz" if desc["data1_kind"] == "NOISE" else "")
+        sensitivity = format_si(sensitivity_value(sens_code, current), sens_unit)
+        time_constant = format_si(time_constant_value(before["tcon"]), "s")
+
+        def kind(n):
+            mode = desc[f"data{n}_mode"]
+            return desc[f"data{n}_kind"] + ("" if mode == "plain" else f"[{mode}]")
+
+        logger.info(f"✓ LI5640: DATA1 {kind(1)} = {data1!r} {desc['data1_unit']}, "
+                    f"DATA2 {kind(2)} = {data2!r} {desc['data2_unit']}, f = {freq!r} Hz"
+                    f"（有効 {len(valid)}/{samples} 回, 感度 {sensitivity}, 時定数 {time_constant}）")
+        if self.wait_after_lockin > 0:
+            await asyncio.sleep(self.wait_after_lockin)
+        return {
+            "lockin_data1": data1,
+            "lockin_data1_kind": kind(1),
+            "lockin_data1_unit": desc["data1_unit"],
+            "lockin_data2": data2,
+            "lockin_data2_kind": kind(2),
+            "lockin_data2_unit": desc["data2_unit"],
+            "lockin_freq": freq,
+            "lockin_sensitivity": sensitivity,
+            "lockin_time_constant": time_constant,
+            "lockin_valid_samples": len(valid),
+            "lockin_invalid": invalid,
+            "lockin_settings": before,
+        }
+
+    def _release_lockin_locked(self) -> bool:
+        """クリア・OTYP 復元・GTL・切断。呼び出し側が _lockin_lock を持っていること
+
+        送出しない。close() に失敗したらエラーをログに残し、ハンドルを残す
+        （次の cleanup() で再試行できる。そのときも OTYP の復元から試す）。
+        """
+        lia = self.lockin
+        if lia is None:
+            return True
+        try:
+            lia.release(self._lockin_saved_otyp)
+        except Exception as e:  # noqa: BLE001 - 記録してハンドルを残す
+            logger.error(f"LI5640 を閉じられません（次の cleanup() で再試行します）: {e}")
+            return False
+        self.lockin = None
+        self._lockin_saved_otyp = None
+        logger.info("✓ LI5640 切断完了")
+        return True
+
+    async def _close_lockin(self):
+        """LI5640 を閉じる。通信中のワーカーがいればその I/O が終わるのを待つ（DMM と同じ）"""
+        self._lockin_closing.set()
+
+        def _close():
+            if not self._lockin_lock.acquire(timeout=self.lockin_close_wait_s):
+                logger.warning("LI5640 の通信が終わっていません。通信を終えたワーカーが"
+                               "OTYP 復元・GTL・切断します")
+                return True
+            try:
+                return self._release_lockin_locked()
+            finally:
+                self._lockin_lock.release()
+
+        if not await asyncio.to_thread(_close):
+            raise RuntimeError("LI5640 を閉じられませんでした（ハンドルは保持しています）")
 
     # ========================================
     # カメラ操作
@@ -733,13 +996,29 @@ class SharedDevices:
         except Exception as e:
             logger.error(f"デジタル顕微鏡 制御ポート切断エラー: {e}")
 
-        try:
-            # self.dmm ではなく use_dmm で判定する: 初期化ワーカーがまだ動いていても
-            # _close_dmm はロックを取ってから開いたハンドルを閉じる
-            if self.use_dmm:
-                await self._close_dmm()
-        except Exception as e:
-            logger.error(f"Keithley 2002 切断エラー: {e}")
+        # GPIB 機器: self.dmm ではなく use_dmm で判定する（初期化ワーカーがまだ動いていても
+        # _close_* はロックを取ってから開いたハンドルを閉じる）。切断を待っている間に
+        # 中断されても残りの機器の切断を続け、全部試してから中断を送出する
+        # 先に全機器の切断要求を立てる: 1 台目の切断を待っている間に、2 台目の
+        # ワーカー（初期化中・測定中）が通常の問い合わせを送り続けないように
+        if self.use_dmm:
+            self._dmm_closing.set()
+        if self.use_lockin:
+            self._lockin_closing.set()
+        cancelled = None
+        for label, used, close in (("Keithley 2002", self.use_dmm, self._close_dmm),
+                                   ("LI5640", self.use_lockin, self._close_lockin)):
+            if not used:
+                continue
+            try:
+                await close()
+            except asyncio.CancelledError as e:
+                logger.error(f"{label} の切断中に中断されました。残りの機器の切断を続けます")
+                cancelled = e
+            except Exception as e:
+                logger.error(f"{label} 切断エラー: {e}")
+        if cancelled is not None:
+            raise cancelled
 
         logger.info("=== SharedDevices 全デバイス切断完了 ===")
 

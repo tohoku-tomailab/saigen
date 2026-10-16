@@ -210,10 +210,11 @@ def test_capture_microscope_is_a_shared_device_action():
 
 
 def test_plan_resources_flags_microscope():
-    ids, picus, scale, camera, microscope, serial, dmm = run_flow.plan_resources(
+    plan = run_flow.plan_resources(
         [{"action": "capture_microscope"}, {"action": "capture_and_save"}])
-    assert ids == [] and picus == set()
-    assert (scale, camera, microscope, dmm) == (False, True, True, False)
+    assert plan.robot_ids == [] and plan.picus2_robots == set()
+    assert (plan.needs_scale, plan.needs_camera, plan.needs_microscope, plan.needs_dmm) == (
+        False, True, True, False)
 
 
 def test_executor_routes_capture_microscope_to_shared_devices():

@@ -19,13 +19,15 @@ _default_logger = logging.getLogger(__name__)
 # 共有デバイス用アクション（robot_idに依存しない）
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
                          "capture_microscope", "microscope_led", "microscope_focus",
-                         "measure_dmm"}
+                         "measure_dmm", "measure_lockin"}
 MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
 # 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
 MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}
 MICROSCOPE_SERIAL_ACTIONS = {"microscope_led", "microscope_focus"}
 # Keithley 2002 DMM（GPIB）が要るアクション
 DMM_ACTIONS = {"measure_dmm"}
+# NF LI5640 ロックインアンプ（GPIB）が要るアクション
+LOCKIN_ACTIONS = {"measure_lockin"}
 
 # ループ制御アクション（実行時にスキップ）
 LOOP_CONTROL_ACTIONS = {"loop_start", "loop_end"}
@@ -193,6 +195,18 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
                       "nplc": step.nplc, "range_": step.range}
         result = await shared_devices.measure_dmm(**kwargs)
         logger.info(f"  DMM: {result['dmm_value']!r} {result['dmm_unit']} ({result['dmm_function']})")
+        return result
+
+    # ===== ロックインアンプ（NF LI5640、読み取り専用） =====
+    elif action == "measure_lockin":
+        if isinstance(step, dict):
+            kwargs = {"samples": step.get("samples", 5), "interval": step.get("interval", 0.0)}
+        else:
+            kwargs = {"samples": step.samples, "interval": step.interval}
+        result = await shared_devices.measure_lockin(**kwargs)
+        logger.info(f"  LI5640: {result['lockin_data1_kind']} {result['lockin_data1']!r} "
+                    f"{result['lockin_data1_unit']}, {result['lockin_data2_kind']} "
+                    f"{result['lockin_data2']!r} {result['lockin_data2_unit']}")
         return result
 
     else:

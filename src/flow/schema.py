@@ -535,6 +535,40 @@ class ActionMeasureDMM(_StrictModel):
         return self
 
 # ==========================================
+# 1.66 個別のアクション定義 (共有デバイス: NF LI5640 ロックインアンプ)
+# ==========================================
+
+class ActionMeasureLockin(_StrictModel):
+    """
+    NF LI5640 ロックインアンプ（GPIB）のパネル表示値を読む（読み取り専用）
+    SharedDevices.measure_lockin(samples, interval) に対応
+
+    感度・時定数・表示（X/Y、R/θ など）は前面パネルで設定する。結果は
+    measurements.csv の lockin_* 列（DATA1 / DATA2 の値・種類・単位、参照周波数、
+    感度、時定数、有効サンプル数、パネル設定）に記録される。
+    config.yaml の shared_devices.lockin_resource が必要。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["measure_lockin"] = Field(
+        ...,
+        description="アクション識別子: ロックインアンプの読み取り"
+    )
+    samples: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="読み取り回数（有効サンプルの中央値を記録）"
+    )
+    interval: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=60.0,
+        description="読み取りの間隔（秒）。整定待ちではない"
+    )
+
+# ==========================================
 # 1.7 個別のアクション定義 (共有デバイス: BCE8221電子天秤用)
 # ==========================================
 
@@ -654,6 +688,7 @@ LabRobotAction = Union[
     ActionMeasureWeight,
     ActionTareScale,
     ActionMeasureDMM,
+    ActionMeasureLockin,
     # ユーティリティ
     ActionWait,
     # ループ制御

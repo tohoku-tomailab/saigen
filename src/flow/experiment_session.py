@@ -240,7 +240,7 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
 
 
 def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
-                           use_microscope_serial=False, use_dmm=False):
+                           use_microscope_serial=False, use_dmm=False, use_lockin=False):
     """実機 SharedDevices を生成する既定ファクトリ"""
     return SharedDevices(
         use_scale=use_scale,
@@ -248,6 +248,7 @@ def default_shared_factory(*, use_scale, use_camera, config, use_microscope=Fals
         use_microscope=use_microscope,
         use_microscope_serial=use_microscope_serial,
         use_dmm=use_dmm,
+        use_lockin=use_lockin,
         scale_port=config["scale_port"],
         camera_index=config["camera_index"],
         microscope_index=config.get("microscope_index", 2),
@@ -256,16 +257,19 @@ def default_shared_factory(*, use_scale, use_camera, config, use_microscope=Fals
         dmm_resource=config.get("dmm_resource", ""),
         dmm_timeout_ms=config.get("dmm_timeout_ms", 10000),
         wait_after_dmm=config.get("wait_after_dmm", 0.0),
+        lockin_resource=config.get("lockin_resource", ""),
+        lockin_timeout_ms=config.get("lockin_timeout_ms", 5000),
+        wait_after_lockin=config.get("wait_after_lockin", 0.0),
     )
 
 
 def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
-                        use_microscope_serial=False, use_dmm=False):
+                        use_microscope_serial=False, use_dmm=False, use_lockin=False):
     """MockSharedDevices を生成するファクトリ"""
     return MockSharedDevices(use_scale=use_scale, use_camera=use_camera,
                              use_microscope=use_microscope,
                              use_microscope_serial=use_microscope_serial,
-                             use_dmm=use_dmm)
+                             use_dmm=use_dmm, use_lockin=use_lockin)
 
 
 class ExperimentSession:
@@ -461,7 +465,7 @@ class ExperimentSession:
 
     async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
                          use_microscope: bool = False, use_microscope_serial: bool = False,
-                         use_dmm: bool = False):
+                         use_dmm: bool = False, use_lockin: bool = False):
         """設定の値で共有デバイスを生成・初期化して登録する
 
         初期化が途中で失敗した場合（天秤は開いたが DMM が開けない等）は、開いた分を
@@ -478,6 +482,8 @@ class ExperimentSession:
         if use_dmm:
             # use_dmm を知らない差し替えファクトリ（テスト・GUI）も動くよう、要るときだけ渡す
             kwargs["use_dmm"] = True
+        if use_lockin:
+            kwargs["use_lockin"] = True
         shared = self.shared_factory(config=self.shared_config(), **kwargs)
         try:
             ok = await shared.initialize()

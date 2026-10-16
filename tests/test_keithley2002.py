@@ -602,10 +602,11 @@ def test_executor_passes_every_parameter(as_model):
 # 6. Runner wiring
 # ----------------------------------------------------------------------
 def test_plan_resources_needs_dmm_and_no_robot():
-    ids, picus, scale, camera, micro, micro_serial, dmm = run_flow.plan_resources(
-        [{"action": "measure_dmm"}])
-    assert ids == [] and dmm and not (scale or camera or micro or micro_serial)
-    assert run_flow.plan_resources([{"action": "measure_weight"}])[6] is False
+    plan = run_flow.plan_resources([{"action": "measure_dmm"}])
+    assert plan.robot_ids == [] and plan.needs_dmm and plan.needs_shared
+    assert not (plan.needs_scale or plan.needs_camera or plan.needs_microscope
+                or plan.needs_microscope_serial or plan.needs_lockin)
+    assert run_flow.plan_resources([{"action": "measure_weight"}]).needs_dmm is False
 
 
 def test_dmm_resource_priority(monkeypatch):

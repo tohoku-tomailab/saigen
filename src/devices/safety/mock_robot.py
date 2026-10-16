@@ -436,16 +436,22 @@ class MockSharedDevices:
     MOCK_WEIGHT = 4.98
     #: measure_dmm が返すモック測定値（単位は測定機能による）
     MOCK_DMM_VALUE = 1.234
+    #: measure_lockin が返すモック値（DATA1 = X [V], DATA2 = Y [V], 参照周波数 [Hz]）
+    MOCK_LOCKIN_X = 1.0e-3
+    MOCK_LOCKIN_Y = 2.0e-5
+    MOCK_LOCKIN_FREQ = 1000.0
 
     def __init__(self, use_scale: bool = False, use_camera: bool = False,
                  use_microscope: bool = False, use_microscope_serial: bool = False,
-                 use_dmm: bool = False, **_ignored):
+                 use_dmm: bool = False, use_lockin: bool = False, **_ignored):
         self.use_scale = use_scale
         self.use_camera = use_camera
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
         self.use_dmm = use_dmm
         self._dmm_open = False          # 実機と同じく initialize() 〜 cleanup() の間だけ測れる
+        self.use_lockin = use_lockin
+        self._lockin_open = False
         self._captures = 0
         self._microscope_captures = 0
         self.microscope_led_on = True
@@ -455,6 +461,7 @@ class MockSharedDevices:
     async def initialize(self) -> bool:
         logger.info("=== [MOCK] 共有デバイス初期化 (成功) ===")
         self._dmm_open = self.use_dmm
+        self._lockin_open = self.use_lockin
         return True
 
     async def measure_weight(self, stabilization_count: int = 3) -> float:
@@ -489,6 +496,31 @@ class MockSharedDevices:
             "dmm_range": float(range_) if range_ is not None else max_range,
             "dmm_nplc": float(nplc),
             "dmm_valid_samples": int(samples),
+        }
+
+    async def measure_lockin(self, samples: int = 5, interval: float = 0.0) -> dict:
+        # 実機と同じ契約: 未初期化は RuntimeError、samples < 1 は ValueError。
+        # 表示は X / Y（電圧入力、正規化・レシオなし）として返す
+        if not self.use_lockin or not self._lockin_open:
+            raise RuntimeError("LI5640 が初期化されていません")
+        if int(samples) < 1:
+            raise ValueError(f"samples は 1 以上: {samples}")
+        logger.info(f"[MOCK] LI5640 読み取り中（{samples}回, 間隔 {interval}s）...")
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] LI5640: X = {self.MOCK_LOCKIN_X} V, Y = {self.MOCK_LOCKIN_Y} V")
+        return {
+            "lockin_data1": self.MOCK_LOCKIN_X,
+            "lockin_data1_kind": "X",
+            "lockin_data1_unit": "V",
+            "lockin_data2": self.MOCK_LOCKIN_Y,
+            "lockin_data2_kind": "Y",
+            "lockin_data2_unit": "V",
+            "lockin_freq": self.MOCK_LOCKIN_FREQ,
+            "lockin_sensitivity": "100 mV",
+            "lockin_time_constant": "100 ms",
+            "lockin_valid_samples": int(samples),
+            "lockin_invalid": {},
+            "lockin_settings": {"mock": True},
         }
 
     async def tare_scale(self, delay: float = 1.0):
@@ -541,4 +573,5 @@ class MockSharedDevices:
 
     async def cleanup(self):
         self._dmm_open = False
+        self._lockin_open = False
         logger.info("✓ [MOCK] 共有デバイスの仮想接続を切断")

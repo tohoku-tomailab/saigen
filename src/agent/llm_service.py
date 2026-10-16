@@ -100,6 +100,9 @@ SYSTEM_PROMPT = """
 ### デジタルマルチメータ操作（Keithley 2002, GPIB）※共有デバイスのためrobot_id不要
 - measure_dmm: {"action": "measure_dmm", "function": "dc_voltage", "samples": 3, "nplc": 1.0} (DMM 測定。function: "dc_voltage"/"ac_voltage" (V), "dc_current"/"ac_current" (A), "resistance_2w"/"resistance_4w" (Ohm)。samples: 1-10 回の中央値, nplc: 0.01-50 (大きいほど低ノイズで遅い), range: 固定レンジ (省略でオートレンジ))
 
+### ロックインアンプ（NF LI5640, GPIB, 読み取り専用）※共有デバイスのためrobot_id不要
+- measure_lockin: {"action": "measure_lockin", "samples": 5, "interval": 0.0} (パネル表示の DATA1 / DATA2 と参照周波数を読む。感度・時定数・表示は前面パネルで設定し、フローからは変えない。samples: 1-100 回の中央値, interval: 読み取り間隔 0-60 秒 (整定待ちではない))
+
 ### ユーティリティ
 - wait: {"action": "wait", "robot_id": 1, "seconds": 2.0}
 
