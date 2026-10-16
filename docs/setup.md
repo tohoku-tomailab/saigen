@@ -70,7 +70,7 @@ Edit `config.yaml`:
 | Section | Purpose |
 |---|---|
 | `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); a robot without `type` is a Dobot |
-| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10) |
+| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10); `lockin_resource` and `lockin_timeout_ms` of the optional NF LI5640 lock-in amplifier (§11) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
 If `config.yaml` is absent the tracked `config.example.yaml` is used, and if that is
@@ -85,7 +85,7 @@ Edit `.env`:
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
 | `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT` | optional per-run override of the `config.yaml` robot ports |
-| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE` | optional per-run override of the shared devices |
+| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE`, `LOCKIN_RESOURCE` | optional per-run override of the shared devices |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
 `.env` is git-ignored. No key is read from anywhere else. For device ports the
@@ -475,6 +475,81 @@ What commissioning the first unit taught (order of work, what the firmware
 accepted, an unexplained line-sync observation, things not to do) is in
 [`keithley2002-commissioning.md`](keithley2002-commissioning.md).
 
+## 11. NF LI5640 lock-in amplifier (optional, read-only)
+
+SAIGEN reads the LI5640 over GPIB; it does not set it up. Sensitivity, time
+constant, slope, reference, input, filters, dynamic reserve and the DATA1 /
+DATA2 display (with offset, expand, normalize and ratio) are set on the front
+panel. The only setting SAIGEN writes is the read-out selection `OTYP`, which it
+reads when it opens the instrument and writes back, and reads back, when it
+closes it. The driver README
+([`src/devices/li5640/README.md`](../src/devices/li5640/README.md)) lists every
+command.
+
+The GPIB interface driver and PyVISA are the same as in §10. On the instrument
+and the PC:
+
+1. On the LI5640, *SHIFT + SPECIAL* (`intFc`) must show `GPib`: the LI5640
+   uses either GPIB or RS-232, not both (manual 5-3).
+2. Read the address with *SHIFT + ADDRESS* (0 to 30, manual 5-4) and make it
+   different from every other instrument on the same GPIB bus; check each
+   instrument's own panel. Two instruments at one address corrupt the bus. The
+   transmit terminator can stay as it is.
+3. Continuous data output must be off. While it runs the LI5640 answers no
+   other query (manual 5-68, error -440); SAIGEN checks `OSTR?` when it opens
+   the instrument and refuses to go on if it is running, without stopping it.
+4. List the GPIB resources only (as in §10 step 3) and put the resource in
+   `config.yaml`:
+
+   ```yaml
+   shared_devices:
+     lockin_resource: "GPIB0::<address>::INSTR"
+     lockin_timeout_ms: 5000
+     wait_after_lockin: 0.0   # optional pause AFTER each measure_lockin step (s)
+   ```
+
+5. Check the link. This talks to the instrument (`*IDN?`, the error queue,
+   `OSTR?`, `OTYP?`, the panel settings, one `DOUT?`, then `OTYP` restored and
+   front-panel control) and moves nothing. As in §10, the listing, this check
+   and the real run are the human's (CLAUDE.md rule 1):
+
+   ```bash
+   python -m src.devices.li5640.li5640 GPIB0::<address>::INSTR
+   ```
+
+6. `--validate-only` and `--mock` the example
+   [`examples/li5640/read_lockin.json`](../examples/li5640/read_lockin.json),
+   then run it for real; for the first check add `--no-record` (no sensor CSV
+   or video recording; the run folder is still written).
+
+Side effects on the instrument besides `OTYP`: a device clear addressed to it
+(clears its input and output buffers; the setup does not change, manual 5-78),
+`*CLS` (clears its event registers and error queue; not restored) and the
+REMOTE state until the end of the run (the front panel is locked; SAIGEN sends
+GTL to this instrument only, never REN off, IFC or DCL to the bus).
+
+Each `measure_lockin` step reads the panel settings before and after its
+readings and fails if they differ (a change made and undone within the step is
+not detected), fails while an automatic setup is running, discards readings
+taken with an over-level or UNLOCK, and fails if none is left. The settings
+decide what DATA1 and DATA2 mean (X, R, θ, noise, AUX; normalize and ratio) and
+their unit. **SAIGEN does not wait for the output to settle**: after a change on
+the panel, wait before the step (manual Table 4-3: at 24 dB/oct about 10 time
+constants to 99 %; noise density about 170 time constants times the smoothing
+factor). `interval` only spaces the readings, and `wait_after_lockin` is a
+pause after the step.
+
+Ctrl+C during a lock-in step behaves as in §10: the robots are stopped first,
+the I/O on the bus is left to finish, nothing more is sent, and then the
+instrument is cleared, `OTYP` restored, sent to local and closed; each of these
+is tried even if the one before failed. If a second Ctrl+C arrives while
+SAIGEN waits for one GPIB instrument, it still releases the other before it
+stops.
+
+What commissioning the first unit taught (what firmware 1.60 answered, the
+defects review found before the bench, open points, things not to do) is in
+[`li5640-commissioning.md`](li5640-commissioning.md).
+
 ## Troubleshooting
 
 - **`GEMINI_API_KEY が設定されていません`** — the key is missing from `.env`, or the
@@ -508,6 +583,17 @@ accepted, an unexplained line-sync observation, things not to do) is in
   `*IDN?`).
 - **DMM step times out** — one reading takes longer than `dmm_timeout_ms` (high
   NPLC with autorange, AC functions); raise it in `config.yaml`.
+- **`LI5640 初期化エラー`** — `lockin_resource` is empty or wrong, the interface
+  is set to RS-232 on the panel, two instruments share the address, continuous
+  data output is running (`連続データ出力（OSTR 1）が動いています`), or the
+  `*IDN?` is not an LI5640. The check in §11 step 5 shows which.
+- **`LI5640 の設定が測定中に変わりました`** — a panel setting differed before and
+  after the readings (someone used the panel, or an automatic function ran).
+  The settings before and after and the difference are in the `diagnostics`
+  column of `measurements.csv` and under `step_diagnostics` in `metadata.json`.
+- **`LI5640 から有効なサンプルを取得できませんでした`** — every reading had an
+  over-level or UNLOCK; the reasons are counted in the message and in
+  `diagnostics`. Check the sensitivity, the reference and the lamps on the panel.
 - **Microscope LED does nothing** — `microscope_led` needs `microscope_port`: the
   400-CAM106 exposes a second device, a Silicon Labs CP210x serial port (VID
   `10C4`, S/N `0001`), on the same USB cable. Set that COM port in `config.yaml`.

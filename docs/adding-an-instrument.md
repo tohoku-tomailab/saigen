@@ -13,7 +13,11 @@ GPIB, was later added by following them: its action is `measure_dmm`, its
 setting `dmm_resource`, and its code (`src/devices/keithley2002/`,
 `SharedDevices.measure_dmm`, `tests/test_keithley2002.py`) is the worked
 example for an instrument whose I/O blocks; what its commissioning taught is in
-[`keithley2002-commissioning.md`](keithley2002-commissioning.md).
+[`keithley2002-commissioning.md`](keithley2002-commissioning.md). The NF LI5640
+lock-in amplifier (`src/devices/li5640/`, `measure_lockin`,
+`tests/test_li5640.py`) followed next, as a read-only instrument whose values
+mean what its front panel says; its notes are in
+[`li5640-commissioning.md`](li5640-commissioning.md).
 
 The electronic balance is the closest existing example, and every step below
 names the balance code to copy from. Read `src/devices/README.md` first for the
@@ -95,6 +99,15 @@ reference; the rules, each of which was a real defect caught in review:
   nothing in a worker may raise into the void.
 - Do not swallow I/O errors on read-back queries: a late reply desynchronises
   the next query.
+- With more than one such instrument, `SharedDevices.cleanup()` closes each in
+  its own `try`, remembers a cancellation, tries the remaining ones and only
+  then re-raises it: a second Ctrl+C while one instrument is being closed must
+  not leave the next one open.
+- If the instrument has a setting you change only to read it (the LI5640's
+  `OTYP`), read the old value first and restore it on a path that is exempt
+  from the stop flag, after a device clear (a timed-out write may have left
+  half a command in the input buffer), and still send GTL and close if the
+  restore fails. Restore nothing you never read.
 - `ExperimentSession.add_shared()` closes a device whose `initialize()` failed,
   and hands an interrupted one to `run()`'s clean-up after the emergency stop;
   `_initialize_<name>()` therefore only has to leave no handle of its own open.
@@ -129,9 +142,11 @@ what tests, CI and `--mock` use to check that the value reaches the log.
   it with the other flags, and pass `use_dmm=needs_dmm` through
   `ExperimentSession.add_shared()` (`src/flow/experiment_session.py`, whose
   shared-device factories forward it to `SharedDevices` / `MockSharedDevices`).
-  The CSV runner and the GUI runner unpack the same tuple, so update those two
-  call sites as well. This is what lets a flow that never measures voltage run
-  on a cell without a DMM.
+  `plan_resources()` returns a `ResourcePlan` (a `NamedTuple`) read by name:
+  add the field, then extend `needs_shared`, `shared_kwargs()` and
+  `shared_labels()`; the three runners (`run_flow`, the CSV runner, the GUI
+  runner) pick it up from there. This is what lets a flow that never measures
+  voltage run on a cell without a DMM.
 
 `src/flow/experiment_logger.py`
 
@@ -142,6 +157,12 @@ what tests, CI and `--mock` use to check that the value reaches the log.
   instrument that measures several quantities should report value, unit and
   function (as `dmm_value` / `dmm_unit` / `dmm_function` do) rather than one
   column per quantity, and keep full precision (`repr`, not a fixed format).
+- A step that fails for a reason worth recording (the LI5640's panel changed
+  during the readings, every reading was invalid) raises an exception with a
+  `diagnostics` dict. All three runners pass `getattr(e, "diagnostics", None)`
+  to `record_step()`, which writes it to the `diagnostics` column, the
+  time-line and `metadata.json` (`step_diagnostics`). An exception message
+  alone loses the structured data.
 
 ## 5. Configuration
 
