@@ -48,6 +48,12 @@ Python 3.11–3.13. Optional extras:
 - `ffmpeg` on PATH for voice input (`winget install ffmpeg` / `brew install ffmpeg`).
 - A CUDA GPU speeds up whisper; CPU works with the int8 model.
 
+On Windows, keep the virtual environment on a short path (e.g. `C:\saigen\venv`).
+Without long-path support enabled, `pip install streamlit` (version not
+recorded; October 2026) into a venv several directories deep failed with
+`WinError 206` on a file deep inside the package and left a package that could
+not be imported.
+
 ## 3. Configuration (`config.yaml` and `.env`)
 
 Two files, with different jobs: `config.yaml` holds the ports and the workspace
@@ -64,7 +70,7 @@ Edit `config.yaml`:
 | Section | Purpose |
 |---|---|
 | `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); a robot without `type` is a Dobot |
-| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy) |
+| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
 If `config.yaml` is absent the tracked `config.example.yaml` is used, and if that is
@@ -79,7 +85,7 @@ Edit `.env`:
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
 | `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT` | optional per-run override of the `config.yaml` robot ports |
-| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT` | optional per-run override of the shared devices |
+| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE` | optional per-run override of the shared devices |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
 `.env` is git-ignored. No key is read from anywhere else. For device ports the
@@ -393,6 +399,82 @@ connect. Details are in [`src/devices/maxarm/README.md`](../src/devices/maxarm/R
 
 The example flow is [`examples/maxarm/pick_and_place.json`](../examples/maxarm/pick_and_place.json).
 
+## 10. Keithley 2002 digital multimeter (optional)
+
+The Keithley 2002 speaks only GPIB (IEEE-488). SAIGEN talks to it through
+PyVISA, which needs a VISA library from the maker of the GPIB interface.
+
+1. Install the driver of the GPIB interface. For National Instruments
+   adapters, **NI-488.2 with NI-VISA** (select NI-VISA in the installer if it
+   is offered separately); this is the configuration tested on hardware (NI
+   GPIB-USB-HS+, see the commissioning notes). Keysight adapters use the
+   **Keysight IO Libraries Suite**, which provides a VISA library as well, but
+   that combination has not been tried. (PyVISA-py can also reach GPIB through
+   `gpib-ctypes` and the vendor's GPIB driver; that path is not covered here.)
+2. `pip install pyvisa` (listed in `requirements.txt`; the mock and the tests do
+   not need it).
+3. Find the address: on the 2002, *MENU > GPIB* shows it (16 from the factory,
+   but do not assume it). On the PC, NI MAX lists the instrument, or list the
+   GPIB resources only (the default query also returns the serial ports, and
+   some devices on this cell react when a serial port is opened):
+
+   ```bash
+   python -c "import pyvisa; print(pyvisa.ResourceManager().list_resources('GPIB?*::INSTR'))"
+   ```
+
+4. Put the resource string in `config.yaml`:
+
+   ```yaml
+   shared_devices:
+     dmm_resource: "GPIB0::16::INSTR"
+     dmm_timeout_ms: 10000
+     wait_after_dmm: 0.0      # optional pause after each measure_dmm step (s)
+   ```
+
+5. Check the link. This talks to the instrument (`*IDN?`, line sync, one
+   DC-voltage reading, then back to front-panel control) and moves nothing.
+   Steps 3 (the listing), 5 and the real run in step 6 are the human's. An
+   agent runs them only when the human explicitly asks for it in the current
+   conversation, the real run only after the `--mock` run succeeded, and it is
+   the human who starts the real run (presses Enter) (CLAUDE.md rule 1):
+
+   ```bash
+   python -m src.devices.keithley2002.keithley2002 GPIB0::16::INSTR
+   ```
+
+6. `--validate-only` and `--mock` the example
+   [`examples/keithley2002/measure_dc_voltage.json`](../examples/keithley2002/measure_dc_voltage.json),
+   then run it for real.
+
+Every `measure_dmm` step sends `:CONFigure:<function>` first, which puts the
+trigger model in single-shot mode (all three layers immediate, count 1, delay
+0), disables math, the buffer and scanning, sets the acquisition method to
+normal and returns the autozero controls and that function's own settings
+(filter, REL, digits) to their `*RST` values (2002 manual p. 3-42); then the
+range, NPLC and output format. It does not send `*RST`; settings outside that
+list, such as the GPIB address, the display and line synchronization, stay as
+they are. The line-synchronization state is written to `run.log` when the DMM
+is opened (a snapshot, not a per-measurement record). The range and NPLC are read back after the last sample and
+logged (on autorange, the range the last sample used). At the end of the run
+the instrument is returned to front-panel control (GTL).
+
+Ctrl+C during a DMM step stops the step at once (robots in the flow are
+emergency-stopped without waiting for the instrument). The I/O already on the
+bus is left to finish (each VISA read and write has the `dmm_timeout_ms`
+timeout), no further SCPI command is sent, and then the instrument is returned
+to front-panel control (GTL) and closed. A failed GTL is logged as a warning and
+the close goes ahead; a failed close is logged as an error and the handle is
+kept, so the next clean-up can try again.
+
+A failing DMM step is an ordinary step error: the run stops and, as for any
+other error, Dobot arms in the same flow are sent home. Current ranges go
+through the instrument's fuse; check the lead configuration before measuring
+current.
+
+What commissioning the first unit taught (order of work, what the firmware
+accepted, an unexplained line-sync observation, things not to do) is in
+[`keithley2002-commissioning.md`](keithley2002-commissioning.md).
+
 ## Troubleshooting
 
 - **`GEMINI_API_KEY が設定されていません`** — the key is missing from `.env`, or the
@@ -416,6 +498,16 @@ The example flow is [`examples/maxarm/pick_and_place.json`](../examples/maxarm/p
   control once. `MicroscopeController.connect()` does that (5000 K, through
   DirectShow on Windows), so use the saigen driver rather than a plain OpenCV
   capture; the vendor viewer's *Connect* button has the same effect.
+- **`Keithley 2002 初期化エラー`** — `dmm_resource` is empty or wrong, the VISA
+  library is not installed (`pyvisa` then cannot find a backend), or another
+  program (NI MAX's interactive window, KickStart) holds the instrument. The
+  check in §10 step 5 shows which. A `*IDN?` that is not a 2002 is refused.
+- **`機器がエラーを報告しました: -113,"Undefined header"`** — the instrument
+  rejected a command; the message lists the errors from its queue. Old firmware
+  may lack `:FORMat:EXPonent`; report the firmware revision (the last field of
+  `*IDN?`).
+- **DMM step times out** — one reading takes longer than `dmm_timeout_ms` (high
+  NPLC with autorange, AC functions); raise it in `config.yaml`.
 - **Microscope LED does nothing** — `microscope_led` needs `microscope_port`: the
   400-CAM106 exposes a second device, a Silicon Labs CP210x serial port (VID
   `10C4`, S/N `0001`), on the same USB cable. Set that COM port in `config.yaml`.

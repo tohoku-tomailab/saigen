@@ -15,6 +15,7 @@ per-device and can be adapted.
 | Web camera (process monitoring) | Logitech C920n | 1 | Fixed above the system |
 | Web camera (appearance imaging) | Logitech C920n | 1 | Part of the imaging system (`src/imaging/`) |
 | USB digital microscope | Sanwa Supply 400-CAM106 (a Vitiny UM22) | 1 | Close-up photos of the product (`capture_microscope`) and LED on/off/brightness (`microscope_led`). One USB cable: UVC camera + CP210x serial for the control MCU. Optional |
+| Digital multimeter (optional) | Keithley 2002 (8.5 digits) + a GPIB interface on the control PC (e.g. NI GPIB-USB-HS) | 1 | DC/AC voltage, DC/AC current, 2- and 4-wire resistance (`measure_dmm`). GPIB only; needs a VISA library (NI-VISA / NI-488.2). Not used for the paper's ZIF-8 experiments |
 | Robot arm, pick-and-place (optional) | Hiwonder MaxArm (ESP32 / MicroPython, 3 bus servos, suction nozzle kit) | 1 | Optional robot 4 for suction pick-and-place, no pipette. USB via CH340; runs the repository's `saigen-maxarm` firmware (`src/devices/maxarm/`). Not used for the paper's ZIF-8 experiments. Add a physical switch on its 12 V servo supply: the arm has no hardware emergency stop |
 | Light | NEEWER RGB62 | 1 | White/red/green/blue illumination, controlled over Bluetooth LE (`src/imaging/`) |
 | IoT sensor board | Raspberry Pi Zero WH + Waveshare Environment Sensor HAT | 1 | Temperature, humidity, illuminance, UV, VOC, 3-axis acceleration and angular velocity (magnetometer not read; see `src/monitoring/README.md`) |

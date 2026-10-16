@@ -7,6 +7,14 @@ spectrometer, a second balance. Instruments mounted on an arm (a second pipette,
 a gripper) go through `LabRobot` instead of `SharedDevices`; the layering is the
 same, only the class differs.
 
+The DMM in the steps below is a generic, hypothetical one (`measure_voltage`,
+`dmm_port`) so that the steps stay short. A real DMM, the Keithley 2002 over
+GPIB, was later added by following them: its action is `measure_dmm`, its
+setting `dmm_resource`, and its code (`src/devices/keithley2002/`,
+`SharedDevices.measure_dmm`, `tests/test_keithley2002.py`) is the worked
+example for an instrument whose I/O blocks; what its commissioning taught is in
+[`keithley2002-commissioning.md`](keithley2002-commissioning.md).
+
 The electronic balance is the closest existing example, and every step below
 names the balance code to copy from. Read `src/devices/README.md` first for the
 two-layer design (thin drivers, one safety wrapper).
@@ -63,6 +71,34 @@ Add the instrument to `SharedDevices` following the balance:
 Do not touch `src/devices/safety/validators/` or the `workspace` section of
 `config.yaml`; a measuring instrument has no business there.
 
+### Instruments whose I/O blocks
+
+A reading that can take seconds (high integration time, a slow bus, a timeout)
+must not freeze the event loop or delay an emergency stop. The Keithley 2002 in
+`SharedDevices` (`_initialize_dmm`, `measure_dmm`, `_close_dmm`) is the
+reference; the rules, each of which was a real defect caught in review:
+
+- Run the I/O on a worker thread (`asyncio.to_thread`) under a
+  `threading.Lock`, so a measurement and the clean-up never use the bus at the
+  same time.
+- On cancellation, set a stop flag and re-raise at once; do not wait for the
+  worker. The robots are emergency-stopped first and the device is closed
+  afterwards. The thread itself cannot be killed; it stops at the next check.
+- Check the stop flag before every ordinary command you send (the 2002
+  driver does it in `write` / `query` through `abort_check`), not only before
+  each reading. The clean-up itself (device clear, GTL, close) is not gated.
+- Close the handle only while holding the lock. If the clean-up gives up
+  waiting, leave the closing to the worker when its I/O ends (give each I/O a
+  timeout; a query is a write plus a read, so that is not a bound on the whole
+  operation); never close under an I/O in flight.
+- A failed close is logged and the handle kept for the next `cleanup()`;
+  nothing in a worker may raise into the void.
+- Do not swallow I/O errors on read-back queries: a late reply desynchronises
+  the next query.
+- `ExperimentSession.add_shared()` closes a device whose `initialize()` failed,
+  and hands an interrupted one to `run()`'s clean-up after the emergency stop;
+  `_initialize_<name>()` therefore only has to leave no handle of its own open.
+
 ## 3. Mock: `src/devices/safety/mock_robot.py`
 
 `MockSharedDevices` must accept the same constructor flag and expose the same
@@ -99,12 +135,13 @@ what tests, CI and `--mock` use to check that the value reaches the log.
 
 `src/flow/experiment_logger.py`
 
-- `record_step()` currently knows two result keys, `weight` and `image_path`,
-  and writes them as the `weight_g` and `image_path` columns of `measurements.csv`.
-  Add the new key the same way (`voltage_v`), and add the event kind to the
-  time-line report if the value is worth listing there. If you expect more
-  instruments, this is the moment to generalise to `measurement` / `unit`
-  columns instead of one column per quantity.
+- `record_step()` maps result keys to `measurements.csv` columns (`weight` to
+  `weight_g`, `image_path`, `focus_position`, and the `dmm_*` keys of the
+  Keithley 2002). Add the new key the same way (`voltage_v`), and add the event
+  kind to the time-line report if the value is worth listing there. An
+  instrument that measures several quantities should report value, unit and
+  function (as `dmm_value` / `dmm_unit` / `dmm_function` do) rather than one
+  column per quantity, and keep full precision (`repr`, not a fixed format).
 
 ## 5. Configuration
 
@@ -127,10 +164,20 @@ All tests run without hardware.
   `tests/test_run_flow.py` and assert that `measurements.csv` has the value in the new
   column. This catches a missing union entry, a missing action in
   `SHARED_DEVICE_ACTIONS`, and a mock that returns `None`.
+- Blocking I/O (see §2): drive the wrapper with a fake resource whose write or
+  query blocks on a `threading.Event`, then cancel during initialisation,
+  during configuration, during the last reading and during clean-up, and
+  assert the order of events (emergency stop before the device is released,
+  no ordinary command sent after an abort, no I/O after close). Then revert
+  each fix once and check that its test fails: a test that releases the fake
+  too early passes against the broken code as well.
+- Test what the code asks for, not wall-clock time: a check of `elapsed >= 0.3`
+  after `asyncio.sleep(0.3)` failed now and then on Windows (the timer
+  granularity there was about 15 ms); record the requested pause instead.
 - Run the full check before reporting done:
 
 ```bash
-python -m pytest tests/ src/monitoring/tests/ -q
+python -m pytest tests/ src/monitoring/tests/ src/imaging/tests/ -q
 python -m src.flow.run_flow <your flow>.json --validate-only
 python -m src.flow.run_flow <your flow>.json --mock
 ```
@@ -152,10 +199,25 @@ the step from the GUI:
   the second drawing the input widgets (copy the `measure_weight` branches).
 
 The GUI imports `SHARED_DEVICE_ACTIONS` from the executor, so a step whose
-action is in that set is created without a `robot_id` automatically. Validation
+action is in that set is created without a `robot_id` automatically. The
+shared-device settings of a GUI run start from `config.yaml` and only the
+sidebar fields are overlaid (`settings_to_session_args()` in
+`src/gui/runner.py`), so a new configuration key reaches the session's
+settings without a sidebar field. It still has to be passed on to the device:
+`default_shared_factory()` in `src/flow/experiment_session.py` lists the keys
+it gives `SharedDevices`; add yours there (§4), or the setting is silently
+dropped. A keyed Streamlit widget keeps its state when its default
+changes: if one parameter invalidates another (the 2002's range is in the unit
+of its function), reset the dependent widget's state in the `on_change`
+callback, as `_change_dmm_function()` does, or the GUI shows a value the step
+no longer has. Validation
 and the Mock run in the GUI go through the same schema and executor as the CLI,
 so nothing else is needed. Verify with `streamlit run src/gui/app.py`: add the
-block, check the parameters, run *Mock*.
+block, check the parameters, run *Mock*. Also add a schema-valid sample of the
+new step to `VALID_STEPS` in `tests/test_gui_app_params.py` (the test fails
+until every palette block has one); it renders every block's editor headlessly
+with Streamlit's `AppTest` and is skipped where Streamlit is not installed,
+as in the CI.
 
 ## 8. Documentation
 
