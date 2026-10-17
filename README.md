@@ -8,6 +8,8 @@ experiments, focusing on **reliable automation and quantitative process recordin
 rather than full autonomy.
 
 Repository: https://github.com/tohoku-tomailab/saigen
+(QR code for slides and posters: [`docs/images/qr-saigen.png`](docs/images/qr-saigen.png),
+[`docs/images/qr-saigen.svg`](docs/images/qr-saigen.svg))
 
 A manuscript describing the platform and its ZIF-8 demonstration is in preparation
 (working title: *Quantitative control and improved reproducibility of materials
