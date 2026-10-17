@@ -30,8 +30,8 @@ authors:
 license: MIT
 version: "0.1.0"
 date-released: "2026-09-14"
-repository-code: "https://github.com/YusukeHashimotoLab/saigen"
-url: "https://github.com/YusukeHashimotoLab/saigen"
+repository-code: "https://github.com/tohoku-tomailab/saigen"
+url: "https://github.com/tohoku-tomailab/saigen"
 keywords:
   - laboratory automation
   - materials synthesis

@@ -7,7 +7,7 @@ A simple, easy-to-introduce, open-source platform for automated materials-synthe
 experiments, focusing on **reliable automation and quantitative process recording**
 rather than full autonomy.
 
-Repository: https://github.com/YusukeHashimotoLab/saigen
+Repository: https://github.com/tohoku-tomailab/saigen
 
 A manuscript describing the platform and its ZIF-8 demonstration is in preparation
 (working title: *Quantitative control and improved reproducibility of materials

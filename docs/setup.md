@@ -33,7 +33,7 @@ Connect everything to the control PC and note the port of each device
 ## 2. Software
 
 ```bash
-git clone https://github.com/YusukeHashimotoLab/saigen.git
+git clone https://github.com/tohoku-tomailab/saigen.git
 cd saigen
 python -m venv venv
 # Windows
