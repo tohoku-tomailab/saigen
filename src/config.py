@@ -76,6 +76,12 @@ DEFAULTS = {
         "lockin_resource": "",
         "lockin_timeout_ms": 5000,
         "wait_after_lockin": 0.0,
+        # LI5640 internal oscillator (OSC OUT), written only by set_lockin_oscillator.
+        # 0 = writing disabled. Set the largest amplitude (Vrms) the load on OSC OUT
+        # tolerates for an unlimited time; the frequency range likewise.
+        "lockin_osc_max_vrms": 0.0,
+        "lockin_osc_min_hz": 0.0005,
+        "lockin_osc_max_hz": 105000.0,
         # Agilent 1000 series oscilloscope (DSO1014A etc., read-only): VISA
         # resource USB0::0x0957::<product id>::<serial>::INSTR. Empty: a flow
         # with measure_scope refuses to start a real run until it is set.

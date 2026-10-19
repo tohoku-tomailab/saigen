@@ -17,6 +17,8 @@ import threading
 import time
 from typing import Optional
 
+from src.devices.li5640 import oscillator as osc
+
 from src.devices.li5640.li5640 import OPCR_AUTO_SENSITIVITY, OPCR_AUTO_SETUP
 
 # ロギング設定
@@ -37,6 +39,26 @@ def parse_resolution(value) -> Optional[tuple]:
         raise ValueError(f"microscope_resolution must be 'WIDTHxHEIGHT', got {value!r}")
 
 
+def parse_int_reply(reply) -> Optional[int]:
+    """整数の応答（記録用。読めなければ None）"""
+    try:
+        return int(str(reply).strip())
+    except ValueError:
+        return None
+
+
+def _plain(value):
+    """記録用に JSON にできる素の値へ写す（dict -> dict、tuple / list -> list）。
+    写せない値は repr()。入れ子も新しいオブジェクトにする（元の値を共有しない）"""
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return repr(value)
+
+
 class SharedDevices:
     """
     共有デバイス管理クラス
@@ -53,6 +75,7 @@ class SharedDevices:
                  use_dmm: bool = False,
                  use_lockin: bool = False,
                  use_scope: bool = False,
+                 lockin_osc_plan: Optional["osc.OscPlan"] = None,
                  **device_configs):
         """
         SharedDevicesを初期化
@@ -70,6 +93,8 @@ class SharedDevices:
                 （measure_lockin）。lockin_resource が必要
             use_scope: Agilent 1000 シリーズ（DSO1014A など）オシロスコープ（USB、読み取り
                 専用）を使用するか（measure_scope）。scope_resource が必要
+            lockin_osc_plan: フローが LI5640 の内部発振器を書く（set_lockin_oscillator）なら
+                その要約（run_flow.plan_resources が作る）。None なら発振器は書かない
             **device_configs: デバイス固有の設定
                 - scale_port: str (デフォルト: 'COM4') - BCE8221天秤のCOMポート
                 - camera_index: int (デフォルト: 1) - Webcamのデバイスインデックス
@@ -85,6 +110,8 @@ class SharedDevices:
                 - lockin_timeout_ms: int (デフォルト: 5000) - LI5640 の 1 回の I/O の上限
                 - wait_after_lockin: float (デフォルト: 0) - measure_lockin の後の待機秒
                   （測定の後の間隔。測定前の整定待ちではない）
+                - lockin_osc_max_vrms / lockin_osc_min_hz / lockin_osc_max_hz - 内部発振器へ
+                  書いてよい範囲（src/devices/li5640/oscillator.py。max_vrms 0 = 無効）
                 - scope_resource: str (デフォルト: '') - オシロスコープの VISA リソース
                   (USB0::0x0957::...::INSTR。シリアル番号を含む)
                 - scope_timeout_ms: int (デフォルト: 5000) - オシロの 1 回の I/O の上限
@@ -109,6 +136,17 @@ class SharedDevices:
         # 接続時に読んだ LI5640 の OTYP（切断時に戻す）。読む前に失敗したら None
         self._lockin_saved_otyp = None
         self.scope = None
+
+        # LI5640 の内部発振器（set_lockin_oscillator）。書けるのは lockin_osc_plan が
+        # あるときだけ。状態の更新は _osc_state_lock の中で（I/O の間は持たない）
+        self.lockin_osc_plan = lockin_osc_plan
+        self._osc_state_lock = threading.Lock()
+        self._osc_saved = None          # 接続時に読んだ設定（切断時に戻す先）
+        self._osc_expected = None       # 最後に読み返して確かめた設定（None = 不明）
+        self._osc_dirty = False         # 書き込みを試みた（タイムアウトでも適用されうる）
+        self._osc_attempt = "none"      # 復元: none -> in_progress -> done（実行した側だけが進める）
+        self._osc_report = None         # 復元の結果（確定値は実行した側が書く）
+        self._osc_closed = None         # 切断の結果（True / False / "pending"）
 
         # DMM の I/O はワーカースレッドで行い、ロックで直列化する（測定・切断が
         # 同時にバスを触らない）。ハンドルを閉じるのは常にロックを持つ側:
@@ -405,6 +443,8 @@ class SharedDevices:
                                           "前面パネルの操作か別のソフトで止めてから実行してください"
                                           "（SAIGEN は止めるコマンドを送りません）")
                     self._lockin_saved_otyp = self.lockin.output_type()
+                    if self.lockin_osc_plan is not None:
+                        self._save_oscillator_locked()
                 except BaseException:
                     self._release_lockin_locked()
                     raise
@@ -425,6 +465,40 @@ class SharedDevices:
         except Exception as e:
             logger.error(f"LI5640 初期化エラー（{resource}）: {e}")
             return False
+
+    def _save_oscillator_locked(self):
+        """接続時の発振器の設定を読んで覚える（_lockin_lock を持って呼ぶ。書かない）
+
+        戻す先も上限の内側でなければならない（外なら、切断時の復元がその値を書く）。
+        保存されたレンジでフローの全振幅を表せなければならない（SAIGEN はレンジを
+        切り替えない）。どちらかが満たされなければ LI5640Error（何も書いていない）。
+        """
+        from src.devices.li5640 import LI5640Error
+        try:
+            limits = osc.parse_limits(self.device_configs)
+        except ValueError as e:
+            raise LI5640Error(str(e))
+        if not limits.enabled:
+            raise LI5640Error("set_lockin_oscillator は無効です（shared_devices.lockin_osc_max_vrms が 0）")
+        saved = self.lockin.oscillator()
+        if not (osc.frequency_representable(saved.freq)
+                and osc.amplitude_fits(saved.ampl, saved.range)):
+            raise LI5640Error(f"接続時の発振器 {saved.as_record()} は SAIGEN が丸めずに書き戻せない値です"
+                              "（周波数は 4 1/2 桁、振幅はレンジの刻み）。切断時に別の値を書くことに"
+                              "なるため、何も書かずに中止します")
+        try:
+            limits.check_state(saved, "接続時の発振器")
+        except ValueError as e:
+            raise LI5640Error(f"{e}。切断時にこの値へ戻すことになるため、何も書かずに中止します")
+        if saved.range not in self.lockin_osc_plan.ranges:
+            raise LI5640Error(f"接続時の振幅レンジ {saved.range} ではフローの振幅 "
+                              f"{[str(a) for a in self.lockin_osc_plan.amplitudes]} Vrms を表せません"
+                              f"（表せるレンジ: {list(self.lockin_osc_plan.ranges)}）。SAIGEN は"
+                              "レンジを切り替えないので、前面パネルでレンジを選んでください")
+        with self._osc_state_lock:
+            self._osc_saved = saved
+            self._osc_expected = saved
+        logger.info(f"LI5640 の発振器（切断時に戻します）: {saved.as_record()}")
 
     @staticmethod
     def _release_quietly(device) -> None:
@@ -792,28 +866,271 @@ class SharedDevices:
             "lockin_settings": before,
         }
 
+    async def set_lockin_oscillator(self, frequency: float, amplitude: float,
+                                    settle: float = 0.0) -> dict:
+        """
+        LI5640 の内部発振器（OSC OUT）の周波数と振幅を設定する
+
+        config.yaml の lockin_osc_max_vrms が 0 より大きく、フローが ResourcePlan で
+        書くと宣言した（lockin_osc_plan）ときだけ使える。レンジは接続時のまま。
+        1 コマンドずつ書いて読み返し、エラーキューを確かめる（:meth:`LI5640.apply_oscillator`）。
+        失敗したら以後の書き込みはしない（状態が不明になる）。切断時に接続時の値へ戻す。
+
+        Args:
+            frequency: Hz（0.0005〜105000、4 1/2 桁で表せる値）
+            amplitude: Vrms（接続時のレンジで表せる値、上限以下）
+            settle: 読み返しの確認の後に待つ秒数（待つだけ。整定や新しい取り込みを保証しない）
+
+        Returns:
+            dict: ``lockin_osc_freq_hz`` / ``lockin_osc_ampl_vrms`` / ``lockin_osc_range``
+            （読み返した設定）, ``lockin_osc_before``, ``lockin_osc_rsrc``,
+            ``lockin_osc_settle_s``（要求）, ``lockin_osc_settled_s``（実際）
+
+        Raises:
+            RuntimeError: 初期化されていない・書き込みが許可されていない・中断された
+            ValueError: 値が範囲外・表せない・上限を超える
+            LockinStepError: 書き込み・読み返し・エラー確認の失敗（``diagnostics`` 付き）
+        """
+        from src.devices.li5640 import LI5640Aborted, LockinStepError
+        if not self.use_lockin or self.lockin is None or self._lockin_closing.is_set():
+            raise RuntimeError("LI5640 が初期化されていません")
+        if self.lockin_osc_plan is None or self._osc_saved is None:
+            raise RuntimeError("このランでは LI5640 の発振器を書けません（フローが "
+                               "set_lockin_oscillator を含み、接続時に設定を読めたときだけ）")
+        limits = osc.parse_limits(self.device_configs)
+        f = osc.check_frequency(frequency)
+        x = osc.check_amplitude(amplitude)
+        settle = float(settle)
+        if not 0.0 <= settle <= 600.0:
+            raise ValueError(f"settle は 0〜600 秒: {settle}")
+        saved = self._osc_saved
+        target = osc.OscState(f, x, saved.range)
+        limits.check_state(target, "要求")
+        if not osc.amplitude_fits(x, saved.range):
+            raise ValueError(f"amplitude {x} Vrms は接続時のレンジ {saved.range} で表せません")
+        lia = self.lockin
+        stop = threading.Event()
+        # 途中経過（中断時の記録用）。値は不変なものだけにし、キーの付け替えで更新する
+        progress = {"requested": target.as_record(), "before": None, "dirty": False,
+                    "writes": (), "read_backs": (), "settle_s": settle, "settled_s": 0.0}
+
+        def _set(key, value):
+            with self._osc_state_lock:
+                progress[key] = value
+
+        settle_t0 = []                  # 待機中だけ開始時刻を持つ（中断時はワーカーを待たずに求める）
+
+        def _snapshot() -> dict:
+            with self._osc_state_lock:
+                snap = _plain(progress)
+                if settle_t0:
+                    snap["settled_s"] = round(time.monotonic() - settle_t0[0], 3)
+                return snap
+
+        def _settled(t0):
+            with self._osc_state_lock:
+                progress["settled_s"] = round(time.monotonic() - t0, 3)
+                settle_t0.clear()
+
+        def _stopped() -> bool:
+            return stop.is_set() or self._lockin_closing.is_set()
+
+        def _mark_dirty(command):
+            with self._osc_state_lock:
+                self._osc_dirty = True
+                progress["dirty"] = True
+
+        def _on_progress(event, detail):
+            key = "writes" if event == "write" else "read_backs"
+            value = detail["command"] if event == "write" else detail["reply"]
+            with self._osc_state_lock:
+                progress[key] = progress[key] + (value,)
+
+        def _run():
+            with self._lockin_lock:
+                if self.lockin is not lia or self._lockin_closing.is_set():
+                    return None
+                lia.abort_check = _stopped
+                try:
+                    with self._osc_state_lock:
+                        expected = self._osc_expected
+                    if expected is None:
+                        return "unknown", None, None
+                    rsrc = parse_int_reply(lia.query("RSRC?"))
+                    current = lia.oscillator()
+                    _set("before", current.as_record())
+                    if current != expected:
+                        with self._osc_state_lock:
+                            self._osc_expected = None
+                        return "changed", current, rsrc
+                    found = lia.drain_errors()
+                    if found:
+                        # 書く前からエラーがある: その原因が分からないまま書かない
+                        _set("pre_existing_errors", tuple(found))
+                        return "errors", current, rsrc
+                    try:
+                        final = lia.apply_oscillator(current, target, before_write=_mark_dirty,
+                                                     on_progress=_on_progress)
+                    except BaseException:
+                        with self._osc_state_lock:
+                            self._osc_expected = None
+                        raise
+                    with self._osc_state_lock:
+                        self._osc_expected = final
+                    t0 = time.monotonic()
+                    with self._osc_state_lock:
+                        settle_t0.append(t0)
+                    while (left := settle - (time.monotonic() - t0)) > 0:
+                        if stop.wait(min(0.1, left)) or _stopped():
+                            _settled(t0)
+                            return None
+                    _settled(t0)
+                    return "ok", current, rsrc, final
+                except LI5640Aborted:
+                    return None
+                finally:
+                    lia.abort_check = self._lockin_closing.is_set
+                    if self._lockin_closing.is_set():
+                        self._release_lockin_locked()
+
+        try:
+            outcome = await asyncio.to_thread(_run)
+        except asyncio.CancelledError as e:
+            stop.set()
+            try:
+                e.diagnostics = _snapshot()
+            except Exception as snap_err:  # noqa: BLE001 - 中断を別の例外に置き換えない
+                e.diagnostics = {"snapshot_error": repr(snap_err)}
+            raise
+        except Exception as e:
+            diagnostics = _snapshot()
+            logger.error(f"LI5640 の発振器を設定できませんでした: {e}（以後このランでは書きません）")
+            raise LockinStepError(f"LI5640 の発振器を設定できませんでした: {e}",
+                                  {**diagnostics, "error_type": type(e).__name__}) from e
+        if outcome is None:
+            raise RuntimeError("LI5640 の発振器の設定が中断されました")
+        if outcome[0] == "unknown":
+            raise LockinStepError("前の設定が失敗したため発振器の状態が不明です。このランでは"
+                                  "これ以上書きません", _snapshot())
+        if outcome[0] == "errors":
+            raise LockinStepError("書く前から LI5640 のエラーキューに項目があります。書かずに中止します: "
+                                  f"{_snapshot().get('pre_existing_errors')}", _snapshot())
+        if outcome[0] == "changed":
+            raise LockinStepError(f"発振器の設定が前回確かめた値と違います（前面パネルで変更された？）: "
+                                  f"{outcome[1].as_record()}。書かずに中止します", _snapshot())
+        _, before, rsrc, final = outcome
+        settled = _snapshot()["settled_s"]
+        logger.info(f"✓ LI5640 発振器: {float(final.freq)!r} Hz, {float(final.ampl)!r} Vrms "
+                    f"（レンジ {final.range}、前 {before.as_record()}、待機 {settled} s）")
+        return {
+            "lockin_osc_freq_hz": float(final.freq),
+            "lockin_osc_ampl_vrms": float(final.ampl),
+            "lockin_osc_range": final.range,
+            "lockin_osc_before": before.as_record(),
+            "lockin_osc_rsrc": rsrc,
+            "lockin_osc_settle_s": settle,
+            "lockin_osc_settled_s": settled,
+        }
+
+    def output_restore_report(self) -> Optional[dict]:
+        """発振器の復元の結果（発振器を書かないランなら None）。状態ロックの中で丸ごと写す
+
+        ``{"oscillator": {"state": not_needed | verified | failed | unverified, ...},
+        "closed": True | False | "pending" | None}``
+        """
+        if self.lockin_osc_plan is None:
+            return None
+        with self._osc_state_lock:
+            if not self._osc_dirty:
+                report = {"state": "not_needed"}
+            elif self._osc_report is None:
+                report = {"state": "unverified", "errors": ["復元はまだ実行されていません"]}
+            else:
+                report = _plain(self._osc_report)
+            return {"oscillator": report, "closed": self._osc_closed}
+
     def _release_lockin_locked(self) -> bool:
-        """クリア・OTYP 復元・GTL・切断。呼び出し側が _lockin_lock を持っていること
+        """クリア・発振器の復元・OTYP 復元・GTL・切断。呼び出し側が _lockin_lock を持っていること
 
         送出しない。close() に失敗したらエラーをログに残し、ハンドルを残す
-        （次の cleanup() で再試行できる。そのときも OTYP の復元から試す）。
+        （次の cleanup() で再試行できる。そのときも OTYP の復元から試す。発振器の
+        復元は 1 回だけ）。
         """
         lia = self.lockin
         if lia is None:
             return True
+        restore = None
+        with self._osc_state_lock:
+            if self._osc_dirty and self._osc_attempt == "none" and self._osc_saved is not None:
+                self._osc_attempt = "in_progress"
+                restore = self._osc_saved
+        closed = False
         try:
-            lia.release(self._lockin_saved_otyp)
+            lia.release(self._lockin_saved_otyp, restore)
+            closed = True
         except Exception as e:  # noqa: BLE001 - 記録してハンドルを残す
             logger.error(f"LI5640 を閉じられません（次の cleanup() で再試行します）: {e}")
+        finally:
+            result = getattr(lia, "last_release", None) or {}
+            with self._osc_state_lock:
+                if restore is not None:
+                    self._osc_attempt = "done"
+                    self._osc_report = result.get("oscillator") or {
+                        "state": "unverified", "errors": ["復元の結果がありません"]}
+                self._osc_closed = closed      # 復元の要否と切断の成否は別々に残す
+        if not closed:
             return False
         self.lockin = None
         self._lockin_saved_otyp = None
         logger.info("✓ LI5640 切断完了")
         return True
 
+    async def _close_lockin_restoring(self):
+        """発振器を書いたランの切断: 期限なしで待つ。待つ側が中断されても切断は撤回しない
+
+        切断は専用スレッドで、待ち始める前に開始する（実行待ちの列で取り消されない）。
+        そのスレッドが _lockin_lock を（期限なしで）取り、復元・切断して確定値を書く。
+        """
+        done = threading.Event()
+
+        def _close():
+            try:
+                with self._lockin_lock:
+                    self._release_lockin_locked()
+            finally:
+                done.set()
+
+        logger.info(f"LI5640 の発振器を戻しています（通信のたびに最大 "
+                    f"{self._lockin_timeout_ms() / 1000:g} 秒）")
+        threading.Thread(target=_close, name="li5640-release", daemon=False).start()
+        try:
+            while not done.is_set():
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            with self._osc_state_lock:
+                if self._osc_attempt != "done":
+                    self._osc_report = {"state": "unverified",
+                                        "errors": ["切断を待っている間に中断されました"
+                                                   "（復元は続いています）"]}
+                if self._osc_closed is not True and self._osc_attempt != "done":
+                    self._osc_closed = "pending"
+            raise
+        with self._osc_state_lock:
+            closed = self._osc_closed
+        if closed is False:
+            raise RuntimeError("LI5640 を閉じられませんでした（ハンドルは保持しています）")
+
     async def _close_lockin(self):
-        """LI5640 を閉じる。通信中のワーカーがいればその I/O が終わるのを待つ（DMM と同じ）"""
+        """LI5640 を閉じる。通信中のワーカーがいればその I/O が終わるのを待つ（DMM と同じ）
+
+        発振器を書いた（書こうとした）ランは :meth:`_close_lockin_restoring`（期限なし）。
+        """
         self._lockin_closing.set()
+        with self._osc_state_lock:
+            dirty = self._osc_dirty
+        if dirty:
+            await self._close_lockin_restoring()
+            return
 
         def _close():
             if not self._lockin_lock.acquire(timeout=self.lockin_close_wait_s):

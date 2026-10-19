@@ -568,6 +568,43 @@ class ActionMeasureLockin(_StrictModel):
         description="読み取りの間隔（秒）。整定待ちではない"
     )
 
+class ActionSetLockinOscillator(_StrictModel):
+    """
+    NF LI5640 の内部発振器（OSC OUT）の周波数と振幅を設定する
+    SharedDevices.set_lockin_oscillator(frequency, amplitude, settle) に対応
+
+    config.yaml の shared_devices.lockin_osc_max_vrms が 0 より大きいときだけ使える
+    （既定 0 = 無効。OSC OUT につないだ負荷に合わせて研究室が決める）。振幅は
+    接続時のレンジのまま（SAIGEN はレンジを切り替えない）。1 コマンドずつ書いて
+    読み返す。ランの終わり（失敗・中断を含む）に接続時の値へ戻す。結果は
+    measurements.csv の lockin_osc_* 列に記録される。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["set_lockin_oscillator"] = Field(
+        ...,
+        description="アクション識別子: ロックインアンプの内部発振器の設定"
+    )
+    frequency: float = Field(
+        ...,
+        ge=0.0005,
+        le=105000.0,
+        description="周波数 [Hz]（4 1/2 桁、最大 19999 カウントで表せる値）"
+    )
+    amplitude: float = Field(
+        ...,
+        ge=0.0,
+        le=5.0,
+        description="振幅 [Vrms]（接続時のレンジで表せる値。config の上限以下）"
+    )
+    settle: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=600.0,
+        description="設定を読み返して確かめた後に待つ秒数（待つだけで、整定は保証しない）"
+    )
+
 # ==========================================
 # 1.67 個別のアクション定義 (共有デバイス: Agilent 1000 シリーズ オシロスコープ)
 # ==========================================
@@ -745,6 +782,7 @@ LabRobotAction = Union[
     ActionTareScale,
     ActionMeasureDMM,
     ActionMeasureLockin,
+    ActionSetLockinOscillator,
     ActionMeasureScope,
     # ユーティリティ
     ActionWait,

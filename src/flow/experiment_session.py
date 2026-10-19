@@ -239,9 +239,20 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     )
 
 
+#: 内部発振器の上限（config.yaml の shared_devices）。発振器を書くランのデバイスへ渡す
+OSC_LIMIT_KEYS = ("lockin_osc_max_vrms", "lockin_osc_min_hz", "lockin_osc_max_hz")
+
+
+def _osc_kwargs(config: dict, lockin_osc_plan) -> dict:
+    if lockin_osc_plan is None:
+        return {}
+    return {"lockin_osc_plan": lockin_osc_plan,
+            **{k: config[k] for k in OSC_LIMIT_KEYS if k in config}}
+
+
 def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
                            use_microscope_serial=False, use_dmm=False, use_lockin=False,
-                           use_scope=False):
+                           use_scope=False, lockin_osc_plan=None):
     """実機 SharedDevices を生成する既定ファクトリ"""
     return SharedDevices(
         use_scale=use_scale,
@@ -265,17 +276,27 @@ def default_shared_factory(*, use_scale, use_camera, config, use_microscope=Fals
         scope_resource=config.get("scope_resource", ""),
         scope_timeout_ms=config.get("scope_timeout_ms", 5000),
         wait_after_scope=config.get("wait_after_scope", 0.0),
+        **_osc_kwargs(config, lockin_osc_plan),
     )
 
 
 def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
                         use_microscope_serial=False, use_dmm=False, use_lockin=False,
-                        use_scope=False):
+                        use_scope=False, lockin_osc_plan=None):
     """MockSharedDevices を生成するファクトリ"""
     return MockSharedDevices(use_scale=use_scale, use_camera=use_camera,
                              use_microscope=use_microscope,
                              use_microscope_serial=use_microscope_serial,
-                             use_dmm=use_dmm, use_lockin=use_lockin, use_scope=use_scope)
+                             use_dmm=use_dmm, use_lockin=use_lockin, use_scope=use_scope,
+                             **_osc_kwargs(config, lockin_osc_plan))
+
+
+class OutputRestoreError(RuntimeError):
+    """本体は終わったが、機器の出力（LI5640 の内部発振器）を戻せなかった・確かめられなかった"""
+
+
+#: 復元できなかったときにエラー文へ足す注意
+OUTPUT_CHECK_NOTE = "LI5640 の OSC OUT（発振器の周波数・振幅）を前面パネルで確認してください"
 
 
 class ExperimentSession:
@@ -472,8 +493,11 @@ class ExperimentSession:
     async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
                          use_microscope: bool = False, use_microscope_serial: bool = False,
                          use_dmm: bool = False, use_lockin: bool = False,
-                         use_scope: bool = False):
+                         use_scope: bool = False, lockin_osc_plan=None):
         """設定の値で共有デバイスを生成・初期化して登録する
+
+        ``lockin_osc_plan`` はフローが LI5640 の内部発振器を書くときだけ渡す
+        （渡さなければファクトリにも渡さない: 引数を知らない差し替えファクトリも動く）。
 
         初期化が途中で失敗した場合（天秤は開いたが DMM が開けない等）は、開いた分を
         切断してから送出する。``self.shared`` に登録されるのは成功時だけなので、
@@ -493,6 +517,8 @@ class ExperimentSession:
             kwargs["use_lockin"] = True
         if use_scope:
             kwargs["use_scope"] = True
+        if lockin_osc_plan is not None:
+            kwargs["lockin_osc_plan"] = lockin_osc_plan
         shared = self.shared_factory(config=self.shared_config(), **kwargs)
         try:
             ok = await shared.initialize()
@@ -613,13 +639,22 @@ class ExperimentSession:
           中断（Ctrl+C / キャンセル）された場合は緊急停止してから再送出
         - いずれの場合もクリーンアップ（切断）は必ず実行する
 
+        - 切断（cleanup）の後に共有デバイスの出力の復元結果（LI5640 の内部発振器）を
+          読む: 戻せなかった・確かめられなかったら、状態を failed にし（中断・失敗は
+          そのまま）エラー文に確認の注意を足す。本体が正常に終わっていた場合だけ
+          :class:`OutputRestoreError` を送出する（進行中の例外・中断は置き換えない）。
+          切断中に初めて中断された場合は aborted にする
+
         exp_logger の確定は行わない。呼び出し側が finally で
+        ``exp_logger.record_output_restore(session.output_restore_report())`` と
         ``exp_logger.finalize(session.status, session.error)`` を呼ぶこと。
         """
+        body_completed = False
+        self._raise_output_error = False
         try:
             result = await body()
+            body_completed = True
             self.status, self.error = "completed", None
-            return result
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.warning("中断要求を受信しました。緊急停止します...")
             self.status, self.error = "aborted", "ユーザーによる中断（Ctrl+C）"
@@ -651,4 +686,48 @@ class ExperimentSession:
                 raise recovery_interrupt from e
             raise
         finally:
-            await self.cleanup()
+            cleanup_interrupt = None
+            try:
+                await self.cleanup()
+            except BaseException as e:      # cleanup() は最後に中断を再送出する
+                cleanup_interrupt = e
+                raise
+            finally:
+                self._apply_output_report(body_completed, cleanup_interrupt)
+        if self._raise_output_error:
+            raise OutputRestoreError(self.error)
+        return result
+
+    def output_restore_report(self):
+        """共有デバイスの出力の復元結果（LI5640 の発振器）。無ければ None。I/O はしない"""
+        fn = getattr(self.shared, "output_restore_report", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - 報告の失敗で後始末を止めない
+            logger.error(f"出力の復元結果を読めません: {e}")
+            return {"oscillator": {"state": "unverified", "errors": [repr(e)]}, "closed": None}
+
+    def _apply_output_report(self, body_completed: bool, cleanup_interrupt):
+        """切断後の状態の確定（I/O も await もしない）"""
+        if cleanup_interrupt is not None and body_completed and self.status == "completed":
+            self.status, self.error = "aborted", "中断（切断処理中）"
+        report = self.output_restore_report()
+        if not report:
+            return
+        state = (report.get("oscillator") or {}).get("state")
+        closed = report.get("closed")
+        # 書いた後は「閉じたと確かめられた」ことを求める。書いていなくても、閉じられなかった
+        # （ハンドルが残った）ことは失敗として扱う
+        bad = state in ("failed", "unverified") or (
+            closed is not True if state not in (None, "not_needed") else closed is False)
+        if not bad:
+            return
+        note = f"{OUTPUT_CHECK_NOTE}（発振器の復元: {state}、切断: {report.get('closed')}）"
+        logger.error(note)
+        if self.status == "completed":
+            self.status, self.error = "failed", note
+            self._raise_output_error = cleanup_interrupt is None and body_completed
+        else:
+            self.error = f"{self.error}。{note}" if self.error else note

@@ -49,6 +49,8 @@ VALID_STEPS = [
     {"action": "measure_lockin", "samples": 5, "interval": 0.5},                       # 24
     {"action": "measure_scope", "channel": 2, "items": ["vpp", "frequency"], "samples": 3,
      "interval": 0.5},                                                                 # 25
+    {"action": "set_lockin_oscillator", "frequency": 100.0, "amplitude": 0.1,
+     "settle": 1.0},                                                                   # 26
 ]
 
 
@@ -78,7 +80,7 @@ def test_every_palette_block_renders_its_parameters():
     # the editors were drawn, not skipped (invalid steps are shown read-only)
     keys = {w.key for w in at.number_input}
     for param, idx in (("delay", 21), ("volume", 9), ("timeout", 17), ("nplc", 22),
-                       ("interval", 24), ("interval", 25)):
+                       ("interval", 24), ("interval", 25), ("amplitude", 26), ("settle", 26)):
         assert any(k and k.startswith(f"{param}_") and k.endswith(f"_{idx}") for k in keys), param
 
 

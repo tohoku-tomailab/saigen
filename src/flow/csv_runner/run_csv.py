@@ -547,6 +547,7 @@ async def run_two_solution_mixing(
             accuracy_logger.finalize(logger)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"error finalising the accuracy CSV: {e}")
+        exp_logger.record_output_restore(session.output_restore_report())
         exp_logger.finalize(session.status, session.error)
         logger.info(f"experiment log saved: {exp_logger.dir}")
 

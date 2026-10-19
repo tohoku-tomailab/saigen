@@ -63,6 +63,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from src import config as lab_config
+from src.devices.li5640 import oscillator as osc
 from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
 from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS, DMM_ACTIONS, LOCKIN_ACTIONS, SCOPE_ACTIONS
@@ -376,10 +377,12 @@ class PreflightReport:
     capability_errors: List[str] = field(default_factory=list)
     validators_by_robot: Dict[int, object] = field(default_factory=dict)
     robot_types: Dict[int, str] = field(default_factory=dict)
+    #: LI5640 の内部発振器の書き込み（set_lockin_oscillator）で、開く前に分かる問題
+    oscillator_errors: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return not self.violations and not self.capability_errors
+        return not self.violations and not self.capability_errors and not self.oscillator_errors
 
 
 def _step_label(index: int, step: dict) -> str:
@@ -529,6 +532,10 @@ def _unverified_note(report: PreflightReport) -> str:
 def violation_message(report: PreflightReport) -> str:
     """違反を 1 件 1 行にまとめた、UI / 例外向けの短い文面"""
     lines = []
+    if report.oscillator_errors:
+        lines.append("LI5640 の発振器の設定（set_lockin_oscillator）に問題があります。"
+                     "デバイスを開かずに中止します:")
+        lines.extend(f"- {msg}" for msg in report.oscillator_errors)
     if report.capability_errors:
         lines.append(f"ロボットが対応していないアクションが {len(report.capability_errors)} 件あります。"
                      "デバイスを開かずに中止します:")
@@ -556,7 +563,8 @@ def build_robot_validators(robot_ids, validator, robot_ports: dict) -> Dict[int,
 
 def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optional[dict] = None,
                   validators_by_robot: Optional[dict] = None,
-                  robot_types: Optional[dict] = None) -> PreflightReport:
+                  robot_types: Optional[dict] = None,
+                  shared_config: Optional[dict] = None) -> PreflightReport:
     """デバイスを開く前のプリフライト（可動域 + 対応アクションの検査とログ出力）。
 
     run_flow.py・CSV ランナー（run_csv.py）・GUI（src/gui/runner.py）が共通で
@@ -575,6 +583,8 @@ def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optiona
             :func:`validator_for_robot` で補う（共通のバリデータで黙って埋めない）。
             MaxArm の項目が共通の（Dobot の）バリデータそのものなら ConfigError
         robot_types: robot_id → 種別。省略時は robot_ports から作る
+        shared_config: 共有デバイス設定（LI5640 の発振器の上限）。省略時は config.yaml。
+            フローが set_lockin_oscillator を含むときだけ読む
 
     Returns:
         PreflightReport。``validators_by_robot`` と ``robot_types`` には実際に
@@ -615,7 +625,14 @@ def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optiona
     report.robot_types = {rid: robot_types.get(rid, lab_config.DEFAULT_ROBOT_TYPE)
                           for rid in robot_ids}
     report.capability_errors = preflight_capabilities(steps, robot_types)
+    if any(s.get("action") == osc.ACTION for s in steps):
+        if shared_config is None:
+            shared_config = lab_config.get_shared_devices()
+        report.oscillator_errors = osc.preflight_errors(steps, shared_config)
     log_preflight(report, validator, log=log)
+    if report.oscillator_errors:
+        for msg in report.oscillator_errors:
+            log.error(f"LI5640 発振器: {msg}")
     if not report.ok:
         if report.capability_errors:
             log.error(f"ロボットが対応していないアクションが {len(report.capability_errors)} 件"
@@ -652,6 +669,8 @@ class ResourcePlan(NamedTuple):
     needs_dmm: bool
     needs_lockin: bool
     needs_scope: bool
+    #: フローが LI5640 の内部発振器を書くなら、その要約（oscillator.OscPlan）。無ければ None
+    lockin_osc_plan: Optional[object] = None
 
     @property
     def needs_shared(self) -> bool:
@@ -661,11 +680,14 @@ class ResourcePlan(NamedTuple):
 
     def shared_kwargs(self) -> dict:
         """ExperimentSession.add_shared() に渡す use_* 引数"""
-        return dict(use_scale=self.needs_scale, use_camera=self.needs_camera,
-                    use_microscope=self.needs_microscope,
-                    use_microscope_serial=self.needs_microscope_serial,
-                    use_dmm=self.needs_dmm, use_lockin=self.needs_lockin,
-                    use_scope=self.needs_scope)
+        kwargs = dict(use_scale=self.needs_scale, use_camera=self.needs_camera,
+                      use_microscope=self.needs_microscope,
+                      use_microscope_serial=self.needs_microscope_serial,
+                      use_dmm=self.needs_dmm, use_lockin=self.needs_lockin,
+                      use_scope=self.needs_scope)
+        if self.lockin_osc_plan is not None:
+            kwargs["lockin_osc_plan"] = self.lockin_osc_plan
+        return kwargs
 
     def shared_labels(self) -> list:
         """ログ表示用の共有デバイス名"""
@@ -703,7 +725,7 @@ def plan_resources(steps: list) -> ResourcePlan:
     needs_scope = bool(actions & SCOPE_ACTIONS)                           # Agilent DSO1000
     return ResourcePlan(sorted(robot_ids), picus2_robots, needs_scale, needs_camera,
                         needs_microscope, needs_microscope_serial, needs_dmm, needs_lockin,
-                        needs_scope)
+                        needs_scope, osc.plan_from_steps(steps))
 
 
 def _fmt_params(step: dict) -> str:
@@ -717,10 +739,13 @@ async def run(args) -> int:
     # 各アクションがそのロボットの種別で実行できるかを検査する
     robot_ports, shared_config = resolve_ports(args)
     validator = default_workspace_validator()
-    report = run_preflight(steps, validator, robot_ports=robot_ports)
+    report = run_preflight(steps, validator, robot_ports=robot_ports, shared_config=shared_config)
     if not report.ok:
         return PREFLIGHT_EXIT_CODE
     unverified_note = _unverified_note(report)
+    if any(s.get("action") == osc.ACTION for s in steps):
+        unverified_note += ("。LI5640 の発振器: 上限・周波数の分解能・共通レンジは OK。接続時の"
+                            "レンジと設定値（上限の内側か）は接続してから確かめます")
 
     if args.validate_only:
         logger.info(f"検証のみ完了（--validate-only）: スキーマ・ループ構造・絶対目標の可動域 OK"
@@ -825,6 +850,13 @@ async def run(args) -> int:
                                        error=str(step_err),
                                        diagnostics=getattr(step_err, "diagnostics", None))
                 raise
+            except BaseException as step_interrupt:
+                # Ctrl+C / キャンセル: 分かっていたことを中断として残してから再送出
+                exp_logger.record_step(i, total, action, rid, iteration,
+                                       "aborted", time.monotonic() - t_start,
+                                       error="中断（Ctrl+C）",
+                                       diagnostics=getattr(step_interrupt, "diagnostics", None))
+                raise
 
             # 分注精度: dispense の指示量と直後の measure_weight を対応付ける
             if action == "dispense":
@@ -863,6 +895,7 @@ async def run(args) -> int:
             accuracy_logger.finalize(logger)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"分注精度CSVの確定でエラー: {e}")
+        exp_logger.record_output_restore(session.output_restore_report())
         exp_logger.finalize(session.status, session.error)
         logger.info(f"実験ログを保存しました: {exp_logger.dir}")
 

@@ -129,6 +129,8 @@ class ExperimentLogger:
         self.step_diagnostics = []  # 失敗したステップの診断データ（metadata.json へ）
         self.lockin_settings = []   # 成功したロックイン読み取りのパネル設定（metadata.json へ）
         self.scope_readings = []    # 成功したオシロ読み取りの設定と応答文字列（metadata.json へ）
+        self.lockin_oscillator = []  # LI5640 の内部発振器の設定ステップ（前後・参照信号源）
+        self.output_restore = None   # 出力の復元結果（LI5640 の発振器。record_output_restore）
         self.robots_used = set()
         self.picus2_robots = set()
         self.robot_types = {}      # robot_id -> "dobot" / "maxarm"
@@ -193,7 +195,7 @@ class ExperimentLogger:
             action: アクション名
             robot_id: ロボットID（共有デバイスは None）
             iteration: ループ反復番号（ループ外は None）
-            status: "ok" or "error"
+            status: "ok" / "error" / "aborted"（Ctrl+C などで中断したステップ）
             duration: 所要秒数
             result: execute_step の戻り値（{"weight":..} / {"image_path":..} /
                 {"dmm_value":.., "dmm_unit":..} 等）
@@ -260,6 +262,12 @@ class ExperimentLogger:
             "scope_valid": _json_cell(result.get("scope_valid")),
             "scope_invalid": _json_cell(result.get("scope_invalid")),
             "scope_settings": _json_cell(result.get("scope_settings")),
+            "lockin_osc_freq_hz": _full_precision(result.get("lockin_osc_freq_hz")),
+            "lockin_osc_ampl_vrms": _full_precision(result.get("lockin_osc_ampl_vrms")),
+            "lockin_osc_range": (str(result["lockin_osc_range"])
+                                 if isinstance(result.get("lockin_osc_range"), int) else ""),
+            "lockin_osc_settle_s": _full_precision(result.get("lockin_osc_settle_s")),
+            "lockin_osc_settled_s": _full_precision(result.get("lockin_osc_settled_s")),
             "diagnostics": _json_cell(diagnostics),
             "error": error or "",
         }
@@ -275,6 +283,15 @@ class ExperimentLogger:
                                         "settings": result.get("scope_settings"),
                                         "settings_after": result.get("scope_settings_after"),
                                         "raw": result.get("scope_raw")})
+        if status == "ok" and record["lockin_osc_freq_hz"]:
+            self.lockin_oscillator.append({"step_index": index, "iteration": record["iteration"],
+                                           "before": result.get("lockin_osc_before"),
+                                           "after": {"freq_hz": result.get("lockin_osc_freq_hz"),
+                                                     "ampl_vrms": result.get("lockin_osc_ampl_vrms"),
+                                                     "range": result.get("lockin_osc_range")},
+                                           "rsrc": result.get("lockin_osc_rsrc"),
+                                           "settle_s": result.get("lockin_osc_settle_s"),
+                                           "settled_s": result.get("lockin_osc_settled_s")})
         if status == "ok" and isinstance(result.get("lockin_settings"), dict):
             # 成功した読み取りのパネル設定も構造のまま残す（CSV の JSON 文字列を解析させない）
             self.lockin_settings.append({"step_index": index, "iteration": record["iteration"],
@@ -310,6 +327,14 @@ class ExperimentLogger:
                            f"{record['lockin_freq']} Hz"),
                 "step_index": index, "iteration": record["iteration"],
             })
+        if record["lockin_osc_freq_hz"]:
+            self.events.append({
+                "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
+                "kind": "lockin_osc",
+                "detail": (f"{record['lockin_osc_freq_hz']} Hz, {record['lockin_osc_ampl_vrms']} Vrms"
+                           f"（レンジ {record['lockin_osc_range']}）"),
+                "step_index": index, "iteration": record["iteration"],
+            })
         if record["scope_values"]:
             shown = ", ".join(f"{k} {v} {(result.get('scope_units') or {}).get(k, '')}".strip()
                               for k, v in (result.get("scope_values") or {}).items())
@@ -329,6 +354,11 @@ class ExperimentLogger:
                 "detail": "; ".join(parts) or (error or "診断データあり（metadata.json）"),
                 "step_index": index, "iteration": record["iteration"],
             })
+
+    def record_output_restore(self, report):
+        """切断時の出力の復元結果（LI5640 の発振器）を残す。None なら何もしない"""
+        if report is not None:
+            self.output_restore = report
 
     def next_image_path(self, index, tag: str = ""):
         """capture_and_save / capture_microscope 用の保存先パスを払い出す
@@ -373,7 +403,9 @@ class ExperimentLogger:
                   "lockin_freq", "lockin_sensitivity", "lockin_time_constant",
                   "lockin_valid_samples", "lockin_invalid", "lockin_settings",
                   "scope_channel", "scope_values", "scope_units", "scope_valid",
-                  "scope_invalid", "scope_settings", "diagnostics", "error"]
+                  "scope_invalid", "scope_settings", "lockin_osc_freq_hz",
+                  "lockin_osc_ampl_vrms", "lockin_osc_range", "lockin_osc_settle_s",
+                  "lockin_osc_settled_s", "diagnostics", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -400,6 +432,7 @@ class ExperimentLogger:
             "total_steps": len(self.records),
             "ok_steps": sum(1 for r in self.records if r["status"] == "ok"),
             "error_steps": sum(1 for r in self.records if r["status"] == "error"),
+            "aborted_steps": sum(1 for r in self.records if r["status"] == "aborted"),
             "robots_used": sorted(self.robots_used),
             "picus2_robots": sorted(self.picus2_robots),
             # JSON のキーは文字列になる: {"4": "maxarm"}
@@ -414,6 +447,9 @@ class ExperimentLogger:
             "scope_measurements": len(scope_rows),
             # 成功したオシロ読み取りごとのパネル設定と応答文字列
             "scope_readings": self.scope_readings,
+            # LI5640 の内部発振器の設定ステップと、切断時の復元結果
+            "lockin_oscillator": self.lockin_oscillator,
+            "lockin_oscillator_restore": self.output_restore,
             "images_captured": len(images),
             "sensor_recording": self.recording,
             "output_files": {
@@ -453,7 +489,8 @@ class ExperimentLogger:
         lines.append(f"- **所要時間**: {self._duration_s():.1f} 秒")
         lines.append(f"- **総ステップ数**: {len(self.records)}"
                      f"（成功 {sum(1 for r in self.records if r['status']=='ok')} /"
-                     f" 失敗 {sum(1 for r in self.records if r['status']=='error')}）")
+                     f" 失敗 {sum(1 for r in self.records if r['status']=='error')} /"
+                     f" 中断 {sum(1 for r in self.records if r['status']=='aborted')}）")
         if self.robots_used:
             lines.append(f"- **使用ロボット**: {sorted(self.robots_used)}")
             if self.robot_types:
@@ -465,6 +502,13 @@ class ExperimentLogger:
                      + (f" / **オシロ測定**: {len(scope_events)} 回" if scope_events else ""))
         if self.error:
             lines.append(f"- **エラー**: {self.error}")
+        if self.output_restore is not None:
+            osc_state = (self.output_restore.get("oscillator") or {}).get("state")
+            label = {"not_needed": "書き込みなし（戻す必要なし）", "verified": "✅ 接続時の値へ戻した",
+                     "failed": "❌ 戻せなかった（前面パネルで確認）",
+                     "unverified": "⚠️ 確かめられなかった（前面パネルで確認）"}.get(osc_state, osc_state)
+            lines.append(f"- **LI5640 発振器の復元**: {label}"
+                         f"（切断: {self.output_restore.get('closed')}）")
         lines.append("")
 
         # 時系列イベント（重量・画像をひも付け）
@@ -482,6 +526,7 @@ class ExperimentLogger:
             for e in self.events:
                 kind = {"weight": "⚖️ 重量", "image": "📷 画像", "dmm": "🔌 DMM",
                         "lockin": "📈 ロックイン", "scope": "📉 オシロ",
+                        "lockin_osc": "🔊 発振器",
                         "diagnostics": "⚠️ 診断"}.get(e["kind"], e["kind"])
                 detail = e["detail"]
                 if e["kind"] == "image":
@@ -569,6 +614,8 @@ class ExperimentLogger:
                 note = f"{r['dmm_value']} {r['dmm_unit']}"
             elif r.get("scope_values"):
                 note = f"CH{r['scope_channel']} {r['scope_values']}"
+            elif r.get("lockin_osc_freq_hz"):
+                note = f"{r['lockin_osc_freq_hz']} Hz, {r['lockin_osc_ampl_vrms']} Vrms"
             elif r.get("lockin_data1"):
                 note = (f"{r['lockin_data1_kind']} {r['lockin_data1']} {r['lockin_data1_unit']}, "
                         f"{r['lockin_data2_kind']} {r['lockin_data2']} {r['lockin_data2_unit']}")
@@ -578,7 +625,7 @@ class ExperimentLogger:
                     note += " (not converged)"
             elif r["error"]:
                 note = f"⚠️ {r['error']}"
-            state = "✅" if r["status"] == "ok" else "❌"
+            state = {"ok": "✅", "aborted": "⛔"}.get(r["status"], "❌")
             lines.append(f"| {r['step_index']} | {r['elapsed_s']:.1f} | {r['action']} "
                          f"| {r['robot_id']} | {r['iteration']} | {state} "
                          f"| {r['duration_s']} | {note} |")

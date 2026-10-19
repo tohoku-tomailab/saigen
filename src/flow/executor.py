@@ -19,7 +19,8 @@ _default_logger = logging.getLogger(__name__)
 # 共有デバイス用アクション（robot_idに依存しない）
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
                          "capture_microscope", "microscope_led", "microscope_focus",
-                         "measure_dmm", "measure_lockin", "measure_scope"}
+                         "measure_dmm", "measure_lockin", "set_lockin_oscillator",
+                         "measure_scope"}
 MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
 # 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
 MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}
@@ -27,7 +28,7 @@ MICROSCOPE_SERIAL_ACTIONS = {"microscope_led", "microscope_focus"}
 # Keithley 2002 DMM（GPIB）が要るアクション
 DMM_ACTIONS = {"measure_dmm"}
 # NF LI5640 ロックインアンプ（GPIB）が要るアクション
-LOCKIN_ACTIONS = {"measure_lockin"}
+LOCKIN_ACTIONS = {"measure_lockin", "set_lockin_oscillator"}
 # Agilent 1000 シリーズ オシロスコープ（USB）が要るアクション
 SCOPE_ACTIONS = {"measure_scope"}
 
@@ -209,6 +210,19 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
         logger.info(f"  LI5640: {result['lockin_data1_kind']} {result['lockin_data1']!r} "
                     f"{result['lockin_data1_unit']}, {result['lockin_data2_kind']} "
                     f"{result['lockin_data2']!r} {result['lockin_data2_unit']}")
+        return result
+
+    # ===== ロックインアンプの内部発振器（設定で許可したときだけ書く） =====
+    elif action == "set_lockin_oscillator":
+        if isinstance(step, dict):
+            kwargs = {"frequency": step.get("frequency"), "amplitude": step.get("amplitude"),
+                      "settle": step.get("settle", 0.0)}
+        else:
+            kwargs = {"frequency": step.frequency, "amplitude": step.amplitude,
+                      "settle": step.settle}
+        result = await shared_devices.set_lockin_oscillator(**kwargs)
+        logger.info(f"  LI5640 発振器: {result['lockin_osc_freq_hz']!r} Hz, "
+                    f"{result['lockin_osc_ampl_vrms']!r} Vrms（レンジ {result['lockin_osc_range']}）")
         return result
 
     # ===== オシロスコープ（Agilent 1000 シリーズ、読み取り専用） =====

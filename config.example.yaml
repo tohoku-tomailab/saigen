@@ -71,6 +71,9 @@ shared_devices:
   lockin_resource: ""     # NF LI5640 lock-in amplifier (GPIB, read-only) for measure_lockin: VISA resource such as GPIB0::<address>::INSTR; its address must differ from every other instrument on the bus; "" = no lock-in
   lockin_timeout_ms: 5000 # upper limit of one LI5640 read or write
   wait_after_lockin: 0.0  # seconds to wait AFTER each measure_lockin step (not a settling time before it)
+  lockin_osc_max_vrms: 0.0      # LI5640 internal oscillator: largest amplitude (Vrms) set_lockin_oscillator may set; 0 = writing disabled. Choose it for what is wired to OSC OUT (it stays applied until the run releases the LI5640)
+  lockin_osc_min_hz: 0.0005     # lowest frequency set_lockin_oscillator may set
+  lockin_osc_max_hz: 105000.0   # highest frequency set_lockin_oscillator may set
   scope_resource: ""      # Agilent 1000 series oscilloscope (DSO1014A etc., USB, read-only) for measure_scope: VISA resource such as USB0::0x0957::<product id>::<serial>::INSTR; "" = no scope
   scope_timeout_ms: 5000  # upper limit of one oscilloscope read or write
   wait_after_scope: 0.0   # seconds to wait AFTER each measure_scope step

@@ -440,7 +440,7 @@ class FlowRunner:
         # PreflightError here, before a session or run folder exists.
         self.validator = default_workspace_validator()
         self.preflight = require_preflight(self.steps, self.validator, log=logger,
-                                           robot_ports=robot_ports)
+                                           robot_ports=robot_ports, shared_config=shared_config)
         self.recording = recording
 
         self.workflow_data = workflow_data
@@ -688,6 +688,13 @@ class FlowRunner:
                         error=str(step_err),
                     ))
                     raise
+                except BaseException as step_interrupt:
+                    # Stop / Ctrl+C: record what was known as an aborted step, then re-raise
+                    exp_logger.record_step(i, total, action, rid, iteration,
+                                           "aborted", time.monotonic() - t0,
+                                           error="中断",
+                                           diagnostics=getattr(step_interrupt, "diagnostics", None))
+                    raise
                 duration = time.monotonic() - t0
                 exp_logger.record_step(i, total, action, rid, iteration,
                                        "ok", duration, result=result)
@@ -720,6 +727,7 @@ class FlowRunner:
                 accuracy_logger.finalize(logger)
             except Exception:  # noqa: BLE001
                 pass
+            exp_logger.record_output_restore(session.output_restore_report())
             exp_logger.finalize(session.status, session.error)
             root_logger.removeHandler(handler)
             root_logger.setLevel(previous_level)

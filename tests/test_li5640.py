@@ -45,6 +45,7 @@ PANEL = {
     "icpl": "0", "ignd": "0", "vsen": "23", "isen": "26", "tcon": "9", "slop": "3",
     "sync": "0", "nois": "1", "ilin": "0", "ifrq": "0", "ithr": "0", "drsv": "2",
     "rsrc": "0", "redg": "0", "harm": "1", "opcr": "0", "ostr": "0",
+    "freq": "1.0000E+03", "ampl": "0.100,1",
 }
 
 
@@ -123,9 +124,18 @@ class FakeLI:
         return [c for kind, c in (e for e in self.log if isinstance(e, tuple))]
 
 
+class _Info:
+    def __init__(self, name):
+        self.resource_name = name
+
+
 class FakeRM:
     def __init__(self, resource):
         self.resource = resource
+
+    def resource_info(self, name):
+        # like PyVISA: the board number defaults to 0 (GPIB::7::INSTR -> GPIB0::7::INSTR)
+        return _Info(name.upper().replace("GPIB::", "GPIB0::"))
 
     def open_resource(self, name):
         return self.resource
@@ -297,6 +307,7 @@ def test_theta_median_is_order_independent(values, expected):
 def test_constructor_reads_on_eoi_and_closes_on_setup_failure():
     lia, res = make_driver()
     assert res.read_termination is None and res.write_termination == "\n"
+    lia.close()                                     # one open handle per instrument at a time
 
     class Broken(FakeLI):
         def __setattr__(self, name, value):
@@ -346,10 +357,13 @@ def test_snapshot_rejects_out_of_range_and_unparsable_settings():
         lia, _ = make_driver(FakeLI(isrc=isrc, **{key: bad}))
         with pytest.raises(LI5640Error):
             lia.snapshot()
+        lia.close()
 
 
 def test_snapshot_reads_the_current_settings_only_for_the_selected_input():
-    _, res = make_driver(FakeLI(isrc="2"))
+    first, res = make_driver(FakeLI(isrc="2"))
+    first.close()
+    res.closed = False
     lia = LI5640(RESOURCE, resource_manager=FakeRM(res))
     snap = lia.snapshot()
     assert "isen" in snap and "istd" in snap and "vsen" not in snap and "vstd" not in snap

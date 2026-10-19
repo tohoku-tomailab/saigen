@@ -12,9 +12,15 @@ LI5640 は GPIB（IEEE 488.1、488.2 一部準拠）か RS-232 のどちらか�
 測定の設定（感度・時定数・参照信号・入力・フィルタ・表示など）は前面パネルの
 もので、SAIGEN は変えない。送る設定コマンドは読み出し項目の選択 ``OTYP`` だけ
 （リモート専用の設定、説明書 5-22, 5-32）。接続時に ``OTYP?`` で元の値を覚え、
-切断時に戻して読み返す。そのほかの副作用: デバイスクリア（入出力バッファを
-消す。設定は変わらない、5-77, 5-78）、``*CLS``（イベントレジスタとエラーキューを
-消す。戻さない、5-36）、GTL までの REMOTE 状態（前面パネル操作不可、5-6）。
+切断時に戻して読み返す。例外は内部発振器（``FREQ`` / ``AMPL``、5-23）で、
+``config.yaml`` の ``lockin_osc_max_vrms`` を 0 より大きくしたときだけ、フローの
+``set_lockin_oscillator`` が書く（1 コマンドずつ読み返して確かめる。レンジは変えない。
+切断時に接続時の値へ戻す。:mod:`.oscillator`）。そのほかの副作用: デバイスクリア
+（入出力バッファを消す。設定は変わらない、5-77, 5-78）、``*CLS``（イベントレジスタと
+エラーキューを消す。戻さない、5-36）、GTL までの REMOTE 状態（前面パネル操作不可、5-6）。
+
+同じ機器（PyVISA が解決した正式なリソース名）を同じプロセスで同時に開かない:
+前のランの切断（発振器の復元）が続いている間、次の :class:`LI5640` は開かずに失敗する。
 
 読み出し（説明書 5-32, 5-70）:
 
@@ -25,7 +31,8 @@ LI5640 は GPIB（IEEE 488.1、488.2 一部準拠）か RS-232 のどちらか�
   （:meth:`LI5640.snapshot`）、意味を :func:`describe` で決める
 - ``WRCR?`` -- 警告状態（1 = UNLOCK、2 = SIGNAL 参照で時定数が小さく同期できない）
 
-``FREQ?`` は内部発振器の設定周波数で、測定周波数ではない（説明書 5-23）。使わない。
+``FREQ?`` は内部発振器の設定周波数で、測定周波数ではない（説明書 5-23）。設定として
+記録する（``osc_freq``）。測定周波数は ``DOUT?`` から読む。
 ``DOUT?`` にはヘッダーは付かない（5-21 のヘッダー出力は旧機種互換メッセージ専用）。
 オーバーレベル時の ``DOUT?`` の数値は説明書に書かれていないので、値ではなく
 OVERLEVEL のビットで判定する。
@@ -50,7 +57,10 @@ OVERLEVEL のビットで判定する。
 import logging
 import math
 import re
-from typing import Optional
+import threading
+from typing import Callable, Optional
+
+from . import oscillator as osc
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +321,26 @@ def _gtl_mode():
 _MODEL = re.compile(r"\bLI\s?5640\b", re.IGNORECASE)
 _MAX_ERROR_READS = 21            # エラーキューは最大 20 件（5-68）+ 終端の 0
 
+#: 機器（正式なリソース名）ごとのロック。開いている間 :class:`LI5640` が持ち、正常に
+#: 閉じたときだけ放す（閉じられなかったハンドルが残る間、次の接続をさせない）
+_RESOURCE_LOCKS = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def _resource_lock(key: str) -> threading.Lock:
+    with _REGISTRY_LOCK:
+        return _RESOURCE_LOCKS.setdefault(key, threading.Lock())
+
+
+def canonical_resource(resource_manager, resource: str) -> str:
+    """PyVISA に解決させた正式なリソース名（``GPIB::7::INSTR`` -> ``GPIB0::7::INSTR``、
+    別名も解決）。解決できなければ例外（元の文字列には戻さない）"""
+    return str(resource_manager.resource_info(resource).resource_name)
+
+
+class OscillatorWriteError(LI5640Error):
+    """発振器の書き込み・読み返し・エラー確認のどこかで止めた（状態は不明になりうる）"""
+
 
 class LI5640:
     """LI5640 を PyVISA で読む薄いドライバ
@@ -321,7 +351,8 @@ class LI5640:
         resource_manager: テスト用の差し替え。省略時は ``pyvisa.ResourceManager()``
     """
 
-    def __init__(self, resource: str, timeout_ms: int = 5000, resource_manager=None):
+    def __init__(self, resource: str, timeout_ms: int = 5000, resource_manager=None,
+                 lock_wait_s: float = 5.0):
         if not resource:
             raise ValueError("VISA リソース文字列が空です（例: GPIB0::<アドレス>::INSTR）")
         if resource_manager is None:
@@ -331,16 +362,45 @@ class LI5640:
         #: 呼び出し側が設定する打ち切り判定（引数なし、True で打ち切り）。通常の
         #: write / query の直前に見る。終了処理（:meth:`release`）は見ない
         self.abort_check = None
-        self._inst = resource_manager.open_resource(resource)
+        #: 直近の :meth:`release` の結果（close() が失敗して例外になっても読める）
+        self.last_release = None
+        self.canonical = canonical_resource(resource_manager, resource)
+        self._lock = _resource_lock(self.canonical)
+        self._lock_held = False
+        if not self._lock.acquire(timeout=max(0.0, float(lock_wait_s))):
+            raise LI5640Error(f"前回の LI5640（{self.canonical}）の終了処理（発振器の復元・切断）が"
+                              "続いているか、閉じられなかったハンドルが残っています。終了処理なら"
+                              "終わるまで待ってから、閉じられなかったのなら SAIGEN（GUI）を"
+                              "再起動してから実行してください（ログに理由があります）")
+        self._lock_held = True
+        try:
+            self._inst = resource_manager.open_resource(resource)
+        except BaseException:
+            self._release_resource_lock()           # 何も開いていない
+            raise
         try:
             self._inst.timeout = int(timeout_ms)
             # 受信は END（EOI）で終わらせ、パネルで選んだ CR / LF / CR+LF は削る
             # （説明書 5-4。どの送信ターミネータでも同じに読める）
             self._inst.read_termination = None
             self._inst.write_termination = "\n"
-        except BaseException:
-            self._inst.close()
+        except BaseException as setup_error:
+            try:
+                self._inst.close()
+            except Exception as close_error:
+                # ハンドルが残りうる: ロックを持ったままにする（このプロセスでは再接続できない）
+                raise LI5640Error(f"{resource} の設定に失敗し（{setup_error!r}）、閉じることも"
+                                  f"できませんでした（{close_error!r}）。ハンドルが残っている"
+                                  "おそれがあるため、このプロセスからは再接続しません。SAIGEN（GUI）"
+                                  "を再起動してください") from setup_error
+            self._release_resource_lock()
             raise
+
+    def _release_resource_lock(self):
+        """機器ロックを一度だけ放す"""
+        if self._lock_held:
+            self._lock_held = False
+            self._lock.release()
 
     # ------------------------------------------------------------------
     # 低レベル I/O
@@ -458,7 +518,151 @@ class LI5640:
         s["harm"] = parse_int(q("HARM?"), 1, 19999, "HARM?")
         s["opcr"] = parse_int(q("OPCR?"), 0, 65535, "OPCR?")
         s["ostr"] = parse_int(q("OSTR?"), 0, 1, "OSTR?")
+        # 内部発振器の設定（OSC OUT。参照信号が INT OSC でなくても出力は出ている）
+        state = self.oscillator()
+        s["osc_freq"], s["osc_ampl"], s["osc_range"] = (float(state.freq), float(state.ampl),
+                                                         state.range)
         return s
+
+    # ------------------------------------------------------------------
+    # 内部発振器（FREQ / AMPL、説明書 5-23）
+    # ------------------------------------------------------------------
+    def oscillator(self, raw: bool = False) -> "osc.OscState":
+        """``FREQ?`` と ``AMPL?``。読めない応答は LI5640Error。``raw`` は打ち切り判定を見ない"""
+        q = self._raw_query if raw else self.query
+        try:
+            freq = osc.parse_frequency_reply(q("FREQ?"))
+            ampl, rng = osc.parse_amplitude_reply(q("AMPL?"))
+        except ValueError as e:
+            raise LI5640Error(str(e))
+        return osc.OscState(freq, ampl, rng)
+
+    def drain_errors(self, raw: bool = False) -> list:
+        """エラーキューを 0 まで読み、読んだ項目を返す（送出しない）。21 回で空にならなければ
+        LI5640Error"""
+        q = self._raw_query if raw else self.query
+        errors = []
+        for _ in range(_MAX_ERROR_READS):
+            code, text = parse_error(q("EROR?"))
+            if code == 0:
+                return errors
+            errors.append(text)
+        raise LI5640Error(f"{_MAX_ERROR_READS} 回読んでもエラーキューが空になりません: {errors}")
+
+    def apply_oscillator(self, current: "osc.OscState", target: "osc.OscState", *,
+                         raw: bool = False, before_write: Optional[Callable] = None,
+                         on_progress: Optional[Callable] = None) -> "osc.OscState":
+        """current から target へ 1 コマンドずつ書き、読み返し、エラーを確かめる
+
+        - レンジは変えない（target.range は current.range と同じでなければならない）
+        - 振幅を下げるときは AMPL を先に、それ以外は FREQ を先に送る（設定値が
+          max(前, 後) を超えない順序。実際の出力の過渡を保証するものではない）
+        - 同じ値は送らない。丸めずに送れない target（分解能・刻みの外）は何も書かずに拒否
+        - 各コマンドの後に読み返して完全一致を求め、``EROR?`` を 1 回読んで 0 を求める。
+          どれかが違えば :class:`OscillatorWriteError`（次のコマンドは送らない）
+
+        Args:
+            raw: 打ち切り判定を見ない（終了処理の復元用）
+            before_write: 各書き込みの直前に (command) で呼ぶ（変更した印を付ける）
+            on_progress: 各書き込みの直前（"write"）と読み返しの後（"read_back"）に
+                (event: str, detail: dict) で呼ぶ（記録用）
+        Returns:
+            読み返して確かめた最終状態
+        """
+        if target.range != current.range:
+            raise OscillatorWriteError(f"レンジを変えることになるため書きません（{current.range} -> "
+                                       f"{target.range}）")
+        if not (osc.frequency_representable(target.freq)
+                and osc.amplitude_fits(target.ampl, target.range)):
+            # 送る形へ丸めると別の値（上限を超えうる）を書くことになる
+            raise OscillatorWriteError(f"{target.as_record()} は丸めずに書けない値なので書きません")
+        write = self._raw_write if raw else self.write
+        query = self._raw_query if raw else self.query
+        plan = []
+        freq_cmd = ("FREQ", f"FREQ {osc.format_frequency(target.freq)}")
+        ampl_cmd = ("AMPL", f"AMPL {osc.format_amplitude(target.ampl, target.range)}")
+        if target.ampl < current.ampl:
+            plan = [ampl_cmd, freq_cmd]
+        else:
+            plan = [freq_cmd, ampl_cmd]
+        state = current
+        for kind, command in plan:
+            if kind == "FREQ" and state.freq == target.freq:
+                continue
+            if kind == "AMPL" and state.ampl == target.ampl:
+                continue
+            if not raw:
+                self._check_abort(command)          # 打ち切りなら印を付ける前に止める
+            if before_write is not None:
+                before_write(command)
+            if on_progress is not None:             # 送信を試みたコマンド（失敗しても届いたかもしれない）
+                on_progress("write", {"command": command})
+            write(command)
+            try:
+                if kind == "FREQ":
+                    reply = query("FREQ?")
+                    got = osc.parse_frequency_reply(reply)
+                    ok = got == target.freq
+                    state = osc.OscState(got, state.ampl, state.range)
+                else:
+                    reply = query("AMPL?")
+                    got_ampl, got_range = osc.parse_amplitude_reply(reply)
+                    ok = got_ampl == target.ampl and got_range == target.range
+                    state = osc.OscState(state.freq, got_ampl, got_range)
+            except ValueError as e:
+                raise OscillatorWriteError(f"{command} の読み返しを解釈できません: {e}")
+            if on_progress is not None:
+                on_progress("read_back", {"command": command, "reply": reply})
+            if not ok:
+                raise OscillatorWriteError(f"{command} の読み返しが一致しません: {reply!r}")
+            code, text = parse_error(query("EROR?"))
+            if code != 0:
+                raise OscillatorWriteError(f"{command} の後に機器がエラーを報告しました: {text}")
+        return state
+
+    def restore_oscillator(self, saved: "osc.OscState") -> dict:
+        """終了処理: 発振器を saved に戻す（打ち切り判定を見ない。送出しない）
+
+        いまの状態を読んでから始める。読めなければ何も書かずに ``unverified``、
+        レンジが違えば何も書かずに ``failed``、同じなら書かずに ``verified``。
+        エラーキューに残っていた項目は ``pre_existing_errors`` として分けて残す。
+        """
+        report = {"state": "unverified", "saved": saved.as_record(), "read_before": None,
+                  "written": [], "read_back": [], "pre_existing_errors": [], "errors": []}
+
+        def progress(event, detail):
+            if event == "write":
+                report["written"].append(detail["command"])
+            else:
+                report["read_back"].append(detail["reply"])
+
+        try:
+            report["pre_existing_errors"] = self.drain_errors(raw=True)
+        except LI5640Error as e:
+            report["state"] = "failed"
+            report["errors"].append(str(e))
+            return report
+        except Exception as e:  # noqa: BLE001 - I/O エラー: 状態は読めていない
+            report["errors"].append(f"エラーキューを読めません: {e}")
+            return report
+        try:
+            current = self.oscillator(raw=True)
+        except Exception as e:  # noqa: BLE001 - 読めなければ書かない
+            report["errors"].append(f"発振器の設定を読めません: {e}")
+            return report
+        report["read_before"] = current.as_record()
+        if current.range != saved.range:
+            report["state"] = "failed"
+            report["errors"].append(f"レンジが接続時と違います（{current.range} != {saved.range}）。"
+                                    "SAIGEN はレンジを切り替えないので戻しません")
+            return report
+        try:
+            self.apply_oscillator(current, saved, raw=True, on_progress=progress)
+            report["state"] = "verified"
+        except Exception as e:  # noqa: BLE001 - 失敗を記録して後続（OTYP・GTL・close）へ
+            report["state"] = "failed"
+            report["errors"].append(str(e))
+        return report
 
     def read_sample(self) -> tuple:
         """``DOUT?`` と ``WRCR?`` を 1 回ずつ読む（同時刻ではない）
@@ -477,19 +681,31 @@ class LI5640:
     # ------------------------------------------------------------------
     # 終了処理（abort_check を見ない）
     # ------------------------------------------------------------------
-    def release(self, saved_output_type: Optional[str]) -> bool:
-        """デバイスクリア -> OTYP 復元と読み返し -> GTL -> 切断
+    def release(self, saved_output_type: Optional[str],
+                saved_oscillator: Optional["osc.OscState"] = None) -> bool:
+        """デバイスクリア -> 発振器の復元 -> OTYP 復元と読み返し -> GTL -> 切断
 
         どれかが失敗しても次へ進む（復元できなくても前面操作に戻して閉じる）。
-        打ち切り要求は見ない。各 I/O はタイムアウト付き。
+        打ち切り要求は見ない。各 I/O はタイムアウト付き。発振器は ``saved_oscillator``
+        を渡したときだけ戻す（:meth:`restore_oscillator`）。結果は :attr:`last_release`
+        （``{"oscillator": 報告 or None, "closed": bool}``）に残す。
 
         Returns:
             bool: 閉じられたら True（close() が失敗したら例外を送出する）
         """
+        self.last_release = {"oscillator": None, "closed": False}
         try:
             self._inst.clear()           # 途中まで送ったコマンドが残っていれば捨てる
         except Exception as e:  # noqa: BLE001 - 後続を優先
             logger.warning(f"LI5640 のデバイスクリアに失敗しました: {e}")
+        if saved_oscillator is not None:
+            report = self.restore_oscillator(saved_oscillator)
+            self.last_release["oscillator"] = report
+            if report["state"] == "verified":
+                logger.info(f"LI5640 の発振器を接続時の設定に戻しました: {report['saved']}")
+            else:
+                logger.error(f"LI5640 の発振器を戻せませんでした（{report['state']}）: "
+                             f"{report['errors']}。OSC OUT を前面パネルで確認してください")
         if saved_output_type is not None:
             try:
                 self._raw_write(f"OTYP {saved_output_type}")
@@ -509,6 +725,7 @@ class LI5640:
         except Exception as e:  # noqa: BLE001 - 閉じることを優先する
             logger.warning(f"LI5640 を前面操作に戻せません（GTL）: {e}")
         self.close()
+        self.last_release["closed"] = True
         return True
 
     def local(self):
@@ -516,7 +733,9 @@ class LI5640:
         self._inst.control_ren(_gtl_mode())
 
     def close(self):
+        """ハンドルを閉じる。成功したときだけ機器ロックを放す（失敗は送出し、ロックは残す）"""
         self._inst.close()
+        self._release_resource_lock()
 
 
 if __name__ == "__main__":

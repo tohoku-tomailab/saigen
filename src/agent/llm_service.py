@@ -102,6 +102,7 @@ SYSTEM_PROMPT = """
 
 ### ロックインアンプ（NF LI5640, GPIB, 読み取り専用）※共有デバイスのためrobot_id不要
 - measure_lockin: {"action": "measure_lockin", "samples": 5, "interval": 0.0} (パネル表示の DATA1 / DATA2 と参照周波数を読む。感度・時定数・表示は前面パネルで設定し、フローからは変えない。samples: 1-100 回の中央値, interval: 読み取り間隔 0-60 秒 (整定待ちではない))
+- set_lockin_oscillator: {"action": "set_lockin_oscillator", "frequency": 100.0, "amplitude": 0.1, "settle": 1.0} (LI5640 の内部発振器 OSC OUT の周波数 [Hz] と振幅 [Vrms] を設定する。config.yaml の lockin_osc_max_vrms が 0 なら使えない (既定)。振幅は上限以下で、接続時のレンジ (0.05 / 0.5 / 5 V) の刻みで表せる値。周波数は 4 1/2 桁 (最大 19999 カウント)。settle: 設定後に待つ秒数 0-600。ランの終わりに接続時の値へ戻る。ユーザーが明示的に頼んだときだけ使う)
 
 ### オシロスコープ（Agilent 1000 シリーズ, USB, 読み取り専用）※共有デバイスのためrobot_id不要
 - measure_scope: {"action": "measure_scope", "channel": 1, "items": ["vpp", "frequency"], "samples": 3, "interval": 0.5} (前面パネルで設定した波形の自動測定値を読む。設定はフローから変えない。channel: 1-4, items: vpp/vmax/vmin/vamplitude/vtop/vbase/vaverage/vrms (V), frequency (Hz), period/risetime/falltime/pwidth/nwidth (s), pdutycycle/ndutycycle/overshoot/preshoot (%) から 1-10 個, samples: 1-20 回の中央値, interval: 0-60 秒)

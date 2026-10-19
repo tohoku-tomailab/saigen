@@ -82,5 +82,19 @@ jobs:
           python -m src.flow.run_flow examples/li5640/read_lockin.json --mock
           python -m src.flow.run_flow examples/dso1000/read_scope.json --mock
 
+      - name: LI5640 oscillator example (refused by default, runs with an enabling config)
+        run: |
+          # writing the oscillator is disabled by default: the preflight refuses (exit 3)
+          set +e
+          python -m src.flow.run_flow examples/li5640/oscillator/osc_sweep_scope.json --validate-only
+          code=$?
+          set -e
+          test "$code" -eq 3
+          # a lab config that allows 0.3 Vrms between 10 Hz and 1 kHz (CI only)
+          printf 'shared_devices:\n  lockin_osc_max_vrms: 0.3\n  lockin_osc_min_hz: 10.0\n  lockin_osc_max_hz: 1000.0\n' > config.yaml
+          python -m src.flow.run_flow examples/li5640/oscillator/osc_sweep_scope.json --validate-only
+          python -m src.flow.run_flow examples/li5640/oscillator/osc_sweep_scope.json --mock
+          rm config.yaml
+
       - name: Recompute the dispensing-stability statistics
         run: python examples/dispensing_stability/stats.py

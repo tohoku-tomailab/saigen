@@ -152,6 +152,10 @@ ACTION_CONFIG = {
         "icon": "📈", "label": "ロックイン測定", "category": "sensor",
         "defaults": {"samples": 5, "interval": 0.0}
     },
+    "set_lockin_oscillator": {
+        "icon": "🔊", "label": "ロックイン発振器設定", "category": "sensor",
+        "defaults": {"frequency": 100.0, "amplitude": 0.1, "settle": 1.0}
+    },
     "measure_scope": {
         "icon": "📉", "label": "オシロ測定", "category": "sensor",
         "defaults": {"channel": 1, "items": ["vpp", "frequency"], "samples": 3, "interval": 0.5}
@@ -183,7 +187,7 @@ CATEGORIES = {
     "peripheral": ("🔩 周辺機器", ["move_slider", "move_conveyer"]),
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
     "maxarm": ("🧲 MaxArm", ["suction"]),
-    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm", "measure_lockin", "measure_scope"]),
+    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm", "measure_lockin", "set_lockin_oscillator", "measure_scope"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
 }
@@ -840,6 +844,9 @@ def get_param_summary(step):
                 f"NPLC {step.get('nplc', 1.0)} " + (f"レンジ {rng}" if rng is not None else "オート"))
     elif action == "measure_lockin":
         return f"{step.get('samples', 5)}回 間隔 {step.get('interval', 0.0)}秒"
+    elif action == "set_lockin_oscillator":
+        return (f"{step.get('frequency', 100.0)} Hz {step.get('amplitude', 0.1)} Vrms "
+                f"待機 {step.get('settle', 0.0)}秒")
     elif action == "measure_scope":
         items = ", ".join(escape(str(i)) for i in (step.get("items") or ["vpp", "frequency"]))
         return f"CH{step.get('channel', 1)} {items} {step.get('samples', 3)}回"
@@ -1065,6 +1072,17 @@ def render_step_params(step, idx):
              min_value=0.0, max_value=60.0, step=0.1)
         st.caption("NF LI5640（config.yaml の shared_devices.lockin_resource）。感度・時定数・"
                    "表示は前面パネルで設定し、整定を待ってから実行してください")
+
+    elif action == "set_lockin_oscillator":
+        _num(st, "周波数 (Hz)", step, idx, "frequency", float, 100.0,
+             min_value=0.0005, max_value=105000.0, step=1.0, format="%.4f")
+        _num(st, "振幅 (Vrms)", step, idx, "amplitude", float, 0.1,
+             min_value=0.0, max_value=5.0, step=0.001, format="%.4f")
+        _num(st, "設定後の待機(秒)", step, idx, "settle", float, 0.0,
+             min_value=0.0, max_value=600.0, step=0.5)
+        st.caption("NF LI5640 の OSC OUT を設定します。config.yaml の shared_devices."
+                   "lockin_osc_max_vrms が 0（既定）なら実行前に拒否されます。振幅は接続時の"
+                   "レンジのまま、ランの終わりに接続時の値へ戻ります")
 
     elif action == "measure_scope":
         _select(st, "チャネル", step, idx, "channel", [1, 2, 3, 4], 1)
