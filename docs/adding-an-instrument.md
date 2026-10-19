@@ -17,7 +17,13 @@ example for an instrument whose I/O blocks; what its commissioning taught is in
 lock-in amplifier (`src/devices/li5640/`, `measure_lockin`,
 `tests/test_li5640.py`) followed next, as a read-only instrument whose values
 mean what its front panel says; its notes are in
-[`li5640-commissioning.md`](li5640-commissioning.md).
+[`li5640-commissioning.md`](li5640-commissioning.md). The Agilent 1000 series
+oscilloscope (`src/devices/dso1000/`, `measure_scope`, `tests/test_dso1000.py`)
+is the third such instrument and the first over USB; it shows how to record
+several quantities per step (JSON columns keyed by item) and how to refuse
+instrument states whose meaning the code cannot check (X-Y time base, non-edge
+trigger) instead of recording ambiguous values; its notes are in
+[`dso1000-commissioning.md`](dso1000-commissioning.md).
 
 The electronic balance is the closest existing example, and every step below
 names the balance code to copy from. Read `src/devices/README.md` first for the

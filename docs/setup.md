@@ -70,7 +70,7 @@ Edit `config.yaml`:
 | Section | Purpose |
 |---|---|
 | `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); a robot without `type` is a Dobot |
-| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10); `lockin_resource` and `lockin_timeout_ms` of the optional NF LI5640 lock-in amplifier (§11) |
+| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10); `lockin_resource` and `lockin_timeout_ms` of the optional NF LI5640 lock-in amplifier (§11); `scope_resource` and `scope_timeout_ms` of the optional Agilent 1000 series oscilloscope (§12) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
 If `config.yaml` is absent the tracked `config.example.yaml` is used, and if that is
@@ -85,7 +85,7 @@ Edit `.env`:
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
 | `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT` | optional per-run override of the `config.yaml` robot ports |
-| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE`, `LOCKIN_RESOURCE` | optional per-run override of the shared devices |
+| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE`, `LOCKIN_RESOURCE`, `SCOPE_RESOURCE` | optional per-run override of the shared devices |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
 `.env` is git-ignored. No key is read from anywhere else. For device ports the
@@ -550,6 +550,68 @@ What commissioning the first unit taught (what firmware 1.60 answered, the
 defects review found before the bench, open points, things not to do) is in
 [`li5640-commissioning.md`](li5640-commissioning.md).
 
+## 12. Agilent 1000 series oscilloscope (optional, read-only)
+
+SAIGEN reads the automatic measurements (Vpp, mean, RMS, frequency, rise time,
+duty cycle ...) of an Agilent DSO1002A / 1004A / 1012A / 1014A / 1022A / 1024A
+over USB. It sends queries only, apart from a device clear when it opens and
+closes the instrument and `*CLS` when it opens it (`*CLS` also clears errors left in the instrument's queue
+by front-panel use): vertical scale, time base, trigger and acquisition are set
+on the front panel. The driver README
+([`src/devices/dso1000/README.md`](../src/devices/dso1000/README.md)) lists
+every command.
+
+1. Connect the rear **USB DEVICE** port (the square connector) to the PC. The
+   VISA library of §10 (NI-VISA) also drives USB instruments (USBTMC); no
+   GPIB adapter is involved.
+2. List USB resources only and put the one of the oscilloscope
+   (`USB0::0x0957::...::INSTR`, vendor 0x0957 = Agilent) in `config.yaml`. It
+   contains the instrument's serial number, so it stays in `config.yaml`:
+
+   ```bash
+   python -c "import pyvisa; print(pyvisa.ResourceManager().list_resources('USB?*::INSTR'))"
+   ```
+
+   ```yaml
+   shared_devices:
+     scope_resource: "USB0::0x0957::<product id>::<serial>::INSTR"
+     scope_timeout_ms: 5000
+     wait_after_scope: 0.0    # optional pause AFTER each measure_scope step (s)
+   ```
+
+3. On the front panel: show the channel to be measured, use the **Y-T** (or
+   ROLL) time base with the main (not zoomed) window and an **edge** trigger.
+   Other states make the step fail rather than record values whose meaning
+   SAIGEN cannot check.
+4. Check the link (the human's step, CLAUDE.md rule 1; queries only, after a
+   device clear and `*CLS`):
+
+   ```bash
+   python -m src.devices.dso1000.dso1000 USB0::0x0957::<product id>::<serial>::INSTR 1
+   ```
+
+5. `--validate-only` and `--mock` the example
+   [`examples/dso1000/read_scope.json`](../examples/dso1000/read_scope.json),
+   then run it for real; for the first check add `--no-record`.
+
+Each `measure_scope` step reads the settings before and after its reads and
+fails if they differ (a change made and undone within the step is not
+detected), if any requested item has no valid reading, or if the instrument
+reports an error. `samples` is the number of reads, not of acquisitions: the
+oscilloscope does not acquire while it answers, and nothing guarantees a new
+acquisition within `interval`. Ctrl+C behaves as in §10 and §11: robots first,
+the query on the bus is left to finish, nothing more is sent, then device clear
+and close. No GTL is sent: over USB it hung for 120 s and then failed on the
+DSO1014A that was tested. Between query sessions the front panel stayed usable,
+but it was once found locked after the session in which GTL hung (cause not
+determined; it was released from the front panel). On the bench only a flat,
+stopped trace was read (Vpp `4.000e-002`; frequency and duty cycle `9.9E+37`);
+measurements on a real signal have not yet been seen.
+
+What commissioning the first unit taught (what firmware 00.04.04 answered, the
+defects found on the bench and by review, open points, things not to do) is in
+[`dso1000-commissioning.md`](dso1000-commissioning.md).
+
 ## Troubleshooting
 
 - **`GEMINI_API_KEY が設定されていません`** — the key is missing from `.env`, or the
@@ -594,6 +656,14 @@ defects review found before the bench, open points, things not to do) is in
 - **`LI5640 から有効なサンプルを取得できませんでした`** — every reading had an
   over-level or UNLOCK; the reasons are counted in the message and in
   `diagnostics`. Check the sensitivity, the reference and the lamps on the panel.
+- **`オシロスコープ初期化エラー`** — `scope_resource` is empty or wrong, the cable
+  is in the front USB host port instead of the rear USB DEVICE port, or the
+  model is not one of the six of the series (`対応していない機種です`).
+- **`有効な値を取得できなかった項目があります`** — the oscilloscope could not
+  make that measurement on the displayed waveform (for example a rise time
+  faster than it can resolve comes back as `<value`, a frequency needs a full
+  cycle on screen). The reasons per item are in `diagnostics`; adjust the time
+  base or the vertical scale on the panel.
 - **Microscope LED does nothing** — `microscope_led` needs `microscope_port`: the
   400-CAM106 exposes a second device, a Silicon Labs CP210x serial port (VID
   `10C4`, S/N `0001`), on the same USB cable. Set that COM port in `config.yaml`.

@@ -32,6 +32,7 @@ configuration and flow files, not in the driver code.
 | `src/devices/{dobot,picus2,scale,ika,webcam}/` | Per-instrument drivers. |
 | `src/devices/keithley2002/` | Keithley 2002 digital multimeter over GPIB (PyVISA, optional, `measure_dmm`). Its self-check `python -m src.devices.keithley2002.keithley2002 <resource>` talks to the instrument: the human's step. |
 | `src/devices/li5640/` | NF LI5640 lock-in amplifier over GPIB (PyVISA, optional, read-only, `measure_lockin`). Its front-panel settings are never changed; the only setting written is the read-out selection `OTYP`, restored on close. Its self-check `python -m src.devices.li5640.li5640 <resource>` talks to the instrument: the human's step. |
+| `src/devices/dso1000/` | Agilent 1000 series oscilloscope (DSO1014A etc.) over USB (PyVISA, optional, read-only, `measure_scope`). Sends queries only (plus a device clear on open and close, and `*CLS` on open); the set-up stays on the front panel. Its self-check `python -m src.devices.dso1000.dso1000 <resource>` talks to the instrument: the human's step. |
 | `src/devices/maxarm/` | Hiwonder MaxArm (optional robot 4, `type: maxarm`): serial client, protocol and the MicroPython firmware with its human-run installer `deploy_firmware.py`. Wrapped by `MaxArmRobot` / `MockMaxArmRobot` in `src/devices/safety/`. |
 | `src/agent/` | LLM-based generation of flows from natural language, plus preset flows. |
 | `src/gui/` | Streamlit GUI. `src/voice/` voice input. |
@@ -43,7 +44,8 @@ configuration and flow files, not in the driver code.
 | `examples/maxarm/` | Suction pick-and-place flow for the MaxArm (robot 4). |
 | `examples/keithley2002/` | DMM-only flow for the Keithley 2002 (`measure_dmm`). |
 | `examples/li5640/` | Lock-in-only flow for the NF LI5640 (`measure_lockin`). |
-| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument, MaxArm commissioning notes (`maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery), Keithley 2002 commissioning notes (`keithley2002-commissioning.md`: order of work, what the firmware accepted, open observations, interruption rules), NF LI5640 commissioning notes (`li5640-commissioning.md`: read-only scope, what the firmware answered, defects found by review, open points). |
+| `examples/dso1000/` | Oscilloscope-only flow for the Agilent 1000 series (`measure_scope`). |
+| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument, MaxArm commissioning notes (`maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery), Keithley 2002 commissioning notes (`keithley2002-commissioning.md`: order of work, what the firmware accepted, open observations, interruption rules), NF LI5640 commissioning notes (`li5640-commissioning.md`: read-only scope, what the firmware answered, defects found by review, open points), Agilent DSO1014A commissioning notes (`dso1000-commissioning.md`: reply forms, GTL hang over USB, defects found by review, open points). |
 | `tests/`, `src/monitoring/tests/`, `src/imaging/tests/` | Unit tests; none need hardware. |
 
 ## How to verify a change (no hardware needed)
