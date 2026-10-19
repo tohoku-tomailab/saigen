@@ -41,6 +41,9 @@ panels/
 # results written back beside it — copy control.example.csv to control.csv
 src/flow/csv_runner/control.csv
 src/flow/csv_runner/results*.csv
+# tube-balancing runner: copy balance.example.csv to balance.csv (lab positions)
+src/flow/balance_runner/balance.csv
+src/flow/balance_runner/results*.csv
 
 # Monitoring (src/monitoring/): per-environment port config, not published
 src/monitoring/config.yaml

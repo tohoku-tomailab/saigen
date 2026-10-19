@@ -1,0 +1,28 @@
+parameter,value,note
+robot_id,4,MaxArm robot id in config.yaml (type: maxarm)
+volume_a_mL,20,volume put into tube A (mL)
+tolerance_g,0.1,stop when |A - B| is at most this (g)
+liquid_density_g_per_mL,1.0,expected density of the liquid (g/mL); used for planning and the density check
+density_check_pct,15,stop if the measured g per commanded mL is off the expected density by more than this (%)
+travel_z,185,PLACEHOLDER - teach it: arm height (mm) at which the tip clears the tubes the rack and the reservoir
+reservoir_x,-100,PLACEHOLDER - teach it: reservoir centre x (mm, MaxArm frame)
+reservoir_y,-170,PLACEHOLDER - teach it: reservoir centre y (mm)
+reservoir_aspirate_z,120,PLACEHOLDER - teach it: arm z for aspirating from the FULL reservoir (tip well under the surface)
+reservoir_drop_mm_per_mL,0,how far the surface drops per mL taken (mm/mL); the aspiration height follows it. 0 = fixed height
+reservoir_min_z,110,PLACEHOLDER - lowest arm z allowed in the reservoir (tip just above the bottom); the run stops before going lower
+tube_a_x,60,PLACEHOLDER - teach it: tube A opening x (mm)
+tube_a_y,-185,PLACEHOLDER - teach it: tube A opening y (mm)
+tube_b_x,95,PLACEHOLDER - teach it: tube B opening x (mm)
+tube_b_y,-185,PLACEHOLDER - teach it: tube B opening y (mm)
+dispense_z,160,PLACEHOLDER - teach it: arm z for dispensing (tip just inside the tube mouth and above the 45 mL mark)
+aspirate_speed,3,pipette aspiration speed (1-9)
+dispense_speed,3,pipette dispensing speed (1-9)
+max_aspirate_mL,10,largest volume per aspiration (0.5-10 mL)
+blow_out_after_dispense,1,blow out after every dispense (1/0)
+top_up_reserve_mL,1.0,the bulk of tube B stops this far short so the last top-up is at least 0.5 mL (mL)
+max_top_ups,6,give up after this many weighed top-ups
+max_tube_volume_mL,45,most liquid the runner may put into one tube (mL)
+allow_extra_in_a,0,1 = may add liquid to tube A to close a gap below 0.5 mL or when B is heavier (A then holds more than volume_a_mL)
+settle_s,3,wait after the arm stops before reading the balance (s)
+stabilization_count,5,balance readings per measurement (median)
+pipette_port,,Picus 2 COM port (empty = --pipette-port or robots.<id>.picus2_address in config.yaml)

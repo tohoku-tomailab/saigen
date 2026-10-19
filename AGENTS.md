@@ -28,6 +28,7 @@ configuration and flow files, not in the driver code.
 | `.env.example` -> `.env` | API keys for flow generation, optional per-run port overrides, monitoring settings. Never committed. |
 | `src/flow/` | JSON flow schema, validator, executor and the CLI runner `run_flow.py`. |
 | `src/flow/csv_runner/` | Spreadsheet-driven runner for the two-solution mixing experiment (`run_csv.py`). |
+| `src/flow/balance_runner/` | Centrifuge-tube balancing with the MaxArm carrying a pipette (`run_balance.py`, sheet `balance.example.csv`, README). A real run prompts the operator at the terminal. |
 | `src/devices/safety/` | `LabRobot` (real), `MockLabRobot` (no hardware), shared devices and the workspace validators. **All flows run through this layer.** |
 | `src/devices/{dobot,picus2,scale,ika,webcam}/` | Per-instrument drivers. |
 | `src/devices/maxarm/` | Hiwonder MaxArm (optional robot 4, `type: maxarm`): serial client, protocol and the MicroPython firmware with its human-run installer `deploy_firmware.py`. Wrapped by `MaxArmRobot` / `MockMaxArmRobot` in `src/devices/safety/`. |
@@ -50,6 +51,8 @@ python -m pytest tests/ src/monitoring/tests/ src/imaging/tests/ -q
 python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --validate-only
 python -m src.flow.run_flow examples/zif8/zif8_two_solution_mixing_speed5.json --mock
 python -m src.flow.csv_runner.run_csv --mock
+python -m src.flow.balance_runner.run_balance --validate-only
+python -m src.flow.balance_runner.run_balance --mock
 ```
 
 `--validate-only` checks a flow against the schema and the loop structure, and
