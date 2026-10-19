@@ -604,9 +604,9 @@ the query on the bus is left to finish, nothing more is sent, then device clear
 and close. No GTL is sent: over USB it hung for 120 s and then failed on the
 DSO1014A that was tested. Between query sessions the front panel stayed usable,
 but it was once found locked after the session in which GTL hung (cause not
-determined; it was released from the front panel). On the bench only a flat,
-stopped trace was read (Vpp `4.000e-002`; frequency and duty cycle `9.9E+37`);
-measurements on a real signal have not yet been seen.
+determined; it was released from the front panel). On the bench all 18 items
+were read on a signal (duty cycle came back without the `%` the guide shows;
+both forms are accepted); accuracy against a known reference was not checked.
 
 What commissioning the first unit taught (what firmware 00.04.04 answered, the
 defects found on the bench and by review, open points, things not to do) is in

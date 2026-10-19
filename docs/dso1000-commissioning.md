@@ -9,12 +9,11 @@ The general rules for new instruments are in
 [`adding-an-instrument.md`](adding-an-instrument.md).
 
 Configuration checked: one DSO1014A (firmware 00.04.04) on the rear USB DEVICE
-port, Windows 11, NI-VISA, PyVISA 1.16, on 2026-10-16 and 2026-10-19. **No
-signal reached the screen during commissioning**: every reading on the bench
-was either "no measurement" or a flat, stopped trace. Readings of a real
-waveform, the position of `%` in the duty-cycle and overshoot replies, and the
-`<` / `>` bound replies are covered by the tests against a simulated instrument
-only. Another unit or firmware may differ, so treat what follows as
+port, Windows 11, NI-VISA, PyVISA 1.16, on 2026-10-16 and 2026-10-19. A signal
+of about 300 Hz and 0.9 Vpp reached CH1 only at the end of the second day; it
+was not a known reference, so the readings in §3 check communication and reply
+forms, not accuracy. The `<` / `>` bound replies are covered by the tests
+against a simulated instrument only. Another unit or firmware may differ, so treat what follows as
 expectations to re-check, not as specifications.
 
 ## 1. Scope chosen: read-only, automatic measurements
@@ -56,9 +55,10 @@ yourself, or have an agent run them only after you ask for it in the session
    `examples/dso1000/read_scope.json` with `--no-record`.
 
 What was verified: communication, every query the driver sends (about 30 per
-snapshot), the reply forms below, the refusal of a hidden channel before any
-measurement query, and a clean close. What was **not** verified: readings of a
-real signal.
+snapshot), all 18 items on a signal, the reply forms below, the refusal of a
+hidden channel before any measurement query, a scope-only flow run end to end
+(two steps, three reads each), and a clean close. What was **not** verified:
+the accuracy of the readings (no known reference was used).
 
 ## 3. What firmware 00.04.04 answered
 
@@ -74,6 +74,10 @@ real signal.
 | `:MEASure:SOURce?` | | `CHANnel1` |
 | `:MEASure:<item>? CHANnel<n>` on a hidden channel, or with no edges in a stopped trace | 9.9E+37 is documented only for the counter (p.103) | `9.9E+37` |
 | `:MEASure:VPP? CHANnel1` on a flat, stopped trace at 0.5 V/div | | `4.000e-002` |
+| `:TRIGger:STATus?` while triggering | `RUN`, `STOP`, `T'D`, `WAIT`, `SCAN`, `AUTO` | `T'D` |
+| `:MEASure:<item>? CHANnel1` on a signal (0.2 V/div, 2 ms/div) | | `8.880e-001` (Vpp), `3.048e002` (frequency), `1.080e-003` (rise time) |
+| `:MEASure:PDUTycycle?`, `NDUTycycle?` | trailing `%` (p.168, 172) | `5.000e001`, `5.121e001`: **no `%`** |
+| `:MEASure:OVERshoot?`, `PREShoot?` | trailing `%` (p.174, 178) | `0.000e000`, `9.090e-003`: no `%` |
 
 - `:KEY:LOCK?` = `ENABLE` means the front panel is **enabled**: with that reply
   the human changed V/div between two sessions and the next session read the
@@ -82,7 +86,12 @@ real signal.
   `:MEASure:SOURce?` and added no measurement to the screen
   (`:MEASure:TOTal?` stayed 0).
 - The self-check (open, snapshot, three items, close) took about 0.5 s with
-  acquisition stopped and no waveform. Times while acquiring were not measured.
+  acquisition stopped and no waveform. With a signal, each step of the example
+  flow (snapshot, three reads 0.5 s apart, snapshot, error queue) took about
+  1.3 s.
+- The driver strips a trailing `%` only if one is there, so both the guide's
+  form and the instrument's form are read.
+- No `<` / `>` reply appeared, also not for rise and fall time.
 
 ## 4. Defects found on the bench
 
@@ -126,11 +135,11 @@ fix is reverted.
 
 ## 6. Open points
 
-- **A real signal.** Readings of a waveform on screen; where `%` sits in the
-  duty-cycle, overshoot and preshoot replies; how `<` / `>` bound replies look
-  (rise time near the limit). Feed a known square wave into CH1, press
-  Run/Stop, choose a time base that shows a few periods, then run the
-  self-check and the example flow with `--no-record`.
+- **A known reference.** Accuracy was not checked. Feed a signal of known
+  amplitude and frequency into CH1 and compare.
+- **Bound replies** (`<` / `>`, rise time near the limit of the time base)
+  and the unit of overshoot / preshoot (the guide says %; `9.090e-003` was read
+  on a signal whose overshoot was not known).
 - **The front-panel lock** described in §4: its cause and the way to release
   it.
 - **Not yet seen on the instrument:** a front-panel measurement lock

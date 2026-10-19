@@ -1086,3 +1086,18 @@ def test_io_error_while_reading_the_error_queue_keeps_the_errors_read(monkeypatc
 
     diag = asyncio.run(main())
     assert diag["errors_after"] == ['-113,"Undefined header"']
+
+
+def test_bench_measurement_replies_on_a_real_signal():
+    """Replies of a DSO1014A (firmware 00.04.04) to a signal on CH1: no % on duty cycle."""
+    from src.devices.dso1000.dso1000 import parse_measurement
+    assert parse_measurement("8.880e-001", "vpp") == (0.888, None)
+    assert parse_measurement("3.048e002", "frequency") == (304.8, None)
+    assert parse_measurement("5.000e001", "pdutycycle") == (50.0, None)
+    assert parse_measurement("5.121e001", "ndutycycle") == (51.21, None)
+    assert parse_measurement("0.000e000", "overshoot") == (0.0, None)
+    assert parse_measurement("9.090e-003", "preshoot") == (0.00909, None)
+    assert parse_measurement("-4.320e-001", "vmin") == (-0.432, None)
+
+    dso, _ = make_driver(FakeScope(**{":TRIGger:STATus?": "T'D"}))
+    assert dso.snapshot(1)["status"] == "T'D"
