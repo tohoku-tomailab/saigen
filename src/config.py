@@ -76,6 +76,12 @@ DEFAULTS = {
         "lockin_resource": "",
         "lockin_timeout_ms": 5000,
         "wait_after_lockin": 0.0,
+        # Agilent 1000 series oscilloscope (DSO1014A etc., read-only): VISA
+        # resource USB0::0x0957::<product id>::<serial>::INSTR. Empty: a flow
+        # with measure_scope refuses to start a real run until it is set.
+        "scope_resource": "",
+        "scope_timeout_ms": 5000,
+        "wait_after_scope": 0.0,
     },
     "workspace": {
         "x_min": -300.0, "x_max": 300.0,
@@ -287,7 +293,7 @@ def get_robot_workspace(robot_id: int) -> dict:
 
 
 def get_shared_devices() -> dict:
-    """Settings for the shared devices (scale_port, camera_index, microscope_*, dmm_*, lockin_*)."""
+    """Settings for the shared devices (scale_port, camera_index, microscope_*, dmm_*, lockin_*, scope_*)."""
     return dict(load_config()["shared_devices"])
 
 

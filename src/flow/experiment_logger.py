@@ -128,6 +128,7 @@ class ExperimentLogger:
         self.events = []           # 重量測定・画像撮影など特筆すべきイベント
         self.step_diagnostics = []  # 失敗したステップの診断データ（metadata.json へ）
         self.lockin_settings = []   # 成功したロックイン読み取りのパネル設定（metadata.json へ）
+        self.scope_readings = []    # 成功したオシロ読み取りの設定と応答文字列（metadata.json へ）
         self.robots_used = set()
         self.picus2_robots = set()
         self.robot_types = {}      # robot_id -> "dobot" / "maxarm"
@@ -252,6 +253,13 @@ class ExperimentLogger:
                                      if isinstance(result.get("lockin_valid_samples"), int) else ""),
             "lockin_invalid": _json_cell(result.get("lockin_invalid")),
             "lockin_settings": _json_cell(result.get("lockin_settings")),
+            "scope_channel": (str(result["scope_channel"])
+                              if isinstance(result.get("scope_channel"), int) else ""),
+            "scope_values": _json_cell(result.get("scope_values")),
+            "scope_units": _json_cell(result.get("scope_units")),
+            "scope_valid": _json_cell(result.get("scope_valid")),
+            "scope_invalid": _json_cell(result.get("scope_invalid")),
+            "scope_settings": _json_cell(result.get("scope_settings")),
             "diagnostics": _json_cell(diagnostics),
             "error": error or "",
         }
@@ -260,6 +268,13 @@ class ExperimentLogger:
             self.step_diagnostics.append({"step_index": index, "action": action,
                                           "iteration": record["iteration"],
                                           "error": error or "", "diagnostics": diagnostics})
+        if status == "ok" and isinstance(result.get("scope_values"), dict):
+            # 設定と応答文字列はステップごとに構造のまま残す（未確認の応答形式の調査用）
+            self.scope_readings.append({"step_index": index, "iteration": record["iteration"],
+                                        "channel": result.get("scope_channel"),
+                                        "settings": result.get("scope_settings"),
+                                        "settings_after": result.get("scope_settings_after"),
+                                        "raw": result.get("scope_raw")})
         if status == "ok" and isinstance(result.get("lockin_settings"), dict):
             # 成功した読み取りのパネル設定も構造のまま残す（CSV の JSON 文字列を解析させない）
             self.lockin_settings.append({"step_index": index, "iteration": record["iteration"],
@@ -293,6 +308,14 @@ class ExperimentLogger:
                            f"{record['lockin_data1_unit']}, {record['lockin_data2_kind']} "
                            f"{record['lockin_data2']} {record['lockin_data2_unit']}, "
                            f"{record['lockin_freq']} Hz"),
+                "step_index": index, "iteration": record["iteration"],
+            })
+        if record["scope_values"]:
+            shown = ", ".join(f"{k} {v} {(result.get('scope_units') or {}).get(k, '')}".strip()
+                              for k, v in (result.get("scope_values") or {}).items())
+            self.events.append({
+                "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
+                "kind": "scope", "detail": f"CH{record['scope_channel']}: {shown}",
                 "step_index": index, "iteration": record["iteration"],
             })
         if diagnostics:
@@ -349,7 +372,8 @@ class ExperimentLogger:
                   "lockin_data2", "lockin_data2_kind", "lockin_data2_unit",
                   "lockin_freq", "lockin_sensitivity", "lockin_time_constant",
                   "lockin_valid_samples", "lockin_invalid", "lockin_settings",
-                  "diagnostics", "error"]
+                  "scope_channel", "scope_values", "scope_units", "scope_valid",
+                  "scope_invalid", "scope_settings", "diagnostics", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -361,6 +385,7 @@ class ExperimentLogger:
         images = [r for r in self.records if r["image_path"] != ""]
         dmm_readings = [r for r in self.records if r["dmm_value"] != ""]
         lockin_readings = [r for r in self.records if r["lockin_data1"] != ""]
+        scope_rows = [r for r in self.records if r["scope_values"] != ""]
         meta = {
             "name": self.name,
             "description": self.description,
@@ -386,6 +411,9 @@ class ExperimentLogger:
             "step_diagnostics": self.step_diagnostics,
             # 成功したロックイン読み取りごとのパネル設定（感度・時定数・表示など）
             "lockin_settings": self.lockin_settings,
+            "scope_measurements": len(scope_rows),
+            # 成功したオシロ読み取りごとのパネル設定と応答文字列
+            "scope_readings": self.scope_readings,
             "images_captured": len(images),
             "sensor_recording": self.recording,
             "output_files": {
@@ -407,6 +435,7 @@ class ExperimentLogger:
         images = [e for e in self.events if e["kind"] == "image"]
         dmm_events = [e for e in self.events if e["kind"] == "dmm"]
         lockin_events = [e for e in self.events if e["kind"] == "lockin"]
+        scope_events = [e for e in self.events if e["kind"] == "scope"]
 
         lines = []
         lines.append(f"# 実験レポート: {self.name}")
@@ -432,7 +461,8 @@ class ExperimentLogger:
                     f"Robot {rid} = {t}" for rid, t in sorted(self.robot_types.items())))
         lines.append(f"- **重量測定**: {len(weights)} 回 / **撮影画像**: {len(images)} 枚"
                      + (f" / **DMM 測定**: {len(dmm_events)} 回" if dmm_events else "")
-                     + (f" / **ロックイン測定**: {len(lockin_events)} 回" if lockin_events else ""))
+                     + (f" / **ロックイン測定**: {len(lockin_events)} 回" if lockin_events else "")
+                     + (f" / **オシロ測定**: {len(scope_events)} 回" if scope_events else ""))
         if self.error:
             lines.append(f"- **エラー**: {self.error}")
         lines.append("")
@@ -451,7 +481,8 @@ class ExperimentLogger:
             lines.append("|--------:|------|------|---------:|------|------|")
             for e in self.events:
                 kind = {"weight": "⚖️ 重量", "image": "📷 画像", "dmm": "🔌 DMM",
-                        "lockin": "📈 ロックイン", "diagnostics": "⚠️ 診断"}.get(e["kind"], e["kind"])
+                        "lockin": "📈 ロックイン", "scope": "📉 オシロ",
+                        "diagnostics": "⚠️ 診断"}.get(e["kind"], e["kind"])
                 detail = e["detail"]
                 if e["kind"] == "image":
                     rel = os.path.relpath(detail, self.dir) if os.path.isabs(detail) else detail
@@ -459,7 +490,7 @@ class ExperimentLogger:
                 lines.append(f"| {e['elapsed_s']:.1f} | {e['timestamp'].split(' ')[1]} "
                              f"| {kind} | {e['step_index']} | {e['iteration']} | {detail} |")
         else:
-            lines.append("（重量測定・DMM 測定・ロックイン測定・画像撮影はありませんでした）")
+            lines.append("（重量測定・DMM 測定・ロックイン測定・オシロ測定・画像撮影はありませんでした）")
         lines.append("")
 
         # 重量測定の抜粋（解析しやすいように数値だけ再掲）
@@ -503,6 +534,26 @@ class ExperimentLogger:
                              f"| {r['lockin_time_constant']} | {r['lockin_valid_samples']} |")
             lines.append("")
 
+        # オシロスコープの自動測定値（項目ごとの中央値・単位・有効回数）
+        if scope_events:
+            lines.append("## オシロ測定値")
+            lines.append("")
+            lines.append("| # | 経過(s) | 反復 | CH | 項目 | 値 | 単位 | 有効回数 |")
+            lines.append("|---|--------:|------|---:|------|---:|------|------:|")
+            n = 0
+            for r in self.records:
+                if r["scope_values"] == "":
+                    continue
+                values = json.loads(r["scope_values"])
+                units = json.loads(r["scope_units"] or "{}")
+                valid = json.loads(r["scope_valid"] or "{}")
+                for item, value in values.items():
+                    n += 1
+                    lines.append(f"| {n} | {r['elapsed_s']:.1f} | {r['iteration']} "
+                                 f"| {r['scope_channel']} | {item} | {value!r} "
+                                 f"| {units.get(item, '')} | {valid.get(item, '')} |")
+            lines.append("")
+
         # 全ステップの実行記録
         lines.append("## 全ステップ実行記録")
         lines.append("")
@@ -516,6 +567,8 @@ class ExperimentLogger:
                 note = os.path.basename(r["image_path"])
             elif r.get("dmm_value"):
                 note = f"{r['dmm_value']} {r['dmm_unit']}"
+            elif r.get("scope_values"):
+                note = f"CH{r['scope_channel']} {r['scope_values']}"
             elif r.get("lockin_data1"):
                 note = (f"{r['lockin_data1_kind']} {r['lockin_data1']} {r['lockin_data1_unit']}, "
                         f"{r['lockin_data2_kind']} {r['lockin_data2']} {r['lockin_data2_unit']}")

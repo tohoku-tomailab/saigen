@@ -16,6 +16,7 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
 
     # Keithley 2002 DMM（GPIB）の VISA リソースは --dmm-resource
     # NF LI5640 ロックインアンプ（GPIB）の VISA リソースは --lockin-resource
+    # Agilent 1000 シリーズ オシロスコープ（USB）の VISA リソースは --scope-resource
     python -m src.flow.run_flow examples/keithley2002/measure_dc_voltage.json --mock
 
     # MaxArm（robot 4, config.yaml の type: maxarm）のポートは --robot4-maxarm
@@ -64,7 +65,7 @@ from pydantic import ValidationError
 from src import config as lab_config
 from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS, DMM_ACTIONS, LOCKIN_ACTIONS
+from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS, DMM_ACTIONS, LOCKIN_ACTIONS, SCOPE_ACTIONS
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, robot_type, validator_for_robot
 from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
@@ -270,6 +271,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lockin-resource", default=None,
                    help="NF LI5640 ロックインアンプの VISA リソース（例 GPIB0::<アドレス>::INSTR。"
                         "既定: LOCKIN_RESOURCE / config.yaml）")
+    p.add_argument("--scope-resource", default=None,
+                   help="オシロスコープ（Agilent 1000 シリーズ）の VISA リソース"
+                        "（例 USB0::0x0957::...::INSTR。既定: SCOPE_RESOURCE / config.yaml）")
     record = p.add_mutually_exclusive_group()
     record.add_argument("--record", dest="record", action="store_true", default=None,
                         help="センサーCSV・動画の録画を行う（実機実行時の既定）")
@@ -333,6 +337,9 @@ def resolve_ports(args) -> Tuple[dict, dict]:
     lockin = getattr(args, "lockin_resource", None) or os.getenv("LOCKIN_RESOURCE")
     if lockin:
         shared_config["lockin_resource"] = lockin
+    scope = getattr(args, "scope_resource", None) or os.getenv("SCOPE_RESOURCE")
+    if scope:
+        shared_config["scope_resource"] = scope
 
     return robot_ports, shared_config
 
@@ -644,25 +651,29 @@ class ResourcePlan(NamedTuple):
     needs_microscope_serial: bool
     needs_dmm: bool
     needs_lockin: bool
+    needs_scope: bool
 
     @property
     def needs_shared(self) -> bool:
         return (self.needs_scale or self.needs_camera or self.needs_microscope
-                or self.needs_microscope_serial or self.needs_dmm or self.needs_lockin)
+                or self.needs_microscope_serial or self.needs_dmm or self.needs_lockin
+                or self.needs_scope)
 
     def shared_kwargs(self) -> dict:
         """ExperimentSession.add_shared() に渡す use_* 引数"""
         return dict(use_scale=self.needs_scale, use_camera=self.needs_camera,
                     use_microscope=self.needs_microscope,
                     use_microscope_serial=self.needs_microscope_serial,
-                    use_dmm=self.needs_dmm, use_lockin=self.needs_lockin)
+                    use_dmm=self.needs_dmm, use_lockin=self.needs_lockin,
+                    use_scope=self.needs_scope)
 
     def shared_labels(self) -> list:
         """ログ表示用の共有デバイス名"""
         return [n for n, need in (("天秤", self.needs_scale), ("カメラ", self.needs_camera),
                                   ("顕微鏡カメラ", self.needs_microscope),
                                   ("顕微鏡制御ポート", self.needs_microscope_serial),
-                                  ("DMM", self.needs_dmm), ("ロックイン", self.needs_lockin))
+                                  ("DMM", self.needs_dmm), ("ロックイン", self.needs_lockin),
+                                  ("オシロ", self.needs_scope))
                 if need]
 
 
@@ -689,8 +700,10 @@ def plan_resources(steps: list) -> ResourcePlan:
     needs_microscope_serial = bool(actions & MICROSCOPE_SERIAL_ACTIONS)   # 顕微鏡の制御ポート
     needs_dmm = bool(actions & DMM_ACTIONS)                               # Keithley 2002
     needs_lockin = bool(actions & LOCKIN_ACTIONS)                         # NF LI5640
+    needs_scope = bool(actions & SCOPE_ACTIONS)                           # Agilent DSO1000
     return ResourcePlan(sorted(robot_ids), picus2_robots, needs_scale, needs_camera,
-                        needs_microscope, needs_microscope_serial, needs_dmm, needs_lockin)
+                        needs_microscope, needs_microscope_serial, needs_dmm, needs_lockin,
+                        needs_scope)
 
 
 def _fmt_params(step: dict) -> str:

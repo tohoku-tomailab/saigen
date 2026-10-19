@@ -52,6 +52,7 @@ class SharedDevices:
                  use_microscope_serial: bool = False,
                  use_dmm: bool = False,
                  use_lockin: bool = False,
+                 use_scope: bool = False,
                  **device_configs):
         """
         SharedDevicesを初期化
@@ -67,6 +68,8 @@ class SharedDevices:
                 （measure_dmm）。dmm_resource が必要
             use_lockin: NF LI5640 ロックインアンプ（GPIB、読み取り専用）を使用するか
                 （measure_lockin）。lockin_resource が必要
+            use_scope: Agilent 1000 シリーズ（DSO1014A など）オシロスコープ（USB、読み取り
+                専用）を使用するか（measure_scope）。scope_resource が必要
             **device_configs: デバイス固有の設定
                 - scale_port: str (デフォルト: 'COM4') - BCE8221天秤のCOMポート
                 - camera_index: int (デフォルト: 1) - Webcamのデバイスインデックス
@@ -82,6 +85,10 @@ class SharedDevices:
                 - lockin_timeout_ms: int (デフォルト: 5000) - LI5640 の 1 回の I/O の上限
                 - wait_after_lockin: float (デフォルト: 0) - measure_lockin の後の待機秒
                   （測定の後の間隔。測定前の整定待ちではない）
+                - scope_resource: str (デフォルト: '') - オシロスコープの VISA リソース
+                  (USB0::0x0957::...::INSTR。シリアル番号を含む)
+                - scope_timeout_ms: int (デフォルト: 5000) - オシロの 1 回の I/O の上限
+                - wait_after_scope: float (デフォルト: 0) - measure_scope の後の待機秒
         """
         # デバイス使用フラグ
         self.use_scale = use_scale
@@ -90,6 +97,7 @@ class SharedDevices:
         self.use_microscope_serial = use_microscope_serial
         self.use_dmm = use_dmm
         self.use_lockin = use_lockin
+        self.use_scope = use_scope
 
         # デバイスインスタンス（初期化前はNone）
         self.scale = None
@@ -100,6 +108,7 @@ class SharedDevices:
         self.lockin = None
         # 接続時に読んだ LI5640 の OTYP（切断時に戻す）。読む前に失敗したら None
         self._lockin_saved_otyp = None
+        self.scope = None
 
         # DMM の I/O はワーカースレッドで行い、ロックで直列化する（測定・切断が
         # 同時にバスを触らない）。ハンドルを閉じるのは常にロックを持つ側:
@@ -110,6 +119,8 @@ class SharedDevices:
         # LI5640 も同じ規則（機器ごとのロック。同じ GPIB バスでも宛先は別の機器）
         self._lockin_lock = threading.Lock()
         self._lockin_closing = threading.Event()
+        self._scope_lock = threading.Lock()
+        self._scope_closing = threading.Event()
 
         # デバイス設定
         self.device_configs = device_configs
@@ -121,6 +132,8 @@ class SharedDevices:
         self.dmm_close_wait_s = self._dmm_timeout_ms() / 1000.0 * 2 + 5.0
         self.wait_after_lockin = float(device_configs.get('wait_after_lockin') or 0.0)
         self.lockin_close_wait_s = self._lockin_timeout_ms() / 1000.0 * 2 + 5.0
+        self.wait_after_scope = float(device_configs.get('wait_after_scope') or 0.0)
+        self.scope_close_wait_s = self._scope_timeout_ms() / 1000.0 * 2 + 5.0
 
         # 初期化フラグ
         self._initialized = False
@@ -161,6 +174,11 @@ class SharedDevices:
             # ロックインアンプ（NF LI5640, GPIB）の初期化
             if self.use_lockin:
                 if not await self._initialize_lockin():
+                    return False
+
+            # オシロスコープ（Agilent 1000 シリーズ, USB）の初期化
+            if self.use_scope:
+                if not await self._initialize_scope():
                     return False
 
             self._initialized = True
@@ -305,6 +323,53 @@ class SharedDevices:
             return True
         except Exception as e:
             logger.error(f"Keithley 2002 初期化エラー（{resource}）: {e}")
+            return False
+
+    def _scope_timeout_ms(self) -> int:
+        return int(self.device_configs.get('scope_timeout_ms') or 5000)
+
+    async def _initialize_scope(self) -> bool:
+        """オシロスコープを開き、機種（対応表）とエラーキューを確かめる
+
+        送るのはデバイスクリア・``*CLS``・問い合わせだけ。失敗時はハンドルを残さない。
+        """
+        resource = self.device_configs.get('scope_resource') or ""
+        if not resource:
+            logger.error("オシロスコープの VISA リソースが未設定です "
+                         "(config.yaml の shared_devices.scope_resource を設定してください。"
+                         "例: USB0::0x0957::<製品ID>::<シリアル>::INSTR)")
+            return False
+        timeout_ms = self._scope_timeout_ms()
+
+        def _open():
+            from src.devices.dso1000 import DSO1000
+            with self._scope_lock:
+                if self._scope_closing.is_set():
+                    raise RuntimeError("切断処理が始まっているためオシロスコープを開きません")
+                self.scope = DSO1000(resource, timeout_ms=timeout_ms)
+                self.scope.abort_check = self._scope_closing.is_set
+                try:
+                    self.scope.clear_status()
+                    idn = self.scope.identify()
+                    self.scope.check_errors("接続確認")
+                except BaseException:
+                    self._release_scope_locked()
+                    raise
+                finally:
+                    if self._scope_closing.is_set():
+                        self._release_scope_locked()
+                return idn
+
+        try:
+            logger.info("オシロスコープを初期化中...")
+            idn = await asyncio.to_thread(_open)
+            logger.info(f"✓ オシロスコープ初期化完了: {idn}")
+            return True
+        except asyncio.CancelledError:
+            self._scope_closing.set()       # ワーカーは次の問い合わせを送らない
+            raise
+        except Exception as e:
+            logger.error(f"オシロスコープ初期化エラー: {e}")
             return False
 
     def _lockin_timeout_ms(self) -> int:
@@ -764,6 +829,191 @@ class SharedDevices:
             raise RuntimeError("LI5640 を閉じられませんでした（ハンドルは保持しています）")
 
     # ========================================
+    # オシロスコープ（Agilent 1000 シリーズ）操作
+    # ========================================
+
+    async def measure_scope(self, channel: int = 1, items=("vpp", "frequency"),
+                            samples: int = 3, interval: float = 0.5) -> dict:
+        """
+        オシロスコープの自動測定値を読む（問い合わせだけ。設定は前面パネルのもの）
+
+        ``samples`` 回、要求された項目を順に ``:MEASure:<項目>? CHANnel<n>`` で読み、
+        項目ごとに有効な値の中央値を返す。``samples`` は読み取り回数で、新しい取り込み
+        の回数でも独立な標本数でもない。1 回の読み取りの中の項目は同時ではない。
+
+        読み取りの前後で設定を読み、違えば失敗（途中で変えて戻された場合は検出できない）。
+        時間軸が X-Y、時間軸モードが DELAYED、トリガがエッジ以外、チャネル非表示も失敗。
+        要求された項目のどれか 1 つでも有効な値が 0 回なら失敗。I/O エラー・読めない設定・
+        機器のエラーキューの項目も失敗（有効な値がほかにあっても）。
+
+        Returns:
+            dict: ``scope_channel``, ``scope_values`` / ``scope_units`` / ``scope_valid``
+            （項目ごと）, ``scope_invalid``（項目ごと・理由ごとの件数）, ``scope_settings``,
+            ``scope_settings_after``（読み取り後の設定。状態・サンプルレート・
+            :MEASure:SOURce の変化も残る）, ``scope_raw``（項目ごとの応答文字列の列）
+
+        Raises:
+            RuntimeError: 初期化されていない・中断された
+            ValueError: 引数が範囲外
+            ScopeStepError: 上記の失敗（``diagnostics`` 付き）
+            DSO1000Error: 機器のエラー・解釈できない設定値。I/O エラーはそのまま送出
+        """
+        from statistics import median
+
+        from src.devices.dso1000 import ITEMS, ScopeStepError
+        from src.devices.dso1000.dso1000 import VOLATILE_SETTINGS, item_unit, parse_measurement
+        if not self.use_scope or self.scope is None or self._scope_closing.is_set():
+            raise RuntimeError("オシロスコープが初期化されていません")
+        channel, samples, interval = int(channel), int(samples), float(interval)
+        items = list(items)
+        if not items or len(set(items)) != len(items) or any(i not in ITEMS for i in items):
+            raise ValueError(f"items は重複のない既知の項目 1 つ以上: {items}")
+        if samples < 1:
+            raise ValueError(f"samples は 1 以上: {samples}")
+        dso = self.scope
+        if not 1 <= channel <= (dso.channels or 4):
+            raise ScopeStepError(f"{dso.model} は CH{channel} を持ちません（1〜{dso.channels}）",
+                                 {"channel": channel, "model": dso.model})
+        stop = threading.Event()
+
+        def _stopped() -> bool:
+            return stop.is_set() or self._scope_closing.is_set()
+
+        def _run():
+            from src.devices.dso1000 import DSO1000Aborted
+            with self._scope_lock:
+                if self.scope is not dso or self._scope_closing.is_set():
+                    return None
+                dso.abort_check = _stopped
+                progress = {"channel": channel}     # 失敗時の診断用（取得済みのものだけ）
+                try:
+                    fmt = dso.timebase_format()
+                    if fmt == "XY":
+                        return "reject", {"tb_format": fmt}, "時間軸が X-Y 表示です（自動測定できません）"
+                    before = dso.snapshot(channel, into=progress.setdefault("settings_before", {}))
+                    if before["tb_mode"] != "MAIN":
+                        return "reject", before, "時間軸が DELAYED（ズーム）です（MAIN だけに対応）"
+                    if before["trig_mode"] != "EDGE":
+                        return "reject", before, (f"トリガが {before['trig_mode']} です"
+                                                  "（エッジトリガだけに対応）")
+                    if not before["ch_display"]:
+                        return "reject", before, f"CH{channel} が表示されていません"
+                    raw = {item: [] for item in items}
+                    progress["raw"] = raw
+                    for i in range(samples):
+                        if i and interval > 0:
+                            deadline = time.monotonic() + interval
+                            while (left := deadline - time.monotonic()) > 0:
+                                if stop.wait(min(0.1, left)) or _stopped():
+                                    return None
+                        for item in items:
+                            raw[item].append(dso.measure(item, channel))
+                    after = dso.snapshot(channel, into=progress.setdefault("settings_after", {}))
+                    dso.check_errors("測定の後", into=progress.setdefault("errors_after", []))
+                    return "ok", before, after, raw
+                except DSO1000Aborted:
+                    return None
+                except Exception as e:
+                    # I/O エラー・機器エラーでも、取得済みの設定と応答を記録に残す
+                    # （追加の I/O はしない）。例外の型はそのまま
+                    try:
+                        e.diagnostics = {**progress, "error_type": type(e).__name__}
+                    except Exception:  # noqa: BLE001 - 属性を持てない例外はそのまま
+                        pass
+                    raise
+                finally:
+                    dso.abort_check = self._scope_closing.is_set
+                    if self._scope_closing.is_set():
+                        self._release_scope_locked()
+
+        try:
+            outcome = await asyncio.to_thread(_run)
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+        except Exception as e:
+            logger.error(f"オシロスコープ測定エラー: {e}")
+            raise
+        if outcome is None:
+            raise RuntimeError("オシロスコープの測定が中断されました")
+        if outcome[0] == "reject":
+            _, settings, reason = outcome
+            raise ScopeStepError(reason, {"channel": channel, "settings_before": settings})
+        _, before, after, raw = outcome
+
+        values, units, valid, invalid = {}, {}, {}, {}
+        for item in items:
+            good = []
+            for reply in raw[item]:
+                value, reason = parse_measurement(reply, item)
+                if reason is None:
+                    good.append(value)
+                else:
+                    invalid.setdefault(item, {})
+                    invalid[item][reason] = invalid[item].get(reason, 0) + 1
+            values[item] = median(good) if good else None
+            units[item] = item_unit(item, before["ch_units"])
+            valid[item] = len(good)
+        diagnostics = {"channel": channel, "settings_before": before, "settings_after": after,
+                       "samples": samples, "interval_s": interval, "values": values,
+                       "valid": valid, "invalid": invalid, "raw": raw}
+        compare = [k for k in set(before) | set(after) if k not in VOLATILE_SETTINGS]
+        diff = {k: [before.get(k), after.get(k)] for k in sorted(compare)
+                if before.get(k) != after.get(k)}
+        if diff:
+            diagnostics["settings_diff"] = diff
+            logger.error(f"オシロスコープの設定が測定中に変わりました: {diff}")
+            raise ScopeStepError(f"オシロスコープの設定が測定中に変わりました: {sorted(diff)}",
+                                 diagnostics)
+        empty = [item for item in items if valid[item] == 0]
+        if empty:
+            raise ScopeStepError(f"有効な値を取得できなかった項目があります: {empty}"
+                                 f"（{ {i: invalid.get(i) for i in empty} }）", diagnostics)
+        if invalid:
+            logger.warning(f"オシロスコープ: 捨てた読み取り {invalid}")
+        if before["status"] == "STOP" or after["status"] == "STOP":
+            logger.warning("オシロスコープが STOP 状態でした（同じ取り込みを読んでいる可能性があります）")
+        shown = ", ".join(f"{i} = {values[i]!r} {units[i]}" for i in items)
+        logger.info(f"✓ オシロスコープ CH{channel}: {shown}（{samples} 回読み取り, "
+                    f"{before['ch_scale']:g} /div, {before['tb_scale']:g} s/div, "
+                    f"状態 {before['status']}）")
+        if self.wait_after_scope > 0:
+            await asyncio.sleep(self.wait_after_scope)
+        return {"scope_channel": channel, "scope_values": values, "scope_units": units,
+                "scope_valid": valid, "scope_invalid": invalid, "scope_settings": before,
+                "scope_settings_after": after, "scope_raw": raw}
+
+    def _release_scope_locked(self) -> bool:
+        """デバイスクリア・切断。呼び出し側が _scope_lock を持っていること。送出しない"""
+        dso = self.scope
+        if dso is None:
+            return True
+        try:
+            dso.release()
+        except Exception as e:  # noqa: BLE001 - 記録してハンドルを残す
+            logger.error(f"オシロスコープを閉じられません（次の cleanup() で再試行します）: {e}")
+            return False
+        self.scope = None
+        logger.info("✓ オシロスコープ切断完了")
+        return True
+
+    async def _close_scope(self):
+        """オシロスコープを閉じる。通信中のワーカーがいればその I/O が終わるのを待つ"""
+        self._scope_closing.set()
+
+        def _close():
+            if not self._scope_lock.acquire(timeout=self.scope_close_wait_s):
+                logger.warning("オシロスコープの通信が終わっていません。通信を終えたワーカーが切断します")
+                return True
+            try:
+                return self._release_scope_locked()
+            finally:
+                self._scope_lock.release()
+
+        if not await asyncio.to_thread(_close):
+            raise RuntimeError("オシロスコープを閉じられませんでした（ハンドルは保持しています）")
+
+    # ========================================
     # カメラ操作
     # ========================================
 
@@ -1005,9 +1255,12 @@ class SharedDevices:
             self._dmm_closing.set()
         if self.use_lockin:
             self._lockin_closing.set()
+        if self.use_scope:
+            self._scope_closing.set()
         cancelled = None
         for label, used, close in (("Keithley 2002", self.use_dmm, self._close_dmm),
-                                   ("LI5640", self.use_lockin, self._close_lockin)):
+                                   ("LI5640", self.use_lockin, self._close_lockin),
+                                   ("オシロスコープ", self.use_scope, self._close_scope)):
             if not used:
                 continue
             try:

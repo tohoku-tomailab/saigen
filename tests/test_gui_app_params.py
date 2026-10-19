@@ -47,6 +47,8 @@ VALID_STEPS = [
      "range": 20.0},                                                                   # 22
     {"action": "rotate", "robot_id": 1, "angle": 90.0},                                # 23
     {"action": "measure_lockin", "samples": 5, "interval": 0.5},                       # 24
+    {"action": "measure_scope", "channel": 2, "items": ["vpp", "frequency"], "samples": 3,
+     "interval": 0.5},                                                                 # 25
 ]
 
 
@@ -76,7 +78,7 @@ def test_every_palette_block_renders_its_parameters():
     # the editors were drawn, not skipped (invalid steps are shown read-only)
     keys = {w.key for w in at.number_input}
     for param, idx in (("delay", 21), ("volume", 9), ("timeout", 17), ("nplc", 22),
-                       ("interval", 24)):
+                       ("interval", 24), ("interval", 25)):
         assert any(k and k.startswith(f"{param}_") and k.endswith(f"_{idx}") for k in keys), param
 
 
@@ -106,4 +108,17 @@ def test_dmm_function_change_resets_the_range_widgets():
     assert at.session_state["workflow_data"]["steps"][0]["range"] == 0.2
     fixed[0].uncheck().run()
     assert "range" not in at.session_state["workflow_data"]["steps"][0]
+    assert _errors(at) == []
+
+
+def test_scope_items_can_change_but_never_become_empty():
+    at = _app_with([{"action": "measure_scope", "channel": 1, "items": ["vpp", "frequency"]}])
+    ms = [w for w in at.multiselect if (w.key or "").startswith("items_")][0]
+    ms.select("vrms").run()
+    assert at.session_state["workflow_data"]["steps"][0]["items"] == ["vpp", "frequency", "vrms"]
+    ms = [w for w in at.multiselect if (w.key or "").startswith("items_")][0]
+    ms.set_value([]).run()                      # emptied: the step keeps its items
+    step = at.session_state["workflow_data"]["steps"][0]
+    ms = [w for w in at.multiselect if (w.key or "").startswith("items_")][0]
+    assert step["items"] == ["vpp", "frequency", "vrms"] and list(ms.value) == step["items"]
     assert _errors(at) == []

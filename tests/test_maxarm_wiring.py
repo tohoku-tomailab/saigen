@@ -178,12 +178,12 @@ def test_plan_resources_signature():
     ])
     assert plan._fields == ("robot_ids", "picus2_robots", "needs_scale", "needs_camera",
                             "needs_microscope", "needs_microscope_serial", "needs_dmm",
-                            "needs_lockin")
+                            "needs_lockin", "needs_scope")
     assert plan.robot_ids == [1, 4] and plan.picus2_robots == {1} and plan.needs_scale
     assert not (plan.needs_camera or plan.needs_dmm or plan.needs_lockin)
     assert plan.shared_kwargs() == dict(use_scale=True, use_camera=False, use_microscope=False,
                                         use_microscope_serial=False, use_dmm=False,
-                                        use_lockin=False)
+                                        use_lockin=False, use_scope=False)
 
 
 def test_preflight_capabilities():

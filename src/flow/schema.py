@@ -569,6 +569,62 @@ class ActionMeasureLockin(_StrictModel):
     )
 
 # ==========================================
+# 1.67 個別のアクション定義 (共有デバイス: Agilent 1000 シリーズ オシロスコープ)
+# ==========================================
+
+ScopeItem = Literal["vpp", "vmax", "vmin", "vamplitude", "vtop", "vbase", "vaverage", "vrms",
+                    "frequency", "period", "risetime", "falltime", "pwidth", "nwidth",
+                    "pdutycycle", "ndutycycle", "overshoot", "preshoot"]
+
+
+class ActionMeasureScope(_StrictModel):
+    """
+    Agilent 1000 シリーズ（DSO1014A など）オシロスコープの自動測定値を読む（読み取り専用）
+    SharedDevices.measure_scope(channel, items, samples, interval) に対応
+
+    垂直・水平・トリガ・取り込みの設定は前面パネルで行う。結果は measurements.csv の
+    scope_* 列（項目ごとの値・単位・有効回数の JSON、パネル設定）に記録される。
+    config.yaml の shared_devices.scope_resource が必要。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["measure_scope"] = Field(
+        ...,
+        description="アクション識別子: オシロスコープの自動測定値の読み取り"
+    )
+    channel: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="測るチャネル（2 チャネル機では 1〜2）"
+    )
+    items: List[ScopeItem] = Field(
+        default_factory=lambda: ["vpp", "frequency"],
+        min_length=1,
+        max_length=10,
+        description="読む測定項目（重複なし）"
+    )
+    samples: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="読み取り回数（項目ごとに有効値の中央値を記録）。取り込みの回数ではない"
+    )
+    interval: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=60.0,
+        description="読み取りの間隔（秒）"
+    )
+
+    @model_validator(mode="after")
+    def _items_unique(self):
+        if len(set(self.items)) != len(self.items):
+            raise ValueError(f"measure_scope: items が重複しています: {self.items}")
+        return self
+
+# ==========================================
 # 1.7 個別のアクション定義 (共有デバイス: BCE8221電子天秤用)
 # ==========================================
 
@@ -689,6 +745,7 @@ LabRobotAction = Union[
     ActionTareScale,
     ActionMeasureDMM,
     ActionMeasureLockin,
+    ActionMeasureScope,
     # ユーティリティ
     ActionWait,
     # ループ制御

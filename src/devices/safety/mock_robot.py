@@ -440,10 +440,19 @@ class MockSharedDevices:
     MOCK_LOCKIN_X = 1.0e-3
     MOCK_LOCKIN_Y = 2.0e-5
     MOCK_LOCKIN_FREQ = 1000.0
+    #: measure_scope が返すモック値（項目 -> 値。単位は実機と同じ規則: 電圧項目は V）
+    MOCK_SCOPE_VALUES = {
+        "vpp": 2.0, "vmax": 1.0, "vmin": -1.0, "vamplitude": 2.0, "vtop": 1.0,
+        "vbase": -1.0, "vaverage": 0.0, "vrms": 0.707, "frequency": 1000.0,
+        "period": 1.0e-3, "risetime": 2.0e-6, "falltime": 2.0e-6, "pwidth": 5.0e-4,
+        "nwidth": 5.0e-4, "pdutycycle": 50.0, "ndutycycle": 50.0, "overshoot": 1.0,
+        "preshoot": 1.0,
+    }
 
     def __init__(self, use_scale: bool = False, use_camera: bool = False,
                  use_microscope: bool = False, use_microscope_serial: bool = False,
-                 use_dmm: bool = False, use_lockin: bool = False, **_ignored):
+                 use_dmm: bool = False, use_lockin: bool = False, use_scope: bool = False,
+                 **_ignored):
         self.use_scale = use_scale
         self.use_camera = use_camera
         self.use_microscope = use_microscope
@@ -452,6 +461,8 @@ class MockSharedDevices:
         self._dmm_open = False          # 実機と同じく initialize() 〜 cleanup() の間だけ測れる
         self.use_lockin = use_lockin
         self._lockin_open = False
+        self.use_scope = use_scope
+        self._scope_open = False
         self._captures = 0
         self._microscope_captures = 0
         self.microscope_led_on = True
@@ -462,6 +473,7 @@ class MockSharedDevices:
         logger.info("=== [MOCK] 共有デバイス初期化 (成功) ===")
         self._dmm_open = self.use_dmm
         self._lockin_open = self.use_lockin
+        self._scope_open = self.use_scope
         return True
 
     async def measure_weight(self, stabilization_count: int = 3) -> float:
@@ -523,6 +535,36 @@ class MockSharedDevices:
             "lockin_settings": {"mock": True},
         }
 
+    async def measure_scope(self, channel: int = 1, items=("vpp", "frequency"),
+                            samples: int = 3, interval: float = 0.5) -> dict:
+        # 実機と同じ契約: 未初期化は RuntimeError、引数は同じ規則で検査する。
+        # 4 チャネル機（DSO1014A）として振る舞う
+        from src.devices.dso1000 import ITEMS
+        from src.devices.dso1000.dso1000 import item_unit
+        if not self.use_scope or not self._scope_open:
+            raise RuntimeError("オシロスコープが初期化されていません")
+        items = list(items)
+        if not items or len(set(items)) != len(items) or any(i not in ITEMS for i in items):
+            raise ValueError(f"items は重複のない既知の項目 1 つ以上: {items}")
+        if int(samples) < 1:
+            raise ValueError(f"samples は 1 以上: {samples}")
+        if not 1 <= int(channel) <= 4:
+            raise ValueError(f"channel は 1〜4: {channel}")
+        logger.info(f"[MOCK] オシロスコープ CH{channel} 読み取り中（{items}, {samples}回）...")
+        await asyncio.sleep(0.05)
+        values = {i: self.MOCK_SCOPE_VALUES[i] for i in items}
+        logger.info(f"✓ [MOCK] オシロスコープ: {values}")
+        return {
+            "scope_channel": int(channel),
+            "scope_values": values,
+            "scope_units": {i: item_unit(i, "V") for i in items},
+            "scope_valid": {i: int(samples) for i in items},
+            "scope_invalid": {},
+            "scope_settings": {"mock": True},
+            "scope_settings_after": {"mock": True},
+            "scope_raw": {i: [repr(values[i])] * int(samples) for i in items},
+        }
+
     async def tare_scale(self, delay: float = 1.0):
         logger.info("[MOCK] 電子天秤を風袋引き中...")
         await asyncio.sleep(min(delay, 0.1))
@@ -574,4 +616,5 @@ class MockSharedDevices:
     async def cleanup(self):
         self._dmm_open = False
         self._lockin_open = False
+        self._scope_open = False
         logger.info("✓ [MOCK] 共有デバイスの仮想接続を切断")

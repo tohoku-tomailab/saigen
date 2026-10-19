@@ -33,6 +33,7 @@ except ImportError:
 
 from pydantic import ValidationError
 
+from src.devices.dso1000 import ITEMS as SCOPE_ITEMS
 from src.devices.keithley2002 import FUNCTIONS as DMM_FUNCTIONS
 from src.flow.executor import SHARED_DEVICE_ACTIONS
 from src.flow.schema import PIPETTE_MIN_VOLUME_ML
@@ -151,6 +152,10 @@ ACTION_CONFIG = {
         "icon": "📈", "label": "ロックイン測定", "category": "sensor",
         "defaults": {"samples": 5, "interval": 0.0}
     },
+    "measure_scope": {
+        "icon": "📉", "label": "オシロ測定", "category": "sensor",
+        "defaults": {"channel": 1, "items": ["vpp", "frequency"], "samples": 3, "interval": 0.5}
+    },
     # ループ制御
     "loop_start": {
         "icon": "🔁", "label": "ループ開始", "category": "loop",
@@ -178,7 +183,7 @@ CATEGORIES = {
     "peripheral": ("🔩 周辺機器", ["move_slider", "move_conveyer"]),
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
     "maxarm": ("🧲 MaxArm", ["suction"]),
-    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm", "measure_lockin"]),
+    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm", "measure_lockin", "measure_scope"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
 }
@@ -835,6 +840,9 @@ def get_param_summary(step):
                 f"NPLC {step.get('nplc', 1.0)} " + (f"レンジ {rng}" if rng is not None else "オート"))
     elif action == "measure_lockin":
         return f"{step.get('samples', 5)}回 間隔 {step.get('interval', 0.0)}秒"
+    elif action == "measure_scope":
+        items = ", ".join(escape(str(i)) for i in (step.get("items") or ["vpp", "frequency"]))
+        return f"CH{step.get('channel', 1)} {items} {step.get('samples', 3)}回"
     elif action == "go_home":
         return ""
     elif action == "loop_start":
@@ -910,6 +918,19 @@ def _change_dmm_function(idx, key):
     flow_runner.change_dmm_function(step, st.session_state[key])
     st.session_state[_wkey("fix_range", idx)] = step.get("range") is not None
     st.session_state.pop(_wkey("range", idx), None)
+
+
+def _change_scope_items(idx, key):
+    """測定項目の on_change: 空にはしない（スキーマが 1 つ以上を要求するので、
+    空のステップは検証に通らず編集できなくなる）。空にされたら元の選択に戻す"""
+    if is_running():
+        return
+    step = st.session_state.workflow_data["steps"][idx]
+    chosen = list(st.session_state[key])
+    if chosen:
+        step["items"] = chosen
+    else:
+        st.session_state[key] = list(step.get("items") or ["vpp", "frequency"])
 
 
 def _toggle_dmm_range(idx, key):
@@ -1044,6 +1065,19 @@ def render_step_params(step, idx):
              min_value=0.0, max_value=60.0, step=0.1)
         st.caption("NF LI5640（config.yaml の shared_devices.lockin_resource）。感度・時定数・"
                    "表示は前面パネルで設定し、整定を待ってから実行してください")
+
+    elif action == "measure_scope":
+        _select(st, "チャネル", step, idx, "channel", [1, 2, 3, 4], 1)
+        items_key = _wkey("items", idx)
+        st.multiselect("測定項目（1〜10 個）", options=list(SCOPE_ITEMS),
+                       default=list(step.get("items") or ["vpp", "frequency"]),
+                       max_selections=10, key=items_key,
+                       on_change=_change_scope_items, args=(idx, items_key))
+        _num(st, "読み取り回数（中央値）", step, idx, "samples", int, 3, min_value=1, max_value=20)
+        _num(st, "読み取り間隔(秒)", step, idx, "interval", float, 0.5,
+             min_value=0.0, max_value=60.0, step=0.1)
+        st.caption("Agilent 1000 シリーズ（config.yaml の shared_devices.scope_resource）。"
+                   "垂直・水平・トリガは前面パネルで設定（エッジトリガ・時間軸 MAIN のみ）")
 
     elif action == "loop_start":
         _num(st, "繰り返し回数", step, idx, "count", int, 10, min_value=1, max_value=1000)

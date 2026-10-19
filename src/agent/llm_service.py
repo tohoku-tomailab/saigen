@@ -103,6 +103,9 @@ SYSTEM_PROMPT = """
 ### ロックインアンプ（NF LI5640, GPIB, 読み取り専用）※共有デバイスのためrobot_id不要
 - measure_lockin: {"action": "measure_lockin", "samples": 5, "interval": 0.0} (パネル表示の DATA1 / DATA2 と参照周波数を読む。感度・時定数・表示は前面パネルで設定し、フローからは変えない。samples: 1-100 回の中央値, interval: 読み取り間隔 0-60 秒 (整定待ちではない))
 
+### オシロスコープ（Agilent 1000 シリーズ, USB, 読み取り専用）※共有デバイスのためrobot_id不要
+- measure_scope: {"action": "measure_scope", "channel": 1, "items": ["vpp", "frequency"], "samples": 3, "interval": 0.5} (前面パネルで設定した波形の自動測定値を読む。設定はフローから変えない。channel: 1-4, items: vpp/vmax/vmin/vamplitude/vtop/vbase/vaverage/vrms (V), frequency (Hz), period/risetime/falltime/pwidth/nwidth (s), pdutycycle/ndutycycle/overshoot/preshoot (%) から 1-10 個, samples: 1-20 回の中央値, interval: 0-60 秒)
+
 ### ユーティリティ
 - wait: {"action": "wait", "robot_id": 1, "seconds": 2.0}
 
