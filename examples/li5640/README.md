@@ -51,3 +51,43 @@ Notes:
   reading is valid (over-level, UNLOCK), or if the phase readings spread over
   180° or more. The settings before and after are then in the `diagnostics`
   column and in `metadata.json`.
+
+## Oscillator sweep read on the oscilloscope
+
+`oscillator/osc_sweep_scope.json` **sets** the internal oscillator of the LI5640
+(`set_lockin_oscillator`) and reads OSC OUT on CH1 of an Agilent 1000 series
+oscilloscope: 0.05, 0.1, 0.2 and 0.3 Vrms at 100 Hz, then 50 and 200 Hz at
+0.3 Vrms. After each setting has been read back it waits 1 s, reads the lock-in
+amplifier (its measured reference frequency) and the oscilloscope (frequency,
+period, Vpp, Vrms, mean). It is kept in a subfolder because it is refused with the
+default configuration: writing the oscillator is off unless `config.yaml` allows it.
+
+Before running it:
+
+- Only the oscilloscope on OSC OUT (BNC to CH1, 1X). The limits below are for that
+  load; choose your own for anything else.
+- `config.yaml`:
+
+  ```yaml
+  shared_devices:
+    lockin_resource: "GPIB0::<address>::INSTR"
+    scope_resource: "USB0::0x0957::<product ID>::<serial>::INSTR"
+    lockin_osc_max_vrms: 0.3
+    lockin_osc_min_hz: 10.0
+    lockin_osc_max_hz: 1000.0
+  ```
+
+- On the LI5640: the amplitude range 500 mV, and an oscillator setting inside the
+  limits (the run writes it back at the end, so it must be allowed too).
+- On the oscilloscope: CH1 shown, 0.2 V/div, DC, 5 ms/div, edge trigger on CH1, Run.
+
+```bash
+python -m src.flow.run_flow examples/li5640/oscillator/osc_sweep_scope.json --validate-only
+python -m src.flow.run_flow examples/li5640/oscillator/osc_sweep_scope.json --mock
+python -m src.flow.run_flow examples/li5640/oscillator/osc_sweep_scope.json --no-record
+```
+
+At the end, `summary.md` and `metadata.json` (`lockin_oscillator_restore`) say whether
+the oscillator was set back to its starting values. If they say `failed` or
+`unverified`, check OSC OUT on the front panel. In `--mock` the oscillator starts at
+the first frequency of the flow and 0 V.

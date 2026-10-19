@@ -482,7 +482,8 @@ constant, slope, reference, input, filters, dynamic reserve and the DATA1 /
 DATA2 display (with offset, expand, normalize and ratio) are set on the front
 panel. The only setting SAIGEN writes is the read-out selection `OTYP`, which it
 reads when it opens the instrument and writes back, and reads back, when it
-closes it. The driver README
+closes it. The one exception, off by default, is the internal oscillator
+(`set_lockin_oscillator`, at the end of this section). The driver README
 ([`src/devices/li5640/README.md`](../src/devices/li5640/README.md)) lists every
 command.
 
@@ -545,6 +546,35 @@ instrument is cleared, `OTYP` restored, sent to local and closed; each of these
 is tried even if the one before failed. If a second Ctrl+C arrives while
 SAIGEN waits for one GPIB instrument, it still releases the other before it
 stops.
+
+**Setting the internal oscillator (optional, off by default).** A flow step
+`set_lockin_oscillator` can set the oscillator frequency and the OSC OUT
+amplitude (Vrms). It is refused before anything opens unless `config.yaml`
+allows it:
+
+```yaml
+shared_devices:
+  lockin_osc_max_vrms: 0.3     # 0 = disabled (default)
+  lockin_osc_min_hz: 10.0
+  lockin_osc_max_hz: 1000.0
+```
+
+Choose the limits for what is wired to OSC OUT. They limit the **set values**
+only: not the actual output, not how long it stays on, not the load. After a
+failure the run may home robots or close other instruments before it restores
+the oscillator, so keep a sample on OSC OUT only if it tolerates the maximum for
+an unlimited time. SAIGEN never switches the amplitude range: set it on the
+panel (50 mV, 500 mV or 5 V) so that it holds every amplitude of the flow. Each
+command is read back before the next is sent. When the run ends, fails or is
+stopped with Ctrl+C, SAIGEN reads the oscillator and writes back the values it
+found when it opened the instrument (Ctrl+C does **not** switch OSC OUT off, and
+the restore may raise the amplitude to its earlier value). The result is in
+`metadata.json` (`lockin_oscillator_restore`); if it could not restore or check
+it, a completed run is marked failed (exit code 1) and a run stopped with Ctrl+C
+stays aborted (exit code 130); both get a note: check OSC OUT on the front
+panel. Details and every rule are in the driver README. The example
+[`examples/li5640/oscillator/osc_sweep_scope.json`](../examples/li5640/oscillator/osc_sweep_scope.json)
+sweeps the amplitude and frequency and reads OSC OUT on the oscilloscope of §12.
 
 What commissioning the first unit taught (what firmware 1.60 answered, the
 defects review found before the bench, open points, things not to do) is in

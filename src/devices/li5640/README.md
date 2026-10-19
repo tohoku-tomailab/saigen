@@ -1,4 +1,4 @@
-# NF LI5640 lock-in amplifier (GPIB, read-only)
+# NF LI5640 lock-in amplifier (GPIB, read-only; internal oscillator optional)
 
 A multifunction digital lock-in amplifier by NF Corporation. SAIGEN reads it over GPIB
 (IEEE 488.1, partially 488.2) through PyVISA. RS-232 is not supported (the LI5640 cannot
@@ -12,7 +12,8 @@ Sensitivity, time constant, slope, reference signal, input, filters, dynamic res
 DATA1 / DATA2 display, offset, expand, normalise and ratio are all set on the front panel.
 SAIGEN never sends any of them. The only setting it writes is the read-out selection `OTYP`
 (remote only, 5-22, 5-32): the value is remembered on connect, restored on disconnect and
-read back.
+read back. The one exception is the internal oscillator (below), and only when the lab
+config enables it.
 
 Other side effects:
 
@@ -21,6 +22,83 @@ Other side effects:
 - `*CLS` (clears the event registers and the error queue; not restored, 5-36)
 - REMOTE state until GTL (the front panel cannot be operated, 5-6). GTL is addressed to
   this instrument; bus-wide REN, IFC and DCL are not used
+- One open handle per instrument in a process: the driver takes a lock per instrument
+  (the resource name as resolved by PyVISA, so `GPIB::7::INSTR` and `GPIB0::7::INSTR` are
+  the same) and releases it only after a successful close. A run whose release is still
+  going on (restoring the oscillator) blocks the next run's open, which then fails with a
+  message instead of talking to the instrument at the same time. Separate processes are
+  not covered
+
+## Internal oscillator (`set_lockin_oscillator`, off by default)
+
+A flow step can set the frequency (`FREQ`) and the OSC OUT amplitude (`AMPL`, Vrms) of the
+internal oscillator (5-23). It is **disabled** unless the lab config allows it:
+
+```yaml
+shared_devices:
+  lockin_osc_max_vrms: 0.3     # 0 = disabled (default); at most 5.0
+  lockin_osc_min_hz: 10.0      # default 0.0005
+  lockin_osc_max_hz: 1000.0    # default 105000
+```
+
+Choose the limits for what is wired to OSC OUT. They bound the **set values** only, not the
+physical output (amplitude accuracy 2 % of set + 0.5 % of full scale up to 1 kHz, 7.4), not
+how long it stays applied, and not the load: OSC OUT has a 50 Ω output impedance and
+±10 mA at 5 Vrms into ≥ 660 Ω (7.4). Keep a sample on OSC OUT only if it tolerates the
+configured maximum for an unlimited time: after a failure the run may home robots or close
+other instruments before it releases the LI5640 and restores the oscillator.
+
+Rules:
+
+- **Refused before anything opens** (`--validate-only`, `--mock`, real run, GUI): when the
+  limit is 0 (also for `amplitude: 0`), when a value is outside the limits, when a frequency
+  cannot be represented at 4½ digits (at most 19999 counts, or 0.1 mHz; e.g. 100.01 Hz is
+  fine, 200.05 Hz is not), and when no single amplitude range holds every amplitude of the
+  flow. Invalid limit values (null, booleans, strings, NaN, negative, above 5) are errors.
+- **The range is never switched.** Amplitudes must be representable in the range found on
+  connect (0: 0–50 mV in 0.1 mV, 1: 0–500 mV in 1 mV, 2: 0–5 V in 10 mV). Choose the range on
+  the front panel before the run. The behaviour of OSC OUT during a range switch is not
+  documented.
+- **On connect** (only when the flow contains the action) `FREQ?` and `AMPL?` are read and
+  remembered. The run stops without writing if that state is outside the limits (the
+  restore would write it back), if it cannot be written back exactly (a frequency off the
+  4½-digit grid or an amplitude off the range's step: rounding it could exceed a limit), or
+  if its range cannot hold the flow's amplitudes. A target that would need rounding is never
+  sent, during a step or during the restore.
+- **One command at a time.** A lower amplitude is written before the frequency, otherwise
+  the frequency first (the set values never exceed the larger of before and after; this
+  says nothing about transients). After each command: read back (exact match required),
+  then one `EROR?` (must be 0). Any failure stops the step; no dependent command follows,
+  the state is treated as unknown and the run writes no more oscillator commands. Equal
+  values are not sent. Errors already queued before a step stop it before any write.
+- **A step also stops** if the oscillator differs from what SAIGEN last confirmed (changed on
+  the panel).
+- **`settle`** is a wait after the last confirmed read-back. It does not prove that the
+  lock-in output settled or that a scope acquired anew. A step interrupted during the wait
+  keeps its values in the `diagnostics` column (`settled_s` is the time waited until the
+  interrupt); the `lockin_osc_*` columns stay empty because the step did not finish.
+- **Restore at the end** (normal end, failed step, Ctrl+C), only if a write was attempted:
+  device clear → read the current state → write back the remembered frequency and
+  amplitude, one command at a time with read-back → OTYP restore → GTL → close. If the
+  current state cannot be read, nothing is written (`unverified`); if its range differs,
+  nothing is written (`failed`); if it already equals the remembered state, nothing is
+  written (`verified`). Errors already in the queue are recorded separately
+  (`pre_existing_errors`); a queue that does not empty in 21 reads stops the restore.
+- **Ctrl+C does not switch OSC OUT off**; the restore may *raise* the amplitude (back to
+  what it was). Cleanup waits for the restore without a time limit (each VISA operation is
+  bounded by `lockin_timeout_ms`). A second Ctrl+C ends the wait but not the restore, which
+  goes on in its own thread. If the restore had already finished, its result is kept;
+  otherwise the run records `unverified` with the LI5640 close `pending`. A restore that
+  finishes after the run's logs were closed appears only on the console: `run.log`,
+  `metadata.json` and `summary.md` are not updated. Check OSC OUT on the front panel.
+- **The result decides the run's status.** `metadata.json` has `lockin_oscillator_restore`
+  (`not_needed`, `verified`, `failed`, `unverified`, and whether the LI5640 was closed).
+  `failed`, `unverified` or a failed close (also in a run that wrote nothing) turn a
+  completed run into `failed` (CLI exit code 1) with a note to check OSC OUT on the front
+  panel. A run that was already aborted (Ctrl+C, exit code 130) or failed keeps its status
+  and exit code and gets the note. After any such note, check the oscillator on the panel.
+- **A close that fails keeps the instrument lock.** The handle may still be open, so the same
+  process does not open the LI5640 again (the GUI says so); restart SAIGEN.
 
 ## Wiring and settings
 
@@ -49,21 +127,23 @@ each step:  OTYP 1,2,3,5 → EROR?        DOUT? then returns DATA1, DATA2, FREQ,
             settings snapshot (queries only)
             DOUT?, WRCR? samples times (waiting interval seconds between completed pairs)
             settings snapshot (again)
-disconnect: device clear → OTYP <remembered value> → OTYP? (read back) → GTL → close
+disconnect: device clear → [oscillator restore, only after a write was attempted]
+            → OTYP <remembered value> → OTYP? (read back) → GTL → close
             (continues to the next step if any of them fails; ignores interrupt requests)
 ```
 
 Settings read in the snapshot: `DDEF? 1/2`, `ISRC?`, `NORM?`, `VSTD?` / `ISTD?`,
 `RAT?`, `KFAC?`, `OFSO? 1/2`, `OFFS? 1/2`, `OEXP? 1/2`, `PHAS?`, `ICPL?`, `IGND?`,
 `VSEN?` / `ISEN?`, `TCON?`, `SLOP?`, `SYNC?`, `NOIS?`, `ILIN?`, `IFRQ?`, `ITHR?`,
-`DRSV?`, `RSRC?`, `REDG?`, `HARM?`, `OPCR?`, `OSTR?`. An unreadable or out-of-range reply
+`DRSV?`, `RSRC?`, `REDG?`, `HARM?`, `OPCR?`, `OSTR?`, and the oscillator setting
+`FREQ?` / `AMPL?` (recorded as `osc_freq`, `osc_ampl`, `osc_range`). An unreadable or out-of-range reply
 fails the step. A difference between the two snapshots fails the step (a setting changed and
 changed back in between cannot be detected). `OPCR` 256 / 512 (auto-setting or
 auto-sensitivity in progress) also fails.
 
-`FREQ?` is the set frequency of the internal oscillator, not the measured frequency (5-23).
-The measured frequency is read from the FREQ field of `DOUT?` (the fundamental in harmonic
-measurement). `DOUT?` and `WRCR?` are not taken at the same instant.
+`FREQ?` is the set frequency of the internal oscillator, not the measured frequency (5-23);
+it is recorded as a setting. The measured frequency is read from the FREQ field of `DOUT?`
+(the fundamental in harmonic measurement). `DOUT?` and `WRCR?` are not taken at the same instant.
 
 ## Meaning of the values (`describe()`)
 

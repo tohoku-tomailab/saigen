@@ -23,7 +23,8 @@ filters, display, offset, expand, normalize, ratio). Writing them from a flow
 would make SAIGEN responsible for the measurement setup. It was decided
 instead that the human sets the instrument up on the front panel and SAIGEN
 only reads. The only setting written is the read-out selection `OTYP`
-(remote-only, manual 5-22 and 5-32), and it is restored on close. Because
+(remote-only, manual 5-22 and 5-32), and it is restored on close (the one
+later exception, the internal oscillator, off by default, is §8). Because
 DATA1 and DATA2 are *display* values (manual 5-70), every step also reads the
 panel settings that give them their meaning.
 
@@ -152,3 +153,82 @@ the fix is reverted.
   package `__init__` imports the module first). It is harmless.
 - The panel is locked (REMOTE) from the first command until GTL at the end of
   the run.
+
+## 8. Internal oscillator (`set_lockin_oscillator`), 2026-10-19
+
+The one exception to the read-only scope: a flow step can set the frequency
+and the OSC OUT amplitude of the internal oscillator. It is off unless
+`config.yaml` sets `lockin_osc_max_vrms` above 0; the rules are in the driver
+README. It was checked with the same LI5640 and an Agilent DSO1014A reading
+OSC OUT on CH1 (BNC, 1X, DC), nothing else on OSC OUT, reference INT OSC
+(`RSRC 1`), SIGNAL input open. Limits for that load: 0.3 Vrms, 10–1000 Hz.
+Amplitude range on the panel: 500 mV (range 1). Flow:
+[`examples/li5640/oscillator/osc_sweep_scope.json`](../examples/li5640/oscillator/osc_sweep_scope.json),
+run with `--no-record`.
+
+**First run: stopped at the first point, by the oscilloscope.** CH1 was at
+0.5 V/div with −0.1 V offset. At 0.05 Vrms (about 0.14 Vpp, a third of a
+division) the DSO1014A gave Vpp and mean but no frequency or period
+(`9.9E+37`, no edges found), so the `measure_scope` step failed and the run
+ended `failed`. The oscillator write before it was fine, and the restore at the
+end sent `AMPL 0.300,1`, read back `0.300,1` (`verified`, `closed: true`).
+That failure was the first real exercise of the restore after a failed step.
+
+**Second run: all 18 steps completed** after CH1 was set to 0.2 V/div, offset
+0, trigger level 0 V (5 ms/div, edge on CH1, auto sweep):
+
+| Set | LI5640 measured frequency | DSO frequency | DSO period | DSO Vrms | DSO Vpp |
+|---|---|---|---|---|---|
+| 100 Hz, 0.05 Vrms | 100.0 Hz | 100.0 Hz | 9.999 ms | 0.0525 V | 0.152 V |
+| 100 Hz, 0.1 Vrms | 100.0 Hz | 100.0 Hz | 9.999 ms | 0.1008 V | 0.296 V |
+| 100 Hz, 0.2 Vrms | 100.0 Hz | 100.0 Hz | 9.999 ms | 0.2019 V | 0.576 V |
+| 100 Hz, 0.3 Vrms | 100.0 Hz | 100.0 Hz | 9.999 ms | 0.3014 V | 0.856 V |
+| 50 Hz, 0.3 Vrms | 50.0 Hz | 50.0 Hz | 19.99 ms | 0.3005 V | 0.856 V |
+| 200 Hz, 0.3 Vrms | 200.0 Hz | 200.0 Hz | 4.999 ms | 0.3001 V | 0.856 V |
+
+Values are medians of the samples of each step (DSO: 3 readings 0.5 s apart).
+Every setting matched its read-back exactly (the step would have failed
+otherwise; the restore's read-back of `FREQ?` was `100.00E+00`), the error queue
+was 0 after each command, and the range stayed 1. The DSO Vrms is within the manual's amplitude accuracy (2 % of setting +
+0.5 % of the 500 mV full scale, up to 1 kHz, 7.4) at every point; the
+0.05 Vrms point is the furthest off (+5 %), mostly the full-scale term. The
+restore at the end found only the frequency different (200 Hz) and sent
+`FREQ 1.0000E+02` alone. `metadata.json`: `lockin_oscillator_restore` =
+`verified`, `closed: true`; `OTYP` back to `1,2`.
+
+A repeat a few minutes later gave the same result (completed, restore
+`verified` with `FREQ 1.0000E+02` alone) and Vrms within 0.001 V of the table,
+except at 0.05 Vrms: 0.0531 V, and the DSO frequency 99.0 Hz (period
+10.09 ms) while the LI5640 measured 100.0 Hz. At 0.76 division the
+oscilloscope's frequency reading is not reliable; use the LI5640's measured
+frequency, or a smaller V/div, for small amplitudes.
+
+**Defects found by review, not by the bench.** The plan went through six
+reviews and the implementation through one before the bench; the
+implementation review found, among others, that a saved state off the
+amplitude step or the 4½-digit frequency grid (e.g. `0.3006,1`) would have been
+*rounded* on restore and sent above the limit (now refused at connect, and no
+rounded value is ever sent), and that a failed close in a run that wrote
+nothing was reported as success (now the run fails).
+
+**Open points**
+
+- The DSO mean was 13–15 mV at every point (also in the earlier manual test).
+  Whether that is an offset of OSC OUT or of the oscilloscope has not been
+  separated (read OSC OUT with the BNC disconnected, or with a DMM).
+- Only range 1 (500 mV), 50–200 Hz and the set values above were exercised.
+  Range 0 and 2, frequencies near the ends, the output transient during a write
+  and Ctrl+C on the instrument (tested only against a simulated instrument and
+  with a real SIGINT in a separate process) have not been seen.
+- The smallest amplitude that the DSO1014A still measures as a frequency
+  depends on V/div; choose V/div for the smallest point of the sweep, not the
+  largest.
+
+**Things not to do**
+
+- Do not raise `lockin_osc_max_vrms` or widen the frequency limits to make a
+  flow pass; they protect what is wired to OSC OUT.
+- Do not switch the amplitude range on the panel during a run: the next step
+  sees a change and stops, and the restore refuses to write across ranges.
+- Do not take `settle` as a settling guarantee: it is a wait after the
+  read-back.
