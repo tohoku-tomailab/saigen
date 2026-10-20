@@ -23,6 +23,7 @@ wrapper decides *how*.
 | `webcam/` | USB webcam for process photos | UVC | `opencv-python` | `WebcamController` |
 | `keithley2002/` | Keithley 2002 8.5-digit digital multimeter (optional) | GPIB (IEEE-488) through a VISA library, SCPI | `pyvisa` | `Keithley2002` |
 | `dso1000/` | Agilent 1000 series digital oscilloscope (DSO1002A-DSO1024A; optional, read-only automatic measurements) | USB (USBTMC) through a VISA library, SCPI-like command set | `pyvisa` | `DSO1000` |
+| `mg400/` | Dobot MG400 (observation only, not a robot type yet) | TCP/IP: Dashboard 29999 (read-only commands), feedback 30004 (read) | none (sockets) | `observe` tool |
 | `li5640/` | NF LI5640 digital lock-in amplifier (optional, read-only: settings stay on the front panel; exception, off by default: the internal oscillator, `set_lockin_oscillator`) | GPIB (IEEE-488) through a VISA library, NF command set | `pyvisa` | `LI5640` |
 | `microscope/` | USB digital microscope for close-up photos (Sanwa Supply 400-CAM106 = Vitiny UM22 in the paper's cell) | UVC (image) + USB serial via CP210x (LED, focus motor, status) | `opencv-python`, `pyserial` | `MicroscopeController` (subclass of `WebcamController`), `UM22SerialController` |
 
