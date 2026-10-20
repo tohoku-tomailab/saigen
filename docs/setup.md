@@ -98,7 +98,8 @@ Each driver has a small self-test; run them with the arm clear of obstacles.
 ```bash
 python -m src.devices.dobot.pydobot_controller          # lists serial ports, connects, reads position
 python src/devices/picus2/test_picus2_minimal.py         # edit the port inside the file first
-python -m src.devices.scale.scale_controller             # reads the balance
+python -m src.devices.scale.scale_controller             # A&D EK-610i only (ScaleController; port fixed to COM3 in the file): TARES the balance, then reads it
+python -m src.devices.scale.BCE8221                      # Sartorius BCE822i (SerialBalance, the balance the flows use; port fixed to COM4 in the file): one reading, no tare
 ```
 
 The Dobot Magician only knows its joint angles precisely after a **homing** run

@@ -3,7 +3,9 @@
 Two layers:
 
 - **Drivers** (`dobot/`, `maxarm/`, `picus2/`, `ika/`, `scale/`, `webcam/`, `microscope/`, `keithley2002/`, `li5640/`, `dso1000/`): thin, device-specific
-  classes that speak the instrument's protocol. They know nothing about experiments.
+  classes that speak the instrument's protocol. They know nothing about flows or
+  robots. (A few carry older stand-alone helpers, such as `run_temperature_experiment`
+  in the IKA driver; the executor does not call them.)
 - **Safety wrapper** (`safety/`): the only layer the flow executor and the AI agent
   ever call. It adds workspace limits, pipette volume tracking, retries, settle
   times and logging on top of the drivers.
@@ -19,7 +21,7 @@ wrapper decides *how*.
 | `maxarm/` | Hiwonder MaxArm robot arm with suction nozzle (optional robot 4) | USB serial (CH340), line protocol `saigen-maxarm` to the repository's MicroPython firmware | `pyserial` | `MaxArmClient` |
 | `picus2/` | Sartorius Picus 2 electric pipette (10 mL) | USB serial or Bluetooth LE | `pyserial` / `bleak` | `Picus2Controller` |
 | `ika/` | IKA RET control-visc hot-plate stirrer | RS-232C | `pyserial` | `IKAController` |
-| `scale/` | Sartorius BCE822i (`BCE8221.py`, used in the paper) and A&D EK-610i (`Ek610i.py`, `scale_controller.py`) balances | RS-232C | `pyserial` | `SerialBalance`, `ScaleController` |
+| `scale/` | Sartorius BCE822i (`BCE8221.py`: the paper's cell, and the only balance the flows use) and A&D EK-610i (`scale_controller.py`; `Ek610i.py` is an older minimal driver, not used by anything here) | RS-232C | `pyserial` | `SerialBalance`, `ScaleController` |
 | `webcam/` | USB webcam for process photos | UVC | `opencv-python` | `WebcamController` |
 | `keithley2002/` | Keithley 2002 8.5-digit digital multimeter (optional) | GPIB (IEEE-488) through a VISA library, SCPI | `pyvisa` | `Keithley2002` |
 | `dso1000/` | Agilent 1000 series digital oscilloscope (DSO1002A-DSO1024A; optional, read-only automatic measurements) | USB (USBTMC) through a VISA library, SCPI-like command set | `pyvisa` | `DSO1000` |
@@ -27,8 +29,10 @@ wrapper decides *how*.
 | `li5640/` | NF LI5640 digital lock-in amplifier (optional, read-only: settings stay on the front panel; exception, off by default: the internal oscillator, `set_lockin_oscillator`) | GPIB (IEEE-488) through a VISA library, NF command set | `pyvisa` | `LI5640` |
 | `microscope/` | USB digital microscope for close-up photos (Sanwa Supply 400-CAM106 = Vitiny UM22 in the paper's cell) | UVC (image) + USB serial via CP210x (LED, focus motor, status) | `opencv-python`, `pyserial` | `MicroscopeController` (subclass of `WebcamController`), `UM22SerialController` |
 
-Each directory has its own README with the command set and a usage example. Device addresses (COM port, Bluetooth MAC) are always passed in by the
-caller; there are no hard-coded addresses.
+Each driver directory has its own README with the command set and a usage example;
+the safety wrapper is described below. Device addresses (COM port, Bluetooth MAC) are
+passed in by the caller: the defaults built into the drivers (`COM3`, `COM4`, ...) are
+placeholders, and the ports actually used come from `config.yaml` and `.env`.
 
 ## Safety wrapper (`safety/`)
 
@@ -98,4 +102,6 @@ Safety behaviour built into the wrapper:
 
 The vendor DLL-based Dobot driver and the powder-dispenser driver used in other
 experiments are not part of this repository; only the `pydobot`-based arm driver is
-shipped. `LabRobot(use_powder_dispenser=True)` therefore raises `ImportError`.
+shipped. `LabRobot(use_powder_dispenser=True)` therefore fails in `initialize()`: the
+missing module is logged and `RuntimeError` is raised, after the devices that did
+connect have been disconnected.
