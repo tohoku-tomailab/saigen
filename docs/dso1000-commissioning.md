@@ -135,8 +135,21 @@ fix is reverted.
 
 ## 6. Open points
 
-- **A known reference.** Accuracy was not checked. Feed a signal of known
-  amplitude and frequency into CH1 and compare.
+- **A known reference.** Checked on 2026-10-19 with the internal oscillator of
+  an NF LI5640 on CH1 (sine, 0.05–0.3 Vrms, 50–200 Hz, DC, 1X, 0.2 V/div,
+  5 ms/div; [`li5640-commissioning.md` §8](li5640-commissioning.md)): in the
+  first complete run frequency and period matched the set value and the
+  lock-in's measured frequency at every point (in the repeat, the smallest
+  point is the exception below), and Vrms was within the oscillator's own
+  amplitude accuracy. Not separated: a mean of
+  13–15 mV at every point (oscillator or oscilloscope). Not checked: other
+  V/div, time bases, channels, square waves.
+- **Small signals.** The automatic frequency and period need enough of the
+  screen: at 0.5 V/div the 0.05 Vrms sine (about 0.14 Vpp computed from the set
+  value; the DSO read 0.180 Vpp, 0.36 division) gave `9.9E+37` for both while
+  Vpp and mean were returned, and at 0.2 V/div the same setting (0.152 Vpp read,
+  0.76 division) read 100.0 Hz in one run and 99.0 Hz (10.09 ms) in the next. Choose
+  V/div for the smallest signal of a flow, not the largest.
 - **Bound replies** (`<` / `>`, rise time near the limit of the time base)
   and the unit of overshoot / preshoot (the guide says %; `9.090e-003` was read
   on a signal whose overshoot was not known).

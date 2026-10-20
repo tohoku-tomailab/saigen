@@ -167,8 +167,9 @@ Amplitude range on the panel: 500 mV (range 1). Flow:
 run with `--no-record`.
 
 **First run: stopped at the first point, by the oscilloscope.** CH1 was at
-0.5 V/div with −0.1 V offset. At 0.05 Vrms (about 0.14 Vpp, a third of a
-division) the DSO1014A gave Vpp and mean but no frequency or period
+0.5 V/div with −0.1 V offset. At 0.05 Vrms (about 0.14 Vpp computed from the
+set value; the DSO read 0.180 Vpp, about a third of a division) the DSO1014A
+gave Vpp and mean but no frequency or period
 (`9.9E+37`, no edges found), so the `measure_scope` step failed and the run
 ended `failed`. The oscillator write before it was fine, and the restore at the
 end sent `AMPL 0.300,1`, read back `0.300,1` (`verified`, `closed: true`).

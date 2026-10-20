@@ -23,7 +23,11 @@ is the third such instrument and the first over USB; it shows how to record
 several quantities per step (JSON columns keyed by item) and how to refuse
 instrument states whose meaning the code cannot check (X-Y time base, non-edge
 trigger) instead of recording ambiguous values; its notes are in
-[`dso1000-commissioning.md`](dso1000-commissioning.md).
+[`dso1000-commissioning.md`](dso1000-commissioning.md). The LI5640's internal
+oscillator (`set_lockin_oscillator`, `tests/test_li5640_oscillator.py`) is the
+first output SAIGEN *writes* to an instrument; the rules it needed are under
+"Instruments that write an output" in §2, and its bench test is §8 of the
+LI5640 notes.
 
 The electronic balance is the closest existing example, and every step below
 names the balance code to copy from. Read `src/devices/README.md` first for the
@@ -117,6 +121,72 @@ reference; the rules, each of which was a real defect caught in review:
 - `ExperimentSession.add_shared()` closes a device whose `initialize()` failed,
   and hands an interrupted one to `run()`'s clean-up after the emergency stop;
   `_initialize_<name>()` therefore only has to leave no handle of its own open.
+
+### Instruments that write an output
+
+A source (an oscillator, a current or voltage source) puts something on a
+wire the code cannot see. The LI5640 oscillator (`SharedDevices.set_lockin_oscillator`,
+`_close_lockin_restoring`, `LI5640.apply_oscillator` / `restore_oscillator`) is
+the reference. Its plan went through six reviews and its implementation through
+three; each rule below answers a defect one of them found:
+
+- **Off by default, enabled by the lab.** Writing is refused unless
+  `config.yaml` sets a limit above 0; the limits (amplitude, frequency range)
+  belong to what is wired to the output and are the human's, like the
+  workspace. Invalid limit values (null, strings, booleans, NaN) are errors,
+  never a fallback to a default. An agent never raises them (CLAUDE.md rule 2).
+- **Refuse before anything opens.** The preflight of every runner that can
+  carry the step (CLI `--validate-only` / `--mock` / real, GUI) checks every requested
+  value against the limits and the instrument's resolution, so a flow that would
+  be refused at step 12 is refused before step 1 moves anything.
+- **Never round.** A value the instrument cannot represent exactly is refused,
+  not rounded: rounding to the instrument's format can step over a limit (a
+  saved `0.3006 V` would have been restored as `0.301 V` above a `0.3006 V`
+  limit). This applies to the values written back at the end too.
+- **Do not switch ranges.** A range change can produce a transient the manual
+  does not describe; require one range for the whole flow and refuse at
+  connect if the instrument is on another.
+- **The state to restore must itself be allowed.** Read it on connect, before
+  any write, and refuse if it is outside the limits or not exactly writable: the
+  restore will write it.
+- **One command at a time, each confirmed.** Order the commands so the set
+  values never exceed the larger of before and after (lower the amplitude
+  before changing the frequency, otherwise frequency first). After each
+  command read it back (exact match) and read the error queue; on any failure
+  send nothing that depends on it, treat the state as unknown and refuse every
+  later step's write in that run. The restore at the end is the one exception:
+  it reads the state afresh and writes back from there. Errors already queued, or a state that differs from the last one
+  confirmed (changed on the panel), stop the step before any write. Equal
+  values are not sent.
+- **Mark "changed" before the write, not after.** A write that times out may
+  still have been applied; the restore must run whenever a write was attempted.
+- **Restore once, from what is there.** At the end (normal end, failure,
+  Ctrl+C): device clear, drain the error queue (recorded separately), read the
+  current state; unreadable means write nothing and report `unverified`, a
+  different range means write nothing and report `failed`, equal means write
+  nothing. The restore runs at most once per run, even if the close is retried.
+- **Start the restore before awaiting it.** Run it on its own non-daemon
+  thread started before the first `await`, so a second Ctrl+C ends the wait but
+  never cancels the restore; the waiter records a provisional result only if
+  the final one is not there yet.
+- **The result decides the run.** A restore that failed or could not be
+  checked, or a close that failed (also in a run that wrote nothing), turns a
+  completed run into `failed` (exit code 1) with a note to check the output on
+  the front panel; an aborted run keeps its status and exit code and gets the
+  note. `run()` raises only after the result is applied.
+- **One handle per instrument.** A process-wide lock keyed by the resource
+  name as resolved by VISA (`GPIB::7` and `GPIB0::7` are the same instrument),
+  released only by a successful close, keeps the next run (the GUI) from
+  talking to the instrument while a restore is still going on.
+- **Record what was interrupted.** A step cut by Ctrl+C is recorded as
+  `aborted` with a snapshot of plain values (commands sent, read-backs, time
+  waited), copied under the lock, not shared with the worker that may still be
+  running.
+- **Test the bus traffic.** Fakes that refuse, ignore, apply a neighbouring
+  value, time out after applying, or raise after applying; assertions on the
+  commands sent and their order, not only on the exceptions; a real SIGINT in a
+  separate process; and source mutations (each rule broken on purpose must
+  fail a named test).
 
 ## 3. Mock: `src/devices/safety/mock_robot.py`
 
@@ -268,6 +338,8 @@ as in the CI.
 [ ] experiment_logger.py           result key -> CSV column
 [ ] config.py + config.example.yaml   port key
 [ ] tests/                         parser test + mock-run test
+[ ] (output instruments)           off by default, preflight limits, read-back,
+                                   restore once, result decides the run (§2)
 [ ] src/gui/app.py (optional)      ACTION_CONFIG, CATEGORIES, two elif branches
 [ ] docs/experimental-flow.md, src/devices/README.md, docs/bom.md, docs/setup.md
 [ ] pytest, --validate-only, --mock all green
