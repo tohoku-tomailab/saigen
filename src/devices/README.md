@@ -13,21 +13,49 @@ Two layers:
 The AI agent never generates driver-level code; it only chooses *what* to do, and the
 wrapper decides *how*.
 
-## Drivers
+## Drivers, by what they do
 
-| Directory | Instrument | Interface | Library | Main class |
-|---|---|---|---|---|
-| `dobot/` | Dobot Magician robot arm (+ optional rail / conveyor) | USB serial | `pydobot` (+ small patch in `pydobot_patch.py`) | `PyDobotController` |
-| `maxarm/` | Hiwonder MaxArm robot arm with suction nozzle (optional robot 4) | USB serial (CH340), line protocol `saigen-maxarm` to the repository's MicroPython firmware | `pyserial` | `MaxArmClient` |
-| `picus2/` | Sartorius Picus 2 electric pipette (10 mL) | USB serial or Bluetooth LE | `pyserial` / `bleak` | `Picus2Controller` |
-| `ika/` | IKA RET control-visc hot-plate stirrer | RS-232C | `pyserial` | `IKAController` |
-| `scale/` | Sartorius BCE822i (`BCE8221.py`: the paper's cell, and the only balance the flows use) and A&D EK-610i (`scale_controller.py`; `Ek610i.py` is an older minimal driver, not used by anything here) | RS-232C | `pyserial` | `SerialBalance`, `ScaleController` |
-| `webcam/` | USB webcam for process photos | UVC | `opencv-python` | `WebcamController` |
-| `keithley2002/` | Keithley 2002 8.5-digit digital multimeter (optional) | GPIB (IEEE-488) through a VISA library, SCPI | `pyvisa` | `Keithley2002` |
-| `dso1000/` | Agilent 1000 series digital oscilloscope (DSO1002A-DSO1024A; optional, read-only automatic measurements) | USB (USBTMC) through a VISA library, SCPI-like command set | `pyvisa` | `DSO1000` |
-| `mg400/` | Dobot MG400 (observation only, not a robot type yet) | TCP/IP: Dashboard 29999 (read-only commands), feedback 30004 (read) | none (sockets) | `observe` tool |
-| `li5640/` | NF LI5640 digital lock-in amplifier (optional, read-only: settings stay on the front panel; exception, off by default: the internal oscillator, `set_lockin_oscillator`) | GPIB (IEEE-488) through a VISA library, NF command set | `pyvisa` | `LI5640` |
-| `microscope/` | USB digital microscope for close-up photos (Sanwa Supply 400-CAM106 = Vitiny UM22 in the paper's cell) | UVC (image) + USB serial via CP210x (LED, focus motor, status) | `opencv-python`, `pyserial` | `MicroscopeController` (subclass of `WebcamController`), `UM22SerialController` |
+Three kinds of entry in the tables: **flow** (a flow action and a `config.yaml` key
+exist; opened only when a flow uses it), **library only** (a driver you can call
+from your own script; no flow action) and **observation only**. Interface, library
+and main class are as in the code; the *Used from* column names the flow actions,
+the configuration keys, the safety-wrapper class and an example flow.
+
+### Robot arms
+
+| Directory | Instrument | Interface | Library | Main class | Used from |
+|---|---|---|---|---|---|
+| `dobot/` | Dobot Magician robot arm (+ optional rail / conveyor) | USB serial | `pydobot` (+ small patch in `pydobot_patch.py`) | `PyDobotController` | **flow**: `move_xyz`, `move_z`, `move_radial`, `rotate`, `rotate_relative`, `go_home`, `move_slider`, `move_conveyer`; `robots.<id>.dobot_port`; `LabRobot`; `examples/zif8/` |
+| `maxarm/` | Hiwonder MaxArm robot arm with suction nozzle (optional robot 4) | USB serial (CH340), line protocol `saigen-maxarm` to the repository's MicroPython firmware | `pyserial` | `MaxArmClient` | **flow**: `move_xyz`, `move_z`, `go_home`, `suction`, `wait`; `robots.<id>.type: maxarm`, `maxarm_port`, own `workspace`; `MaxArmRobot`; `examples/maxarm/` |
+| `mg400/` | Dobot MG400 | TCP/IP: Dashboard 29999 (read-only commands), feedback 30004 (read) | none (sockets) | `observe` tool | **observation only**: `python -m src.devices.mg400.observe <address>`; not a robot type, no flow can use it |
+
+### Liquid handling
+
+| Directory | Instrument | Interface | Library | Main class | Used from |
+|---|---|---|---|---|---|
+| `picus2/` | Sartorius Picus 2 electric pipette (10 mL) | USB serial or Bluetooth LE | `pyserial` / `bleak` | `Picus2Controller` | **flow**: `aspirate`, `dispense`, `blow_out`; `robots.<id>.picus2_address`; `LabRobot` (volume tracking); `examples/zif8/` |
+
+### Heating and stirring
+
+| Directory | Instrument | Interface | Library | Main class | Used from |
+|---|---|---|---|---|---|
+| `ika/` | IKA RET control-visc hot-plate stirrer | RS-232C | `pyserial` | `IKAController` | **library only**: no flow action and no `config.yaml` key; `LabRobot(use_ika=True, ika_port=...)` opens it and switches heater and stirrer off on `emergency_stop()` / `cleanup()` |
+
+### Measurement instruments
+
+| Directory | Instrument | Interface | Library | Main class | Used from |
+|---|---|---|---|---|---|
+| `scale/` | Sartorius BCE822i (`BCE8221.py`: the paper's cell, and the only balance the flows use) and A&D EK-610i (`scale_controller.py`; `Ek610i.py` is an older minimal driver, not used by anything here) | RS-232C | `pyserial` | `SerialBalance`, `ScaleController` | **flow** (Sartorius): `measure_weight`, `tare_scale`; `shared_devices.scale_port`; `SharedDevices`; `examples/zif8/`. A&D: library only |
+| `keithley2002/` | Keithley 2002 8.5-digit digital multimeter (optional) | GPIB (IEEE-488) through a VISA library, SCPI | `pyvisa` | `Keithley2002` | **flow**: `measure_dmm`; `shared_devices.dmm_resource`, `dmm_timeout_ms`, `wait_after_dmm`; `SharedDevices`; `examples/keithley2002/` |
+| `li5640/` | NF LI5640 digital lock-in amplifier (optional, read-only: settings stay on the front panel; exception, off by default: the internal oscillator, `set_lockin_oscillator`) | GPIB (IEEE-488) through a VISA library, NF command set | `pyvisa` | `LI5640` | **flow**: `measure_lockin`, `set_lockin_oscillator`; `shared_devices.lockin_resource`, `lockin_timeout_ms`, `wait_after_lockin`, `lockin_osc_*`; `SharedDevices`; `examples/li5640/` |
+| `dso1000/` | Agilent 1000 series digital oscilloscope (DSO1002A-DSO1024A; optional, read-only automatic measurements) | USB (USBTMC) through a VISA library, SCPI-like command set | `pyvisa` | `DSO1000` | **flow**: `measure_scope`; `shared_devices.scope_resource`, `scope_timeout_ms`, `wait_after_scope`; `SharedDevices`; `examples/dso1000/` |
+
+### Cameras and microscopy
+
+| Directory | Instrument | Interface | Library | Main class | Used from |
+|---|---|---|---|---|---|
+| `webcam/` | USB webcam for process photos | UVC | `opencv-python` | `WebcamController` | **flow**: `capture_and_save`; `shared_devices.camera_index`; `SharedDevices` |
+| `microscope/` | USB digital microscope for close-up photos (Sanwa Supply 400-CAM106 = Vitiny UM22 in the paper's cell) | UVC (image) + USB serial via CP210x (LED, focus motor, status) | `opencv-python`, `pyserial` | `MicroscopeController` (subclass of `WebcamController`), `UM22SerialController` | **flow**: `capture_microscope`, `microscope_led`, `microscope_focus`; `shared_devices.microscope_index`, `microscope_port`, `microscope_resolution`; `SharedDevices`; `examples/microscope/` |
 
 Each driver directory has its own README with the command set and a usage example;
 the safety wrapper is described below. Device addresses (COM port, Bluetooth MAC) are
