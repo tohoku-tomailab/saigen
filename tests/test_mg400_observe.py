@@ -69,7 +69,9 @@ def test_the_dashboard_writes_only_command_objects():
         def sendall(self, data):
             Sock.sent.append(data)
 
-    dash = observe.Dashboard(Sock(), observe.Recorder.__new__(observe.Recorder), "x")
+    rec = observe.Recorder.__new__(observe.Recorder)       # no folder: nothing may be saved
+    rec.report = {"commands": []}
+    dash = observe.Dashboard(Sock(), rec, "x")
     with pytest.raises(TypeError):
         dash.write("EnableRobot()")
     with pytest.raises(ValueError):
@@ -354,20 +356,22 @@ def test_a_refused_command_ends_the_observation(tmp_path):
 
 def test_a_state_reply_on_the_second_connection_ends_it_even_if_it_recovers(tmp_path):
     with FakeMG400() as fake:
-        orig, calls = fake.reply, {"n": 0}
+        orig, flipped = fake.reply, {"done": False}
 
         def reply(cmd):
-            if cmd == "RobotMode()":
-                calls["n"] += 1
-                if calls["n"] == 3:                         # dashboard-2's first RobotMode
-                    return "0,{5},RobotMode();"
+            # dashboard-2's first RobotMode answers 5 once; later replies are 4 again
+            if cmd == "RobotMode()" and fake.conn_number.n == 2 and not flipped["done"]:
+                flipped["done"] = True
+                return "0,{5},RobotMode();"
             return orig(cmd)
 
         fake.reply = reply
         report = _run(fake, tmp_path)
-        sent = list(fake.received)
-    assert report["complete"] is False and "RobotMode 5" in " ".join(report["notes"])
-    assert not any(c.startswith(("PositiveSolution", "InverseSolution")) for c in sent)
+        sent = list(fake.received_on)
+    assert flipped["done"] and report["complete"] is False
+    assert "RobotMode 5" in " ".join(report["notes"])
+    assert sent[-1] == (2, "RobotMode()")                  # nothing after it, on either connection
+    assert report["two_connections"]["result"] is None
 
 
 def test_a_feedback_alarm_after_a_forward_solution_stops_the_inverse(tmp_path):
@@ -529,13 +533,11 @@ def test_a_silent_feed_ends_before_any_command(tmp_path):
 
 def test_a_malformed_reply_whose_values_are_not_used_still_ends_it(tmp_path):
     with FakeMG400() as fake:
-        orig, calls = fake.reply, {"n": 0}
+        orig = fake.reply
 
         def reply(cmd):
-            if cmd == "GetPose()":
-                calls["n"] += 1
-                if calls["n"] == 3:                         # dashboard-2, two-connection test
-                    return "0,{1,2,3},GetPose();"
+            if cmd == "GetPose()" and fake.conn_number.n == 2:      # dashboard-2
+                return "0,{1,2,3},GetPose();"
             return orig(cmd)
 
         fake.reply = reply
@@ -1509,3 +1511,514 @@ def test_the_onedrive_note_depends_on_the_output_folder(tmp_path, capsys):
     if "onedrive" not in str(tmp_path).lower():
         assert observe.main(["--mock", "--seconds", "1", "--out", str(tmp_path / "plain")]) == 0
         assert observe.ONEDRIVE_NOTE not in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# After the second bench run: a second Dashboard connection may end the first
+# ----------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _short_waits(monkeypatch):
+    monkeypatch.setattr(observe, "IDLE_PROBE_S", 0.05)
+    monkeypatch.setattr(observe, "SECOND_OPEN_SETTLE_S", 0.02)
+
+
+def _on(fake, number):
+    return [cmd for n, cmd in fake.received_on if n == number]
+
+
+def _ordered(fake, extra=None):
+    """wrap for _run: the second Dashboard connect returns only after the single-client fake
+    has closed the first one (the order of drop and probe is then fixed)"""
+    count = [0]
+
+    def wrap(sock):
+        count[0] += 1
+        if count[0] == 2 and fake.single_dashboard:
+            assert fake.dropped.wait(5.0)
+        return extra(sock, count[0]) if extra is not None else sock
+
+    return wrap
+
+
+class _ProbeFault(_Wrapped):
+    """dashboard-1 only: once ``armed`` (set when dashboard-2 opens), the next sendall or recv
+    raises ``error`` (or recv returns ``chunks`` one by one)"""
+
+    def __init__(self, sock, armed, op, error=None, chunks=None):
+        super().__init__(sock)
+        self._armed, self._op, self._error, self._chunks = armed, op, error, chunks
+
+    def sendall(self, data):
+        if self._armed[0] and self._op == "send":
+            self._armed[0] = False
+            raise self._error
+        return self._sock.sendall(data)
+
+    def recv(self, n):
+        if self._armed[0] and self._op == "recv":
+            if self._chunks is not None:
+                if self._chunks:
+                    return self._chunks.pop(0)
+                self._armed[0] = False
+                return b""
+            self._armed[0] = False
+            raise self._error
+        return self._sock.recv(n)
+
+
+def _probe_fault(op, error=None, chunks=None):
+    armed = [False]
+
+    def extra(sock, number):
+        if number == 1:
+            return _ProbeFault(sock, armed, op, error, chunks)
+        armed[0] = True                                     # dashboard-2 is open: probe next
+        return sock
+
+    return extra
+
+
+def test_a_dropped_first_connection_is_recorded_and_the_run_completes_on_the_second(tmp_path):
+    entries = [0]
+    labels = iter(["dashboard-1", "dashboard-2"])
+
+    class CheckedSend(_Wrapped):
+        def __init__(self, sock):
+            super().__init__(sock)
+            self.label = next(labels)
+
+        def sendall(self, data):
+            entries[0] += 1
+            report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+            last = report["commands"][-1]
+            assert len(report["commands"]) == entries[0]
+            assert last["connection"] == self.label and last["command"] == data.decode("ascii")
+            assert "sent_utc" not in last
+            assert self.label in [c["label"] for c in report["connections"]]
+            return self._sock.sendall(data)
+
+    with FakeMG400(single_dashboard=True) as fake:
+        report = _run(fake, tmp_path, wrap=_ordered(fake, lambda s, n: CheckedSend(s)))
+    assert report["complete"] is True
+    two = report["two_connections"]
+    assert two["outcome"].startswith("first connection's end detected") and two["result"] == two["outcome"]
+    assert two["interleaved"] == two["outstanding"] == "not run: first connection ended"
+    conns = {c["label"]: c for c in report["connections"]}
+    assert conns["dashboard-1"]["end_seen"] in ("eof detected", "reset detected")
+    assert conns["dashboard-1"]["opened_monotonic"] < conns["dashboard-2"]["opened_monotonic"] \
+        < conns["dashboard-1"]["end_detected_monotonic"]
+    probe = next(c for c in report["commands"] if c.get("tag") == "probe")
+    assert two["probe"]["command_id"] == probe["id"] and probe["connection"] == "dashboard-1"
+    after = report["commands"][report["commands"].index(probe) + 1:]
+    assert after and all(c["connection"] == "dashboard-2" for c in after)
+    assert "dashboard-2 GetPose()" in report["queries"]
+    assert entries[0] == len(report["commands"])            # every command was tried after its save
+
+
+def test_both_answered_is_set_only_when_the_stage_is_done(tmp_path):
+    with FakeMG400() as fake:
+        orig, seen = fake.reply, {"n": 0}
+
+        def reply(cmd):
+            if cmd == "GetAngle()" and fake.conn_number.n == 2:
+                seen["n"] += 1
+                if seen["n"] == 2:                          # the outstanding step's GetAngle
+                    return "-30001,{},GetAngle();"
+            return orig(cmd)
+
+        fake.reply = reply
+        with pytest.raises(protocol.MG400CommandError):
+            _run(fake, tmp_path)
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    two = report["two_connections"]
+    assert two["outcome"] == "first still answered after the second opened"
+    assert len(two["interleaved"]) == 8 and two["result"] is None
+
+
+def test_the_default_fake_still_answers_on_both(tmp_path):
+    with FakeMG400() as fake:
+        report = _run(fake, tmp_path)
+    two = report["two_connections"]
+    assert report["complete"] is True and two["result"] == "both answered"
+    assert two["control"]["command_id"] and two["probe"]["elapsed_s"] >= observe.SECOND_OPEN_SETTLE_S
+
+
+def test_a_drop_during_the_idle_wait_ends_it_before_a_second_connection(tmp_path, monkeypatch):
+    real_wait = observe._wait
+    with FakeMG400() as fake:
+        def wait(fb, seconds):
+            if seconds == observe.IDLE_PROBE_S:
+                c = fake._dashboard_conns[0]
+                c.shutdown(socket.SHUT_RDWR)
+                c.close()
+            return real_wait(fb, seconds)
+
+        monkeypatch.setattr(observe, "_wait", wait)
+        with pytest.raises(protocol.MG400ConnectionError):
+            _run(fake, tmp_path)
+        conns = len(fake._dashboard_conns)
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert conns == 1 and "dashboard-2" not in [c["label"] for c in report["connections"]]
+    assert "before a second connection was opened" in " ".join(report["notes"])
+    assert report["two_connections"]["control"]["command_id"]
+
+
+def test_a_probe_timeout_is_not_taken_as_a_drop(tmp_path, monkeypatch):
+    monkeypatch.setattr(observe, "TIMEOUT_S", 0.3)
+    with FakeMG400() as fake:
+        orig = fake.reply
+
+        def reply(cmd):
+            if cmd == "RobotMode()" and fake.conn_number.n == 1 and len(fake._dashboard_conns) == 2:
+                time.sleep(0.6)
+            return orig(cmd)
+
+        fake.reply = reply
+        with pytest.raises(protocol.MG400ConnectionError) as info:
+            _run(fake, tmp_path)
+        on_2 = _on(fake, 2)
+    assert info.value.kind == "timeout" and on_2 == []
+
+
+def test_a_probe_answered_with_another_mode_ends_it(tmp_path):
+    with FakeMG400() as fake:
+        orig = fake.reply
+
+        def reply(cmd):
+            if cmd == "RobotMode()" and fake.conn_number.n == 1 and len(fake._dashboard_conns) == 2:
+                return "0,{5},RobotMode();"
+            return orig(cmd)
+
+        fake.reply = reply
+        report = _run(fake, tmp_path)
+        on_2 = _on(fake, 2)
+    assert report["complete"] is False and "RobotMode 5" in " ".join(report["notes"]) and on_2 == []
+
+
+def test_an_end_after_part_of_a_reply_is_not_a_drop(tmp_path):
+    with FakeMG400() as fake:
+        with pytest.raises(protocol.MG400ConnectionError) as info:
+            _run(fake, tmp_path, wrap=_ordered(fake, _probe_fault("recv", chunks=[b"0,{4"])))
+        on_2 = _on(fake, 2)
+    assert info.value.kind == "eof" and info.value.partial_reply and on_2 == []
+
+
+@pytest.mark.parametrize("op, error, kind", [
+    ("send", ConnectionAbortedError(10053, "aborted"), "aborted"),
+    ("recv", ConnectionAbortedError(10053, "aborted"), "aborted"),
+    ("send", BrokenPipeError(32, "broken pipe"), "broken pipe"),
+    ("send", socket.timeout("timed out"), "timeout"),
+    ("send", OSError(9, "bad file descriptor"), "other"),
+])
+def test_other_probe_errors_end_it(tmp_path, op, error, kind):
+    with FakeMG400() as fake:
+        with pytest.raises(protocol.MG400ConnectionError) as info:
+            _run(fake, tmp_path, wrap=_ordered(fake, _probe_fault(op, error)))
+        on_2 = _on(fake, 2)
+    assert info.value.kind == kind and on_2 == []
+
+
+@pytest.mark.parametrize("op", ["send", "recv"])
+def test_a_reset_of_the_probe_is_a_drop(tmp_path, op):
+    with FakeMG400() as fake:
+        report = _run(fake, tmp_path,
+                      wrap=_ordered(fake, _probe_fault(op, ConnectionResetError(10054, "reset"))))
+        on_2 = _on(fake, 2)
+    assert report["complete"] is True and on_2
+    assert report["two_connections"]["result"].startswith("first connection's end detected")
+    conns = {c["label"]: c for c in report["connections"]}
+    assert conns["dashboard-1"]["end_seen"] == "reset detected"
+
+
+def test_a_drop_shaped_error_of_another_command_ends_it(tmp_path):
+    # every tolerated condition holds except the command: the error names command 1
+    err = protocol.MG400ConnectionError("dashboard-1: connection closed by the arm",
+                                        label="dashboard-1", op="recv", kind="eof")
+    err.command_id = 1
+    with FakeMG400() as fake:
+        with pytest.raises(protocol.MG400ConnectionError) as info:
+            _run(fake, tmp_path, wrap=_ordered(fake, _probe_fault("recv", err)))
+        on_2 = _on(fake, 2)
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    probe = next(c for c in report["commands"] if c.get("tag") == "probe")
+    assert info.value is err and probe["id"] != 1 and on_2 == []
+
+
+def _single_client_main(monkeypatch, tmp_path):
+    """main() --mock with a single-client fake; the second Dashboard connect returns only
+    after the fake has ended the first (fixed order of drop and probe)"""
+    made = []
+    real_open = observe._open
+    opens = [0]
+
+    def ordered_open(connect, host, port):
+        sock = real_open(connect, host, port)
+        if port == observe.DASHBOARD_PORT:
+            opens[0] += 1
+            if opens[0] == 2:
+                assert made[0].dropped.wait(5.0)
+        return sock
+
+    monkeypatch.setattr(observe, "_open", ordered_open)
+    code, fakes = _main_with(monkeypatch, tmp_path,
+                             setup=lambda f: (setattr(f, "single_dashboard", True), made.append(f)))
+    return code, fakes[0]
+
+
+@pytest.mark.parametrize("marker, code_line", [
+    # the save of the probe's error entry fails: the probe's connection error is the error
+    ('"end_seen"', "connection error: dashboard-1: connection closed by the arm"),
+    # the save of the drop record fails: the record error is the error
+    ('"outcome": "first connection', "record error:"),
+])
+def test_a_drop_whose_record_cannot_be_saved_ends_it(tmp_path, monkeypatch, capsys, marker,
+                                                    code_line):
+    # that one save fails (not retried); the saves after it succeed
+    once = {}
+
+    def fail(n, text):
+        if marker in text and '"tag": "probe"' in text and not once:
+            once["failed"] = True
+            return OSError("busy")
+        return None
+
+    _patch_replace(monkeypatch, fail)
+    code, fake = _single_client_main(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    assert once and code == 1 and _on(fake, 2) == []
+    line = _lines(out, code_line)
+    assert line, out
+    if code_line.startswith("connection error"):
+        assert "record also failed" in line[0]
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["save_errors"] and report["complete"] is False
+
+
+def test_a_single_client_run_through_the_cli_completes(tmp_path, monkeypatch, capsys):
+    code, fake = _single_client_main(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    assert code == 0 and "continuing on dashboard-2 only" in out and _on(fake, 2)
+
+
+def test_a_control_probe_timeout_is_not_called_an_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(observe, "TIMEOUT_S", 0.3)
+    with FakeMG400() as fake:
+        orig, seen = fake.reply, {"n": 0}
+
+        def reply(cmd):
+            if cmd == "RobotMode()" and fake.conn_number.n == 1:
+                seen["n"] += 1
+                if seen["n"] == 2:                          # the control (1: the first check)
+                    time.sleep(0.6)
+            return orig(cmd)
+
+        fake.reply = reply
+        with pytest.raises(protocol.MG400ConnectionError) as info:
+            _run(fake, tmp_path)
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    notes = " ".join(report["notes"])
+    assert info.value.kind == "timeout" and "failed (timeout)" in notes and "end detected" not in notes
+    conns = {c["label"]: c for c in report["connections"]}
+    assert "end_seen" not in conns["dashboard-1"] or conns["dashboard-1"]["end_seen"] == "closed by this tool"
+
+
+def test_the_connection_records_say_what_was_seen(tmp_path):
+    with FakeMG400() as fake:
+        report = _run(fake, tmp_path)
+    conns = {c["label"]: c for c in report["connections"]}
+    assert set(conns) == {"feedback", "dashboard-1", "dashboard-2"}
+    for c in conns.values():
+        assert c["opened_monotonic"] < c["end_detected_monotonic"]
+        assert c["end_seen"] == "closed by this tool"
+    probe = report["two_connections"]["probe"]
+    assert probe["last_reply_monotonic_before"] is not None
+    assert probe["elapsed_s"] >= observe.SECOND_OPEN_SETTLE_S
+
+
+def test_the_feedback_end_is_recorded_when_the_receiver_saw_it(tmp_path):
+    """not when the tool tore down: a Dashboard reply that comes later must not move it"""
+    with FakeMG400() as fake:
+        orig = fake.reply
+        dropped_at = []
+
+        def reply(cmd):
+            if cmd.startswith("PositiveSolution") and not dropped_at:
+                dropped_at.append(time.monotonic())
+                fake.drop_feedback()
+                time.sleep(0.6)
+            return orig(cmd)
+
+        fake.reply = reply
+        report = _run(fake, tmp_path)
+    conns = {c["label"]: c for c in report["connections"]}
+    fb = conns["feedback"]
+    assert fb["end_seen"] == "eof detected" and fb["fault"] == "feedback connection closed"
+    assert fb["end_detected_monotonic"] - dropped_at[0] < 0.4
+    assert conns["dashboard-1"]["end_seen"] == "closed by this tool"
+    assert conns["dashboard-1"]["end_detected_monotonic"] - fb["end_detected_monotonic"] > 0.2
+
+
+def test_the_feedback_close_is_recorded_at_the_first_stop(tmp_path, monkeypatch):
+    """a slow wind-down after a complete run must not move the time the tool closed it"""
+    orig = observe.FeedbackRecorder.join
+
+    def slow_join(self, timeout=None):
+        time.sleep(0.6)
+        return orig(self, timeout)
+
+    monkeypatch.setattr(observe.FeedbackRecorder, "join", slow_join)
+    with FakeMG400() as fake:
+        report = _run(fake, tmp_path)
+    assert report["complete"] is True
+    conns = {c["label"]: c for c in report["connections"]}
+    fb = conns["feedback"]
+    assert fb["end_seen"] == "closed by this tool" and "fault" not in fb
+    assert conns["dashboard-1"]["end_detected_monotonic"] - fb["end_detected_monotonic"] > 0.4
+
+
+def test_a_failed_connect_says_which_operation_and_what_was_seen(tmp_path):
+    s = socket.socket()
+    s.bind((LOOPBACK, 0))
+    port = s.getsockname()[1]
+    s.close()
+    with pytest.raises(protocol.MG400ConnectionError) as info:
+        observe.observe(LOOPBACK, str(tmp_path), 1.0, None,
+                        connect=lambda h, p, t: observe._connect(LOOPBACK, port, t),
+                        out=lambda *a: None)
+    assert info.value.op == "connect" and info.value.kind in ("refused", "timeout")
+    assert info.value.label == f"port {observe.FEEDBACK_PORT}"
+
+
+def test_a_reset_at_connect_is_not_a_drop():
+    err = protocol.MG400ConnectionError("x", label="dashboard-1", op="connect", kind="reset")
+    err.command_id = 7
+    rec = observe.Recorder.__new__(observe.Recorder)
+    rec.failed = False
+    assert not observe._tolerated_drop(err, 7, rec)
+    err.op = "recv"
+    assert observe._tolerated_drop(err, 7, rec)
+
+
+def _feed_fault_then_recover(fake, recorders):
+    """Three packets with mode 5, then good ones. Every packet from here on carries its own
+    number as TimeStamp, so the wait is on what the receiver took: the three bad packets and
+    then three good ones after the last bad one"""
+    orig_packet = fake.packet
+    state = {"n": 10 ** 15, "bad": []}       # above any real millisecond TimeStamp
+
+    def packet():
+        pkt = bytearray(orig_packet())
+        state["n"] += 1
+        struct.pack_into("<Q", pkt, 32, state["n"])
+        if len(state["bad"]) < 3:
+            state["bad"].append(state["n"])
+            struct.pack_into("<Q", pkt, 24, 5)
+        return bytes(pkt)
+
+    fb = recorders[0]
+    fake.packet = packet
+
+    def recovered():
+        with fb.lock:
+            seen = list(fb.timestamps)
+        if len(state["bad"]) < 3 or not set(state["bad"]) <= set(seen):
+            return False
+        return len([t for t in seen if t > state["bad"][-1]]) >= 3
+
+    _until(recovered)
+    with fb.lock:
+        assert fb.latest["robot_mode"] == 4                  # the feed is good again
+
+
+@pytest.mark.parametrize("where", ["first send on dashboard-2", "drop record"])
+def test_a_feed_fault_during_a_save_after_the_drop_stops_the_next_send(tmp_path, monkeypatch, where):
+    recorders = _capture_feedback(monkeypatch)
+    state = {}
+    with FakeMG400(single_dashboard=True) as fake:
+        def fail(n, text):
+            report = json.loads(text)
+            if state or not report["commands"]:
+                return None
+            last = report["commands"][-1]
+            hit = (where == "drop record" and '"outcome": "first connection' in text) or \
+                  (where == "first send on dashboard-2" and last["connection"] == "dashboard-2"
+                   and "sent_utc" not in last)
+            if hit:
+                state["hit"] = True
+                _feed_fault_then_recover(fake, recorders)    # after _check_state's opening check
+                return PermissionError("locked")             # one refused rename: the retry succeeds
+            return None
+
+        _patch_replace(monkeypatch, fail)
+        report = _run(fake, tmp_path, wrap=_ordered(fake))
+        on_2 = _on(fake, 2)
+    assert state and on_2 == [] and report["complete"] is False
+    assert "mode 5" in " ".join(report["notes"])
+
+
+def test_the_second_connection_is_checked_before_its_queries(tmp_path):
+    with FakeMG400(single_dashboard=True) as fake:
+        orig = fake.reply
+
+        def reply(cmd):
+            if cmd == "RobotMode()" and fake.conn_number.n == 2:
+                return "0,{5},RobotMode();"
+            return orig(cmd)
+
+        fake.reply = reply
+        report = _run(fake, tmp_path, wrap=_ordered(fake))
+        on_2 = _on(fake, 2)
+    assert on_2 == ["RobotMode()"] and report["complete"] is False
+
+
+def test_the_second_connection_ending_later_ends_it(tmp_path):
+    with FakeMG400(single_dashboard=True) as fake:
+        orig = fake.reply
+
+        def reply(cmd):
+            if cmd.startswith("PositiveSolution") and fake.conn_number.n == 2:
+                c = fake._dashboard_conns[1]
+                c.shutdown(socket.SHUT_RDWR)
+                c.close()
+            return orig(cmd)
+
+        fake.reply = reply
+        with pytest.raises(protocol.MG400ConnectionError):
+            _run(fake, tmp_path, wrap=_ordered(fake))
+        sent = list(fake.received)
+    assert not any(c.startswith("InverseSolution") for c in sent)
+
+
+@pytest.mark.parametrize("which", ["idle", "settle"])
+def test_a_feed_fault_during_the_waits_stops_the_next_send(tmp_path, monkeypatch, which):
+    real_wait = observe._wait
+    with FakeMG400() as fake:
+        alarm = {"on": False}
+        orig_packet = fake.packet
+
+        def packet():
+            pkt = bytearray(orig_packet())
+            if alarm["on"]:
+                pkt[1029] = 1
+            return bytes(pkt)
+
+        fake.packet = packet
+        target = {"idle": observe.IDLE_PROBE_S, "settle": observe.SECOND_OPEN_SETTLE_S}[which]
+
+        def wait(fb, seconds):
+            if seconds == target:
+                alarm["on"] = True
+                _until(lambda: fb.fault is not None)
+            return real_wait(fb, seconds)
+
+        monkeypatch.setattr(observe, "_wait", wait)
+        report = _run(fake, tmp_path)
+        on_1 = _on(fake, 1)
+    assert report["complete"] is False
+    assert on_1.count("RobotMode()") == (1 if which == "idle" else 2)
+
+
+def test_the_dry_run_names_the_control_and_the_probe(capsys):
+    assert observe.main(["--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "(control)" in out and "(probe)" in out and "end of stream or reset" in out

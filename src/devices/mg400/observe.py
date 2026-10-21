@@ -46,6 +46,8 @@ FEEDBACK_PORT = 30004
 TIMEOUT_S = 3.0
 FEEDBACK_FIRST_S = 2.0          # the first valid packet must arrive within this
 FEEDBACK_MAX_AGE_S = 0.5        # the last valid packet must be younger than this
+IDLE_PROBE_S = 1.0              # dashboard-1 idle before the control probe
+SECOND_OPEN_SETTLE_S = 0.2      # wait after opening dashboard-2, before probing dashboard-1
 LOG_ROOT = os.path.join("logs", "mg400_observe")
 GUIDE = "TCP_IP Remote Control Interface Guide (4axis) 2024-04-19"
 
@@ -223,27 +225,71 @@ def judge_errors(errors: list):
         raise ObservationEnded(f"alarm reported by GetErrorID: {errors}")
 
 
+def _kind(e: OSError) -> str:
+    """What a socket error says, by its type (not a cause)"""
+    return ("timeout" if isinstance(e, socket.timeout) else
+            "refused" if isinstance(e, ConnectionRefusedError) else
+            "reset" if isinstance(e, ConnectionResetError) else
+            "aborted" if isinstance(e, ConnectionAbortedError) else
+            "broken pipe" if isinstance(e, BrokenPipeError) else "other")
+
+
+def _attribute(e: BaseException, entry: dict):
+    """Name the command an exception belongs to; the first command named keeps it"""
+    if getattr(e, "command_id", None) is None:
+        e.command_id = entry["id"]
+
+
 class Dashboard:
     """One Dashboard connection. Writes only commands that pass :func:`protocol.check_command`
     in their exact form; every RobotMode / GetErrorID reply on any connection is judged at once"""
 
     def __init__(self, sock: socket.socket, recorder: Recorder, label: str,
-                 guard: Optional[Callable[[], None]] = None):
+                 guard: Optional[Callable[[], None]] = None, port: Optional[int] = None):
         self._sock = sock
         self._guard = guard            # called right before every send; raises to stop it
         self._reader = protocol.ReplyReader()
         self._pending: List[protocol.Reply] = []
         self._rec = recorder
         self.label = label
+        self.last_reply: Optional[tuple] = None           # (utc, monotonic) of the last reply
+        # the connection's record; on disk with the next save, before anything is sent on it
+        self.conn = {"label": label, "port": port, "opened_utc": _utc(),
+                     "opened_monotonic": round(time.monotonic(), 6)}
+        recorder.report.setdefault("connections", []).append(self.conn)
 
-    def write(self, command: Command) -> dict:
+    def _ended(self, kind: str, error: BaseException):
+        if "end_seen" not in self.conn:
+            self.conn.update(end_seen=f"{kind} detected", end_detected_utc=_utc(),
+                             end_detected_monotonic=round(time.monotonic(), 6), error=repr(error))
+
+    def _connection_error(self, op: str, e: OSError) -> MG400ConnectionError:
+        kind = _kind(e)
+        if kind == "timeout":
+            text = (f"{self.label}: no reply within {self._sock.gettimeout():g} s" if op == "recv"
+                    else f"{self.label}: send not done within {self._sock.gettimeout():g} s")
+        else:
+            text = f"{self.label}: {op} failed ({kind}): {e}"
+        err = MG400ConnectionError(text, label=self.label, op=op, kind=kind,
+                                   partial_reply=bool(self._reader.pending))
+        if kind != "timeout":
+            self._ended(kind, err)
+        return err
+
+    def write(self, command: Command, tag: Optional[str] = None) -> dict:
         if not isinstance(command, Command):
             raise TypeError("only protocol.Command objects can be sent")
         protocol.check_command(command.text, command.name)
-        entry = {"connection": self.label, "command": command.text, "planned_utc": _utc(),
-                 "reply": None}
+        entry = {"id": len(self._rec.report["commands"]) + 1, "connection": self.label,
+                 "command": command.text, "planned_utc": _utc(), "reply": None}
+        if tag is not None:
+            entry["tag"] = tag
         self._rec.report["commands"].append(entry)       # recorded before the bytes leave
-        self._rec.save()
+        try:
+            self._rec.save()
+        except BaseException as e:
+            _attribute(e, entry)
+            raise
         try:
             if self._guard is not None:
                 self._guard()
@@ -251,8 +297,9 @@ class Dashboard:
             try:
                 self._sock.sendall(command.text.encode("ascii"))
             except OSError as e:
-                raise MG400ConnectionError(f"{self.label}: send failed: {e}") from e
+                raise self._connection_error("send", e) from e
         except BaseException as e:
+            _attribute(e, entry)
             entry["error"] = f"not sent: {e!r}" if "sent_utc" not in entry else f"send: {e!r}"
             self._rec.save_during()
             raise
@@ -261,13 +308,14 @@ class Dashboard:
     def _recv(self) -> bytes:
         try:
             data = self._sock.recv(4096)
-        except socket.timeout as e:
-            raise MG400ConnectionError(
-                f"{self.label}: no reply within {self._sock.gettimeout():g} s") from e
         except OSError as e:
-            raise MG400ConnectionError(f"{self.label}: receive failed: {e}") from e
+            raise self._connection_error("recv", e) from e
         if not data:
-            raise MG400ConnectionError(f"{self.label}: connection closed by the arm")
+            err = MG400ConnectionError(f"{self.label}: connection closed by the arm",
+                                       label=self.label, op="recv", kind="eof",
+                                       partial_reply=bool(self._reader.pending))
+            self._ended("eof", err)
+            raise err
         return data
 
     def read(self, command: Command, entry: dict) -> protocol.Reply:
@@ -275,8 +323,10 @@ class Dashboard:
             while not self._pending:
                 self._pending.extend(self._reader.feed(self._recv()))
             reply = self._pending.pop(0)
+            now = time.monotonic()
             entry.update(reply=reply.raw, reply_utc=_utc(),
-                         reply_s=round(time.monotonic() - entry["sent_monotonic"], 4))
+                         reply_s=round(now - entry["sent_monotonic"], 4))
+            self.last_reply = (entry["reply_utc"], now)
             entry["echo_note"] = protocol.check_echo(reply, command)
             if reply.error_id != 0:
                 raise protocol.MG400CommandError(f"{command.text} -> ErrorID {reply.error_id}")
@@ -287,18 +337,26 @@ class Dashboard:
             elif command.name in LENGTHS:
                 protocol.parse_numbers(reply.values, LENGTHS[command.name])
         except BaseException as e:
+            _attribute(e, entry)
             entry.setdefault("error", repr(e))
             if self._reader.pending:
                 entry["partial_reply"] = self._reader.pending
             self._rec.save_during()
             raise
-        self._rec.save()
+        try:
+            self._rec.save()
+        except BaseException as e:
+            _attribute(e, entry)
+            raise
         return reply
 
-    def query(self, command: Command) -> protocol.Reply:
-        return self.read(command, self.write(command))
+    def query(self, command: Command, tag: Optional[str] = None) -> protocol.Reply:
+        return self.read(command, self.write(command, tag))
 
     def close(self):
+        if "end_seen" not in self.conn:
+            self.conn.update(end_seen="closed by this tool", end_detected_utc=_utc(),
+                             end_detected_monotonic=round(time.monotonic(), 6))
         try:
             self._sock.close()
         except OSError:
@@ -334,6 +392,8 @@ class FeedbackRecorder(threading.Thread):
         self.clock_diffs: List[int] = []
         self.rejected: List[str] = []
         self.fault: Optional[str] = None
+        self.end: Optional[dict] = None     # the end of the connection, when this thread saw it
+        self.closed: Optional[dict] = None  # or when this tool first closed it
         self.tail = 0
         self.started_t = time.monotonic()
 
@@ -341,6 +401,11 @@ class FeedbackRecorder(threading.Thread):
         with self.lock:
             if self.fault is None:
                 self.fault = text
+
+    def _ended(self, seen: str):
+        with self.lock:
+            self.end = {"end_seen": seen, "end_detected_utc": _utc(),
+                        "end_detected_monotonic": round(time.monotonic(), 6)}
 
     def _check_gap(self, now: float):
         """A gap is latched as a fault here, in the receiving thread: a feed that pauses and
@@ -361,10 +426,12 @@ class FeedbackRecorder(threading.Thread):
                 except OSError as e:
                     # our own stop closes the socket: only then is a receive error expected
                     if not self._halt.is_set():
+                        self._ended(f"{_kind(e)} detected")
                         self._fault(f"feedback read failed: {e}")
                     return
                 if not data:
                     if not self._halt.is_set():
+                        self._ended("eof detected")
                         self._fault("feedback connection closed")
                     return
                 t = time.monotonic()
@@ -432,6 +499,10 @@ class FeedbackRecorder(threading.Thread):
         self.check()
 
     def stop(self):
+        with self.lock:
+            if self.closed is None:
+                self.closed = {"end_seen": "closed by this tool", "end_detected_utc": _utc(),
+                               "end_detected_monotonic": round(time.monotonic(), 6)}
         self._halt.set()
         try:
             self._sock.close()
@@ -471,6 +542,107 @@ def _check_state(dash: Dashboard, fb: FeedbackRecorder):
     fb.check()
 
 
+def _wait(fb: FeedbackRecorder, seconds: float):
+    """Wait, checking the feedback every 50 ms (a fault ends the observation)"""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        fb.check()
+        time.sleep(min(0.05, max(0.0, end - time.monotonic())))
+    fb.check()
+
+
+def _tolerated_drop(e: BaseException, probe_id: Optional[int], rec: Recorder) -> bool:
+    """The one connection error the observation continues after: the probe's own, on
+    dashboard-1, an end of stream or a reset by the peer with no reply bytes, and no save of
+    the run has failed. Anything else ends the observation"""
+    return (isinstance(e, MG400ConnectionError) and probe_id is not None
+            and getattr(e, "command_id", None) == probe_id and e.label == "dashboard-1"
+            and not e.partial_reply
+            and ((e.kind == "eof" and e.op == "recv")
+                 or (e.kind == "reset" and e.op in ("send", "recv")))
+            and not rec.failed)
+
+
+def _probe_timing(rec: Recorder, tag: str, before: Optional[tuple]) -> dict:
+    """The tagged entry's id and the time from the connection's last reply to its send,
+    copied now so later replies cannot change it"""
+    entry = next((c for c in rec.report["commands"] if c.get("tag") == tag), None)
+    out = {"command_id": entry["id"] if entry else None,
+           "last_reply_utc_before": before[0] if before else None,
+           "last_reply_monotonic_before": round(before[1], 6) if before else None}
+    if entry and before and "sent_monotonic" in entry:
+        out["elapsed_s"] = round(entry["sent_monotonic"] - before[1], 4)
+    return out
+
+
+def _two_connections(rec, fb, dash, dashes, connect, host, port):
+    """Control on dashboard-1 after an idle wait, open dashboard-2, probe dashboard-1.
+    Returns (the connection to continue on, whether dashboard-1's end was detected)"""
+    two = {"control_idle_s": IDLE_PROBE_S, "settle_s": SECOND_OPEN_SETTLE_S, "result": None}
+    rec.report["two_connections"] = two
+    rec.save()
+
+    # control: does dashboard-1 survive an idle wait with no second connection?
+    _wait(fb, IDLE_PROBE_S)
+    before = dash.last_reply
+    try:
+        dash.query(protocol.robot_mode(), tag="control")
+    except MG400ConnectionError as e:
+        if e.kind in ("eof", "reset"):
+            rec.note("dashboard-1 end detected by the control probe after the idle wait, "
+                     "before a second connection was opened")
+        else:                              # not an end of the connection: say only what it was
+            rec.note(f"the control probe on dashboard-1 failed ({e.kind}) after the idle wait, "
+                     "before a second connection was opened")
+        raise
+    finally:
+        two["control"] = _probe_timing(rec, "control", before)
+    rec.save()
+
+    dash2 = Dashboard(_open(connect, host, port), rec, "dashboard-2", fb.check, port=port)
+    dashes.append(dash2)
+    two["second_opened_utc"] = dash2.conn["opened_utc"]
+    rec.save()
+    _wait(fb, SECOND_OPEN_SETTLE_S)
+
+    before = dash.last_reply
+    try:
+        dash.query(protocol.robot_mode(), tag="probe")
+    except BaseException as e:
+        two["probe"] = _probe_timing(rec, "probe", before)
+        if not _tolerated_drop(e, two["probe"]["command_id"], rec):
+            raise
+        dash.close()                       # never used again; its end_seen stays as detected
+        two["outcome"] = "first connection's end detected after the second opened (this run)"
+        two["interleaved"] = two["outstanding"] = "not run: first connection ended"
+        two["result"] = two["outcome"]
+        rec.save()                         # the drop record must be on disk, or it ends here
+        return dash2, True
+    two["probe"] = _probe_timing(rec, "probe", before)
+    two["outcome"] = "first still answered after the second opened"
+    two["interleaved"] = []
+    rec.save()
+
+    for cmd in (protocol.robot_mode(), protocol.get_error_id(), protocol.get_pose(),
+                protocol.get_angle()):
+        for d in (dash, dash2):
+            fb.check()
+            d.query(cmd)
+            two["interleaved"].append({"connection": d.label, "command": cmd.text, "ok": True})
+    rec.save()
+    fb.check()
+    c1 = protocol.robot_mode()
+    e1 = dash.write(c1)                      # left outstanding while dashboard-2 answers
+    t2 = time.monotonic()
+    dash2.query(protocol.get_angle())
+    answered = time.monotonic() - t2
+    dash.read(c1, e1)
+    two["outstanding"] = {"second_answered_s": round(answered, 4)}
+    two["result"] = "both answered"
+    rec.save()
+    return dash, False
+
+
 def observe(host: str, folder: str, seconds: float = 10.0, controller_version: Optional[str] = None,
             connect: Connector = _connect, dashboard_port: int = DASHBOARD_PORT,
             feedback_port: int = FEEDBACK_PORT, out=print) -> dict:
@@ -481,13 +653,18 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
     rec.report["controller_version_typed"] = controller_version
     dashes: List[Dashboard] = []
     fb: Optional[FeedbackRecorder] = None
+    fb_conn: Optional[dict] = None
     ended = None
     error: Optional[BaseException] = None
     try:
         fb = FeedbackRecorder(_open(connect, host, feedback_port), folder)
+        fb_conn = {"label": "feedback", "port": feedback_port, "opened_utc": _utc(),
+                   "opened_monotonic": round(time.monotonic(), 6)}
+        rec.report.setdefault("connections", []).append(fb_conn)
         fb.start()
         fb.wait_first()
-        dash = Dashboard(_open(connect, host, dashboard_port), rec, "dashboard-1", fb.check)
+        dash = Dashboard(_open(connect, host, dashboard_port), rec, "dashboard-1", fb.check,
+                         port=dashboard_port)
         dashes.append(dash)
         _check_state(dash, fb)
         out("state: disabled, no alarm")
@@ -500,33 +677,22 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
         rec.save()
 
         # 2. a second Dashboard connection (every RobotMode / GetErrorID reply is judged)
-        dash2 = Dashboard(_open(connect, host, dashboard_port), rec, "dashboard-2", fb.check)
-        dashes.append(dash2)
-        two = {"interleaved": [], "outstanding": None}
-        for cmd in (protocol.robot_mode(), protocol.get_error_id(), protocol.get_pose(),
-                    protocol.get_angle()):
-            for d in (dash, dash2):
-                fb.check()
-                d.query(cmd)
-                two["interleaved"].append({"connection": d.label, "command": cmd.text, "ok": True})
-        fb.check()
-        c1 = protocol.robot_mode()
-        e1 = dash.write(c1)                      # left outstanding while dashboard-2 answers
-        t2 = time.monotonic()
-        dash2.query(protocol.get_angle())
-        answered = time.monotonic() - t2
-        dash.read(c1, e1)
-        two["outstanding"] = {"second_answered_s": round(answered, 4)}
-        rec.report["two_connections"] = two
-        rec.save()
-        out("two Dashboard connections: both answered")
+        dash, dropped = _two_connections(rec, fb, dash, dashes, connect, host, dashboard_port)
+        if dropped:
+            out("second Dashboard connection: the first one's end was detected; "
+                "continuing on dashboard-2 only")
+            _check_state(dash, fb)
+            r["dashboard-2 GetPose()"] = protocol.parse_numbers(
+                dash.query(protocol.get_pose()).values, 4)
+            r["dashboard-2 GetAngle()"] = protocol.parse_numbers(
+                dash.query(protocol.get_angle()).values, (4, 6))
+            rec.save()
+        else:
+            out("two Dashboard connections: both answered")
 
         # 3. feedback window
         out(f"recording feedback for {seconds:g} s ...")
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
-            fb.check()
-            time.sleep(0.05)
+        _wait(fb, seconds)
         _check_state(dash, fb)
         r["GetAngle() after window"] = protocol.parse_numbers(
             dash.query(protocol.get_angle()).values, (4, 6))
@@ -581,6 +747,12 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
             fb.stop()
             fb.join(timeout=2.0)
             rec.report["feedback"] = fb.summary()       # the final summary, whole recording
+            if fb_conn is not None:
+                with fb.lock:
+                    fault, end = fb.fault, fb.end or fb.closed
+                fb_conn.update(end)         # the receiver's time when it saw the end, or the first stop()
+                if fault:
+                    fb_conn["fault"] = fault
         rec.report["ended_utc"] = _utc()
         rec.save_during()
     if error is not None:
@@ -597,7 +769,8 @@ def _open(connect: Connector, host: str, port: int) -> socket.socket:
     except MG400Error:
         raise
     except OSError as e:
-        raise MG400ConnectionError(f"connecting to {host}:{port}: {e}") from e
+        raise MG400ConnectionError(f"connecting to {host}:{port}: {e}", label=f"port {port}",
+                                   op="connect", kind=_kind(e)) from e
 
 
 def dry_run(out=print):
@@ -606,8 +779,12 @@ def dry_run(out=print):
         % (FEEDBACK_PORT, FEEDBACK_FIRST_S))
     for line in ("RobotMode()   (end unless 4)", "GetErrorID()  (end on any alarm)",
                  "GetPose()", "GetAngle()",
-                 "second connection: RobotMode() GetErrorID() GetPose() GetAngle() on both, interleaved",
-                 "RobotMode() on 1 left outstanding while GetAngle() on 2",
+                 "wait %g s (dashboard-1 idle), then RobotMode() on 1 (control)" % IDLE_PROBE_S,
+                 "open dashboard-2, wait %g s, then RobotMode() on 1 (probe)" % SECOND_OPEN_SETTLE_S,
+                 "if 1 answered: RobotMode() GetErrorID() GetPose() GetAngle() on both, "
+                 "interleaved; RobotMode() on 1 left outstanding while GetAngle() on 2",
+                 "if 1's end was detected (end of stream or reset, nothing else): close 1; "
+                 "RobotMode() GetErrorID() GetPose() GetAngle() on 2, and 2 from here on",
                  "wait --seconds, recording feedback (end on any fault)",
                  "RobotMode() GetErrorID() GetAngle() GetPose()",
                  "for the current joints and %d grid joint sets: RobotMode() GetErrorID() "

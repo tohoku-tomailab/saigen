@@ -54,7 +54,14 @@ class MG400ProtocolError(MG400Error):
 
 class MG400ConnectionError(MG400Error):
     """A Dashboard or feedback connection that could not be opened, or failed: refused,
-    timed out, reset, or closed by the arm"""
+    timed out, reset, or closed by the arm. ``op`` is "connect", "send" or "recv"; ``kind``
+    what was seen: "eof", "refused", "reset", "aborted", "broken pipe", "timeout" or
+    "other"; ``partial_reply`` whether bytes of an unfinished reply had arrived"""
+
+    def __init__(self, text: str, label: Optional[str] = None, op: Optional[str] = None,
+                 kind: Optional[str] = None, partial_reply: bool = False):
+        super().__init__(text)
+        self.label, self.op, self.kind, self.partial_reply = label, op, kind, partial_reply
 
 
 class MG400CommandError(MG400Error):

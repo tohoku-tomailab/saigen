@@ -19,7 +19,7 @@ class FakeMG400:
     def __init__(self, mode: int = 4, pose=(308.141606, 0.384430, 67.673470, 18.632881),
                  angles=(0.071847, 10.278645, 16.846972, 18.555908, 0.0, 0.0),
                  errors: Optional[list] = None, period_s: float = 0.008,
-                 split_replies: bool = False, echo_bare=()):
+                 split_replies: bool = False, echo_bare=(), single_dashboard: bool = False):
         self.mode = mode
         self.pose = list(pose)
         self.angles = list(angles)
@@ -28,6 +28,14 @@ class FakeMG400:
         self.split_replies = split_replies
         self.echo_bare = set(echo_bare)            # names echoed without their parameters
         self.received: List[str] = []
+        self.received_on: List[tuple] = []        # (Dashboard connection number from 1, cmd)
+        # True: a new Dashboard connection closes the previous one (as the bench controller
+        # appeared to do), then sets ``dropped``
+        self.single_dashboard = single_dashboard
+        self.dropped = threading.Event()
+        self.conn_number = threading.local()       # .n: the connection whose command reply() answers
+        self._dashboard_conns: List[socket.socket] = []
+        self._silenced: set = set()
         self.feedback_bytes_received = 0
         self.hold_replies = threading.Event()      # set: replies wait until cleared
         self._lock = threading.Lock()
@@ -85,6 +93,21 @@ class FakeMG400:
 
     # -- Dashboard --------------------------------------------------------
     def _serve_dashboard(self, conn):
+        with self._lock:
+            older = list(self._dashboard_conns)
+            self._dashboard_conns.append(conn)
+            self.conn_number.n = len(self._dashboard_conns)
+        number = self.conn_number.n
+        if self.single_dashboard and older:
+            for c in older:
+                # end of stream for the client (what the bench run saw); whatever it still
+                # sends is read and dropped, so it never sees a reset
+                self._silenced.add(c)
+                try:
+                    c.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            self.dropped.set()
         conn.settimeout(0.1)
         buf = ""
         while not self._stop.is_set():
@@ -96,12 +119,15 @@ class FakeMG400:
                 return
             if not data:
                 return
+            if conn in self._silenced:
+                continue
             buf += data.decode("ascii", "replace")
             while ")" in buf:
                 # a command ends at its only ")" (the allowed ones have no nested parentheses)
                 cmd, buf = buf[:buf.index(")") + 1].strip(), buf[buf.index(")") + 1:]
                 with self._lock:
                     self.received.append(cmd)
+                    self.received_on.append((number, cmd))
                 while self.hold_replies.is_set() and not self._stop.is_set():
                     time.sleep(0.01)
                 reply = self.reply(cmd).encode("ascii")
