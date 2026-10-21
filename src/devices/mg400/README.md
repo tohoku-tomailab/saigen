@@ -41,6 +41,17 @@ the arm); or when the record cannot be saved (the command is then not sent). The
 checked before every compute command. That is the arm's state when read; the tool does
 not guarantee it afterwards.
 
+The one exception is the two-connection step. After a 1 s idle wait and a control
+`RobotMode()` on the first Dashboard connection, the tool opens a second one, waits 0.2 s
+and sends `RobotMode()` on the first (the probe). On the second bench run the first
+connection's end was detected right after the second was opened (end of stream, no reply).
+If the probe meets exactly that (an end of stream with no reply bytes, or a reset by the
+peer; not a timeout, not a local abort, not after part of a reply), and no save of the run
+has failed, and the record of it is saved, the tool closes the first connection, checks the
+state on the second and continues there alone. That is recorded as an observation of the
+run, not as proof that the controller serves only one client. Any other outcome ends the
+observation as above.
+
 ## Running it
 
 ```bash
@@ -59,7 +70,10 @@ sends nothing to the arm and is not an emergency stop.
 
 - `report.json`: every command, recorded before it is sent, with its send and reply times,
   the reply text (or the error and any partial reply), the echo notes; the query results,
-  the two-connection test, the final feedback statistics over the whole recording, the
+  every connection with the time it was opened and the time its end was detected (not the
+  time the arm closed it), the two-connection step saved after each of its parts (control,
+  probe with the time since the connection's last reply, outcome, result), the final
+  feedback statistics over the whole recording, the
   kinematics pairs, why the observation ended, the tool's source hash, and `complete`
   (false for an interrupted or ended run; the file is rewritten after each command).
   Each save writes `report.json.tmp` and renames it; a refused rename (a sync client or a
