@@ -6,6 +6,9 @@ state, to collect what a later integration plan needs. That plan (enable / disab
 first small move, stopping) has been reviewed but not accepted; its open questions are
 answered only by measurements on the arm.
 
+What the first bench runs showed, and what is still open, is in
+[`docs/mg400-commissioning.md`](../../../docs/mg400-commissioning.md).
+
 Protocol reference: Dobot "TCP_IP Remote Control Interface Guide (4axis)", 2024-04-19
 ([Dobot-Arm/TCP-IP-Protocol-4AXis](https://github.com/Dobot-Arm/TCP-IP-Protocol-4AXis)).
 
