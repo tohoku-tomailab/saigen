@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+from src.devices.mg400 import fake as fake_module
 from src.devices.mg400 import feedback, observe, protocol
 from src.devices.mg400.fake import LOOPBACK, FakeMG400
 from src.devices.mg400.protocol import MG400ProtocolError
@@ -28,7 +29,6 @@ def test_the_six_commands_and_their_exact_text():
     assert protocol.robot_mode().text == "RobotMode()"
     assert protocol.get_error_id().text == "GetErrorID()"
     assert protocol.get_pose().text == "GetPose()"
-    assert protocol.get_pose(base_frames=True).text == "GetPose(User=0,Tool=0)"
     assert protocol.get_angle().text == "GetAngle()"
     assert protocol.positive_solution([1, 2, 3, 4]).text == \
         "PositiveSolution(1.000000,2.000000,3.000000,4.000000,0,0)"
@@ -41,7 +41,7 @@ def test_the_six_commands_and_their_exact_text():
     "RobotMode()\n", "GetAngle(1)", "PositiveSolution(nan,2,3,4,0,0)",
     "PositiveSolution(1.000000,2.000000,3.000000,4.000000,1,0)",
     "InverseSolution(1.000000,2.000000,3.000000,4.000000,0,0,1,}1.000000,2.000000,3.000000,4.000000{)",
-    "GetPose(User=1,Tool=0)", "GetPose(Tool=0,User=0)",
+    "GetPose(User=0,Tool=0)", "GetPose(User=1,Tool=0)", "GetPose(Tool=0,User=0)",
     "EnableRobot()", "DisableRobot()", "ClearError()", "EmergencyStop()", "MovL(1,2,3,4)",
     "ResetRobot()", "SpeedFactor(50)", "User(1)", "Tool(1)", "Continue()",
     "RobotMode()EnableRobot()", "RobotMode();EnableRobot()", "RobotMode()\nEnableRobot()",
@@ -130,14 +130,16 @@ def test_malformed_replies_raise(raw):
 
 
 def test_echo_rules():
-    cmd = protocol.get_pose(base_frames=True)
-    assert protocol.check_echo(protocol.parse_reply("0,{1,2,3,4},GetPose();"), cmd) == \
+    cmd = protocol.inverse_solution([300, 0, 50, 10], [0, 10, 20, 0])
+    assert protocol.check_echo(protocol.parse_reply("0,{0,10,20,0},InverseSolution();"), cmd) == \
         "echo without parameters"
-    assert protocol.check_echo(protocol.parse_reply("0,{1,2,3,4},GetPose(User=0,Tool=0);"), cmd) is None
+    assert protocol.check_echo(protocol.parse_reply("0,{0,10,20,0},%s;" % cmd.text), cmd) is None
     with pytest.raises(MG400ProtocolError):
         protocol.check_echo(protocol.parse_reply("0,{4},RobotMode();"), cmd)
     with pytest.raises(MG400ProtocolError):
-        protocol.check_echo(protocol.parse_reply("0,{1,2,3,4},GetPose(User=1,Tool=0);"), cmd)
+        protocol.check_echo(protocol.parse_reply(
+            "0,{0,10,20,0},InverseSolution(1.000000,0.000000,50.000000,10.000000,0,0,1,"
+            "{0.000000,10.000000,20.000000,0.000000});"), cmd)
 
 
 def test_unknown_robot_mode_and_bad_numbers():
@@ -206,17 +208,26 @@ def test_feedback_names_keep_indices_apart_from_frame_arrays():
 # ----------------------------------------------------------------------
 # The tool against the fake controller
 # ----------------------------------------------------------------------
-def _run(fake, tmp_path, seconds=1.0):
+def _run(fake, tmp_path, seconds=1.0, wrap=None):
     def connect(host, port, timeout):
         assert host == LOOPBACK
-        return observe._connect(LOOPBACK, {observe.DASHBOARD_PORT: fake.dashboard_port,
-                                           observe.FEEDBACK_PORT: fake.feedback_port}[port], timeout)
+        s = observe._connect(LOOPBACK, {observe.DASHBOARD_PORT: fake.dashboard_port,
+                                        observe.FEEDBACK_PORT: fake.feedback_port}[port], timeout)
+        return wrap(s) if wrap is not None and port == observe.DASHBOARD_PORT else s
     return observe.observe(LOOPBACK, str(tmp_path), seconds, "1.6.0.0", connect=connect,
                            out=lambda *a: None)
 
 
 def test_full_observation_sends_only_allowed_commands(tmp_path):
-    with FakeMG400(split_replies=True) as fake:
+    with FakeMG400(split_replies=True, echo_bare={"InverseSolution"}) as fake:
+        orig_packet = fake.packet
+
+        def packet():                    # distinct non-zero frame indices, taken from the packet
+            pkt = bytearray(orig_packet())
+            pkt[1012], pkt[1013] = 3, 5
+            return bytes(pkt)
+
+        fake.packet = packet
         report = _run(fake, tmp_path)
         sent = list(fake.received)
         fb_written = fake.feedback_bytes_received
@@ -230,6 +241,10 @@ def test_full_observation_sends_only_allowed_commands(tmp_path):
     assert on_disk["complete"] is True
     assert (tmp_path / "feedback.bin").stat().st_size % 1440 == 0
     assert any(c["echo_note"] == "echo without parameters" for c in report["commands"])
+    assert not any(c.startswith("GetPose(User") for c in sent)       # refused by the bench arm
+    compare = report["compare_mapping_unverified"]
+    assert len(compare["tool_vector_actual_minus_GetPose_first4"]) == 4
+    assert compare["packet_user_index"] == 3 and compare["packet_tool_index"] == 5
 
 
 @pytest.mark.parametrize("mode, errors, why, expected", [
@@ -416,14 +431,14 @@ def test_a_reply_timeout_is_recorded_with_the_command(tmp_path, monkeypatch):
 
         fake.reply = reply
         try:
-            with pytest.raises(OSError):
+            with pytest.raises(protocol.MG400ConnectionError):
                 _run(fake, tmp_path)
         finally:
             fake.hold_replies.clear()
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     last = report["commands"][-1]
-    assert last["command"] == "GetPose(User=0,Tool=0)" and last["reply"] is None   # held after GetPose()
-    assert "timed out" in last["error"]
+    assert last["command"] == "GetAngle()" and last["reply"] is None   # held after GetPose()
+    assert "no reply within" in last["error"]
     assert report["complete"] is False and report["notes"]
 
 
@@ -758,3 +773,739 @@ def test_a_write_failure_after_the_stop_is_still_a_fault(tmp_path, monkeypatch):
     with FakeMG400() as fake:
         report = _run(fake, tmp_path)
     assert report["complete"] is False and "disk full" in (report["feedback"]["fault"] or "")
+
+
+# ----------------------------------------------------------------------
+# After the first bench run: GetPose(User=0,Tool=0) refused; a locked report.json
+# ----------------------------------------------------------------------
+def _until(pred, timeout=5.0):
+    end = time.monotonic() + timeout
+    while not pred():
+        assert time.monotonic() < end, "condition not reached"
+        time.sleep(0.005)
+
+
+def _capture_feedback(monkeypatch):
+    recorders = []
+    orig_init = observe.FeedbackRecorder.__init__
+
+    def init(self, *a, **k):
+        orig_init(self, *a, **k)
+        recorders.append(self)
+
+    monkeypatch.setattr(observe.FeedbackRecorder, "__init__", init)
+    return recorders
+
+
+def _patch_replace(monkeypatch, fail):
+    """os.replace for the tool: fail(call number, text of the tmp file) -> exception or None.
+    Every call counts, retries included"""
+    real = os.replace
+    calls = []
+
+    def replace(src, dst):
+        calls.append(src)
+        with open(src, encoding="utf-8") as f:
+            text = f.read()
+        e = fail(len(calls), text)
+        if e is not None:
+            raise e
+        return real(src, dst)
+
+    monkeypatch.setattr(observe.os, "replace", replace)
+    monkeypatch.setattr(observe, "REPLACE_RETRY_S", (0.001,) * 5)
+    return calls
+
+
+def _main_with(monkeypatch, tmp_path, setup=None, cls=FakeMG400):
+    """main() --mock with the fake it creates handed to setup() first"""
+    made = []
+
+    def factory(*a, **k):
+        f = cls(*a, **k)
+        if setup is not None:
+            setup(f)
+        made.append(f)
+        return f
+
+    monkeypatch.setattr(fake_module, "FakeMG400", factory)
+    code = observe.main(["--mock", "--seconds", "1", "--out", str(tmp_path)])
+    return code, made
+
+
+def _lines(out, start):
+    return [line for line in out.splitlines() if line.startswith(start)]
+
+
+class _Wrapped:
+    def __init__(self, sock):
+        self._sock = sock
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+def test_a_refused_command_reaches_the_cli_as_that_error(tmp_path, monkeypatch, capsys):
+    def setup(f):
+        orig = f.reply
+        # synthetic, modelled on the bench reply -30001,{},GetPose(User=0,Tool=0);
+        f.reply = lambda cmd: "-30001,{},GetAngle();" if cmd == "GetAngle()" else orig(cmd)
+
+    code, made = _main_with(monkeypatch, tmp_path, setup)
+    out = capsys.readouterr().out
+    assert code == 1 and _lines(out, "error: GetAngle() -> ErrorID -30001")
+    assert "record also failed" not in out and made[0].received[-1] == "GetAngle()"
+
+
+def test_a_rename_refused_twice_then_allowed_loses_nothing(tmp_path, monkeypatch):
+    _patch_replace(monkeypatch, lambda n, text: PermissionError("locked") if n in (2, 3) else None)
+    with FakeMG400() as fake:
+        report = _run(fake, tmp_path)
+    assert report["complete"] is True and "save_errors" not in report
+    on_disk = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert on_disk == json.loads(json.dumps(observe._finite(report)))
+    assert not (tmp_path / "report.json.tmp").exists()
+
+
+def test_every_command_is_on_disk_before_its_bytes_leave(tmp_path):
+    entries = [0]
+    labels = iter(["dashboard-1", "dashboard-2"])
+
+    class CheckedSend(_Wrapped):
+        def __init__(self, sock):
+            super().__init__(sock)
+            self.label = next(labels)
+
+        def sendall(self, data):
+            entries[0] += 1
+            report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+            last = report["commands"][-1]
+            assert len(report["commands"]) == entries[0]
+            assert last["connection"] == self.label and last["command"] == data.decode("ascii")
+            assert "planned_utc" in last and "sent_utc" not in last     # this very entry
+            return self._sock.sendall(data)
+
+    with FakeMG400() as fake:
+        report = _run(fake, tmp_path, wrap=CheckedSend)
+        sent = list(fake.received)
+    assert report["complete"] is True and entries[0] == len(sent) > 20
+
+
+def test_a_feed_gap_during_a_save_retry_is_not_forgotten_when_the_feed_resumes(tmp_path, monkeypatch):
+    recorders = _capture_feedback(monkeypatch)
+    state = {}
+    with FakeMG400() as fake:
+        orig_packet = fake.packet
+
+        def fail(n, text):
+            # call 6 is the save before GetPose() is sent (1: start, 2-5: RobotMode, GetErrorID)
+            if n == 6 and not state:
+                fb = recorders[0]
+                state["sent"] = len(fake.received)
+                fake.packet = lambda: b""                        # the feed pauses ...
+                _until(lambda: time.monotonic() - fb.last_valid_t > 0.6)
+                have = len(fb.recv_times)
+                fake.packet = orig_packet                        # ... and resumes
+                _until(lambda: len(fb.recv_times) >= have + 3)
+                return PermissionError("locked")                 # the retry then succeeds
+            return None
+
+        _patch_replace(monkeypatch, fail)
+        report = _run(fake, tmp_path)
+        sent = list(fake.received)
+    assert state["sent"] == 2 and len(sent) == 2
+    assert report["complete"] is False and "feedback gap" in " ".join(report["notes"])
+
+
+@pytest.mark.parametrize("offset, fmt, value, why", [(24, "<Q", 5, "mode 5"),
+                                                     (1029, "<B", 1, "error_status 1")])
+def test_a_feedback_fault_that_recovers_still_ends_it(tmp_path, monkeypatch, offset, fmt, value, why):
+    recorders = _capture_feedback(monkeypatch)
+    with FakeMG400() as fake:
+        orig_reply, orig_packet = fake.reply, fake.packet
+        bad = {"left": 0, "done": False}
+
+        def packet():
+            pkt = bytearray(orig_packet())
+            if bad["left"] > 0:
+                bad["left"] -= 1
+                struct.pack_into(fmt, pkt, offset, value)
+            return bytes(pkt)
+
+        def reply(cmd):
+            out = orig_reply(cmd)
+            if cmd == "GetPose()" and not bad["done"]:
+                bad["done"] = True
+                fb = recorders[0]
+                have = len(fb.recv_times)
+                bad["left"] = 3                                  # three bad packets, then good
+                _until(lambda: bad["left"] == 0 and len(fb.recv_times) >= have + 6)
+            return out
+
+        fake.reply, fake.packet = reply, packet
+        report = _run(fake, tmp_path)
+        sent = list(fake.received)
+    assert sent[-1] == "GetPose()" and report["complete"] is False
+    assert why in " ".join(report["notes"])
+
+
+_GOOD = feedback.build(robot_mode=4, robot_type=1)
+
+
+def _feed_pair(tmp_path, recv_timeout):
+    a, b = socket.socketpair()
+    fb = observe.FeedbackRecorder(a, str(tmp_path), recv_timeout=recv_timeout)
+    fb.start()
+    return fb, b
+
+
+def test_a_gap_seen_when_the_next_packet_arrives_is_a_fault(tmp_path):
+    fb, b = _feed_pair(tmp_path, recv_timeout=5.0)       # the timeout side cannot fire
+    try:
+        for _ in range(3):
+            b.sendall(_GOOD)
+        _until(lambda: len(fb.recv_times) == 3)
+        time.sleep(0.6)
+        b.sendall(_GOOD)
+        _until(lambda: len(fb.recv_times) == 4)
+        assert fb.fault and fb.fault.startswith("feedback gap")
+    finally:
+        fb.stop()
+        fb.join(timeout=2.0)
+        b.close()
+
+
+def test_a_gap_seen_while_waiting_for_a_packet_is_a_fault(tmp_path):
+    fb, b = _feed_pair(tmp_path, recv_timeout=0.05)
+    try:
+        for _ in range(3):
+            b.sendall(_GOOD)
+        _until(lambda: fb.fault is not None)               # no further packet is sent
+        assert fb.fault.startswith("feedback gap") and len(fb.recv_times) == 3
+    finally:
+        fb.stop()
+        fb.join(timeout=2.0)
+        b.close()
+
+
+@pytest.mark.parametrize("error, attempts", [(PermissionError("locked"), 6), (OSError("busy"), 1)])
+def test_a_rename_that_keeps_failing_ends_it_and_the_tmp_holds_the_latest(tmp_path, monkeypatch,
+                                                                         error, attempts):
+    state = {}
+    with FakeMG400() as fake:
+        def fail(n, text):
+            if n >= 4:                                   # the save before GetErrorID is sent
+                state.setdefault("sent", len(fake.received))
+                return error
+            return None
+
+        calls = _patch_replace(monkeypatch, fail)
+        with pytest.raises(observe.MG400RecordError) as info:
+            _run(fake, tmp_path)
+        sent = list(fake.received)
+    assert sent == ["RobotMode()"] and state["sent"] == 1
+    assert len(calls) == 3 + 2 * attempts                # the failed save, then the final one
+    tmp = json.loads((tmp_path / "report.json.tmp").read_text(encoding="utf-8"))
+    assert len(tmp["save_errors"]) == 2 and "ended_utc" in tmp
+    assert "report.json.tmp holds the latest" in info.value.recorder.describe()
+
+
+def test_a_failed_first_save_opens_no_connection(tmp_path, monkeypatch, capsys):
+    real_open = open
+
+    def fake_open(path, *a, **k):
+        if str(path).endswith("report.json.tmp"):
+            raise OSError("denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(observe, "open", fake_open, raising=False)
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: pytest.fail("connected"))
+    code, made = _main_with(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    assert code == 1 and made[0].received == []
+    line = _lines(out, "record error: could not write report.json.tmp")
+    assert line and "no save of this run was confirmed" in line[0]
+
+
+def test_the_record_line_tells_the_state_after_the_last_save(tmp_path, monkeypatch, capsys):
+    # one save in the middle fails, the final save succeeds: the line says report.json is
+    # current (the state at the end), and the run still fails
+    _patch_replace(monkeypatch, lambda n, text: OSError("busy") if n == 4 else None)
+    code, made = _main_with(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    line = _lines(out, "record error: could not rename report.json.tmp to report.json")
+    assert code == 1 and line and "OSError('busy')" in line[0] and "report.json is current" in line[0]
+    assert made[0].received == ["RobotMode()"]
+
+
+def test_an_ended_observation_whose_record_failed_on_the_way_is_not_a_success(tmp_path, monkeypatch,
+                                                                            capsys):
+    # pre-send save succeeds -> the guard ends it (feedback alarm) -> the save in the send's
+    # error branch fails -> the final save succeeds
+    once = {}
+
+    def fail(n, text):
+        if '"not sent' in text and not once:
+            once["failed"] = True
+            return OSError("busy")
+        return None
+
+    _patch_replace(monkeypatch, fail)
+    recorders = _capture_feedback(monkeypatch)
+
+    def setup(f):
+        orig_reply, orig_packet, alarm = f.reply, f.packet, {"on": False}
+
+        def reply(cmd):
+            out = orig_reply(cmd)
+            if cmd == "GetPose()" and not alarm["on"]:
+                alarm["on"] = True
+                _until(lambda: recorders[0].fault is not None)   # the receiver has the alarm
+            return out
+
+        def packet():
+            pkt = bytearray(orig_packet())
+            if alarm["on"]:
+                pkt[1029] = 1
+            return bytes(pkt)
+
+        f.reply, f.packet = reply, packet
+
+    code, made = _main_with(monkeypatch, tmp_path, setup)
+    out = capsys.readouterr().out
+    assert once and code == 1
+    line = _lines(out, "record error:")
+    assert line and "report.json is current" in line[0]
+    assert made[0].received[-1] == "GetPose()"
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["complete"] is False and report["save_errors"]
+
+
+class _TmpFile:
+    def __init__(self, real, stage):
+        self._real, self._stage = real, stage
+
+    def write(self, s):
+        return self._real.write(s)
+
+    def flush(self):
+        if self._stage == "flush":
+            raise OSError("flush failed")
+        return self._real.flush()
+
+    def fileno(self):
+        return self._real.fileno()
+
+    def close(self):
+        self._real.close()
+        if self._stage == "close":
+            raise OSError("close failed")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@pytest.mark.parametrize("stage", ["flush", "fsync", "close"])
+def test_a_failed_tmp_write_sends_nothing_more_and_says_what_is_on_disk(tmp_path, monkeypatch, stage):
+    real_open, real_fsync = open, os.fsync
+    state = {"opens": 0, "sent": None}
+    fakes = []
+
+    def fake_open(path, *a, **k):
+        f = real_open(path, *a, **k)
+        if str(path).endswith("report.json.tmp"):
+            state["opens"] += 1
+            if state["opens"] >= 4:                      # the save before GetErrorID is sent
+                if state["sent"] is None:
+                    state["sent"] = len(fakes[0].received)
+                if stage != "fsync":
+                    return _TmpFile(f, stage)
+        return f
+
+    def fsync(fd):
+        if stage == "fsync" and state["opens"] >= 4:
+            raise OSError("fsync failed")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(observe, "open", fake_open, raising=False)
+    monkeypatch.setattr(observe.os, "fsync", fsync)
+    with FakeMG400() as fake:
+        fakes.append(fake)
+        with pytest.raises(observe.MG400RecordError) as info:
+            _run(fake, tmp_path)
+        sent = list(fake.received)
+    assert sent == ["RobotMode()"] and state["sent"] == 1
+    assert f"{stage} failed" in str(info.value)
+    assert "report.json holds the last successful save of this run (save 3)" in \
+        info.value.recorder.describe()
+
+
+class _PartialTmp(_TmpFile):
+    """Writes the first chunks in full, then fails (the file holds the start of the JSON)"""
+
+    def __init__(self, real):
+        super().__init__(real, None)
+        self._left = 20
+
+    def write(self, s):
+        if self._left <= 0:
+            raise OSError("disk full")
+        self._left -= 1
+        return self._real.write(s)
+
+
+@pytest.mark.parametrize("how", ["open", "partial"])
+def test_a_failed_rewrite_after_a_failed_rename_is_not_called_the_latest_record(tmp_path,
+                                                                                monkeypatch, how):
+    # renames fail from the 4th save; the rewrite of the tmp file after each failed rename
+    # fails too (opens 5 and 7), the plain writes succeed
+    _patch_replace(monkeypatch, lambda n, text: OSError("busy") if n >= 4 else None)
+    real_open = open
+    opens = [0]
+
+    def fake_open(path, *a, **k):
+        if str(path).endswith("report.json.tmp"):
+            opens[0] += 1
+            if opens[0] in (5, 7):
+                if how == "open":
+                    raise OSError("denied")
+                return _PartialTmp(real_open(path, *a, **k))
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(observe, "open", fake_open, raising=False)
+    with FakeMG400() as fake:
+        with pytest.raises(observe.MG400RecordError) as info:
+            _run(fake, tmp_path)
+    assert opens[0] == 7
+    assert info.value.recorder.describe().startswith(
+        "report.json holds the last successful save of this run (save 3)")
+    assert len(json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["commands"]) == 1
+    if how == "partial":                                 # what the message warns about
+        text = (tmp_path / "report.json.tmp").read_text(encoding="utf-8")
+        assert text.startswith('{\n  "tool": "src.devices.mg400.observe"') and len(text) > 40
+        with pytest.raises(ValueError):
+            json.loads(text)
+
+
+def _fail_tmp_writes(monkeypatch, stage, armed):
+    """From armed() on, every write of report.json.tmp fails at ``stage``"""
+    real_open, real_fsync = open, os.fsync
+
+    def fake_open(path, *a, **k):
+        f = real_open(path, *a, **k)
+        if str(path).endswith("report.json.tmp") and armed():
+            if stage == "partial":
+                return _PartialTmp(f)
+            if stage in ("flush", "close"):
+                return _TmpFile(f, stage)
+        return f
+
+    def fsync(fd):
+        if stage == "fsync" and armed():
+            raise OSError("fsync failed")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(observe, "open", fake_open, raising=False)
+    monkeypatch.setattr(observe.os, "fsync", fsync)
+
+
+@pytest.mark.parametrize("stage", ["flush", "fsync", "close", "partial"])
+@pytest.mark.parametrize("trigger", ["refusal", "send"])
+def test_a_tmp_write_failure_on_an_error_path_keeps_the_original_error(tmp_path, monkeypatch,
+                                                                       stage, trigger):
+    armed = {"on": False}
+    _fail_tmp_writes(monkeypatch, stage, lambda: armed["on"])
+    count = [0]
+
+    class BrokenSend(_Wrapped):
+        def sendall(self, data):
+            count[0] += 1
+            if count[0] == 3:
+                armed["on"] = True
+                raise ConnectionResetError("reset by peer")
+            return self._sock.sendall(data)
+
+    with FakeMG400() as fake:
+        orig = fake.reply
+
+        def reply(cmd):
+            if cmd == "GetAngle()":
+                armed["on"] = True
+                return "-30001,{},GetAngle();"
+            return orig(cmd)
+
+        if trigger == "refusal":
+            fake.reply = reply
+        expected = protocol.MG400CommandError if trigger == "refusal" else protocol.MG400ConnectionError
+        with pytest.raises(expected) as info:
+            _run(fake, tmp_path, wrap=BrokenSend if trigger == "send" else None)
+        sent = list(fake.received)
+    rec = info.value.mg400_recorder
+    assert rec.failed and not rec.tmp_current and not rec.report_current
+    assert sent[-1] == ("GetAngle()" if trigger == "refusal" else "GetErrorID()")
+
+
+class _BreakableStdout:
+    """Passes to the real stream until ``broken`` is set, then every write fails"""
+
+    def __init__(self, real):
+        self._real, self.broken = real, False
+
+    def write(self, s):
+        if self.broken:
+            raise OSError("stdout disk full")
+        return self._real.write(s)
+
+    def flush(self):
+        if self.broken:
+            raise OSError("stdout disk full")
+        return self._real.flush()
+
+
+def test_a_failing_notice_does_not_turn_an_ended_observation_into_an_error(tmp_path):
+    def out(text):
+        if text.startswith("observation ended"):
+            raise OSError("stdout disk full")
+
+    with FakeMG400(mode=5) as fake:
+        report = observe.observe(
+            LOOPBACK, str(tmp_path), 1.0, None, out=out,
+            connect=lambda h, p, t: observe._connect(
+                LOOPBACK, {observe.DASHBOARD_PORT: fake.dashboard_port,
+                           observe.FEEDBACK_PORT: fake.feedback_port}[p], t))
+    assert report["complete"] is False and "mode 5" in " ".join(report["notes"])
+
+
+@pytest.mark.parametrize("trigger, code", [("refusal", 1), ("ctrl-c", 130)])
+def test_a_failing_stdout_keeps_the_exit_code(tmp_path, monkeypatch, trigger, code):
+    stream = _BreakableStdout(sys.stdout)
+    monkeypatch.setattr(sys, "stdout", stream)
+    if trigger == "ctrl-c":
+        orig_check = observe.FeedbackRecorder.check
+        calls = [0]
+
+        def check(self, now=None):
+            calls[0] += 1
+            if calls[0] == 6:
+                stream.broken = True
+                raise KeyboardInterrupt
+            return orig_check(self, now)
+
+        monkeypatch.setattr(observe.FeedbackRecorder, "check", check)
+        setup = None
+    else:
+        def setup(f):
+            orig = f.reply
+
+            def reply(cmd):
+                if cmd == "GetAngle()":
+                    stream.broken = True
+                    return "-30001,{},GetAngle();"
+                return orig(cmd)
+
+            f.reply = reply
+    got, made = _main_with(monkeypatch, tmp_path, setup)
+    assert stream.broken and got == code
+
+
+@pytest.mark.parametrize("streams", ["stdout", "stderr", "stdout,stderr"])
+@pytest.mark.parametrize("trigger, code", [("refusal", 1), ("ctrl-c", 130)])
+def test_a_stream_that_cannot_be_flushed_keeps_the_process_exit_code(tmp_path, trigger, code,
+                                                                     streams):
+    # Python turns a failed flush of stdout / stderr at shutdown into exit code 120. Once the
+    # streams break, opening any file fails too (as when out of file descriptors)
+    script = textwrap.dedent(f"""
+        import builtins, sys
+        sys.path.insert(0, {REPO_ROOT!r})
+        from src.devices.mg400 import fake as fake_module, observe
+
+        class Breakable:
+            broken = False
+            def __init__(self, real):
+                self.real = real
+            def write(self, s):
+                if Breakable.broken:
+                    raise OSError("disk full")
+                return self.real.write(s)
+            def flush(self):
+                if Breakable.broken:
+                    raise OSError("disk full")
+                return self.real.flush()
+
+        for name in {streams!r}.split(","):
+            setattr(sys, name, Breakable(getattr(sys, name)))
+        real_open = builtins.open
+        def failing_open(*a, **k):
+            if Breakable.broken:
+                raise OSError(24, "Too many open files")
+            return real_open(*a, **k)
+        builtins.open = failing_open
+
+        Fake = fake_module.FakeMG400
+        if {trigger!r} == "ctrl-c":
+            orig_check = observe.FeedbackRecorder.check
+            calls = [0]
+            def check(self, now=None):
+                calls[0] += 1
+                if calls[0] == 6:
+                    Breakable.broken = True
+                    raise KeyboardInterrupt
+                return orig_check(self, now)
+            observe.FeedbackRecorder.check = check
+            factory = Fake
+        else:
+            def factory(*a, **k):
+                f = Fake(*a, **k)
+                orig = f.reply
+                def reply(cmd):
+                    if cmd == "GetAngle()":
+                        Breakable.broken = True
+                        return "-30001,{{}},GetAngle();"
+                    return orig(cmd)
+                f.reply = reply
+                return f
+        fake_module.FakeMG400 = factory
+        observe._exit(observe.main(["--mock", "--seconds", "1", "--out", {str(tmp_path)!r}]))
+    """)
+    p = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+    assert p.returncode == code, p.stdout + p.stderr
+
+
+def test_a_failing_stderr_does_not_replace_the_original_error(tmp_path, monkeypatch):
+    class BrokenStream:
+        def write(self, s):
+            raise OSError("stderr disk full")
+
+        def flush(self):
+            raise OSError("stderr disk full")
+
+    _patch_replace(monkeypatch, lambda n, text: OSError("busy") if "-30001" in text else None)
+    with FakeMG400() as fake:
+        orig = fake.reply
+        fake.reply = lambda cmd: "-30001,{},GetAngle();" if cmd == "GetAngle()" else orig(cmd)
+        monkeypatch.setattr(sys, "stderr", BrokenStream())
+        try:
+            with pytest.raises(protocol.MG400CommandError):
+                _run(fake, tmp_path)
+        finally:
+            monkeypatch.undo()
+
+
+def test_a_refusal_is_reported_even_when_its_record_cannot_be_saved(tmp_path, monkeypatch, capsys):
+    _patch_replace(monkeypatch, lambda n, text: OSError("busy") if "-30001" in text else None)
+
+    def setup(f):
+        orig = f.reply
+        f.reply = lambda cmd: "-30001,{},GetAngle();" if cmd == "GetAngle()" else orig(cmd)
+
+    code, made = _main_with(monkeypatch, tmp_path, setup)
+    out = capsys.readouterr().out
+    line = _lines(out, "error: GetAngle() -> ErrorID -30001")
+    assert code == 1 and line and "record also failed" in line[0]
+    assert made[0].received[-1] == "GetAngle()"
+
+
+def test_a_send_failure_is_reported_even_when_its_record_cannot_be_saved(tmp_path, monkeypatch):
+    _patch_replace(monkeypatch, lambda n, text: OSError("busy") if '"send: ' in text else None)
+    count = [0]
+
+    class BrokenSend(_Wrapped):
+        def sendall(self, data):
+            count[0] += 1
+            if count[0] == 3:
+                raise ConnectionResetError("reset by peer")
+            return self._sock.sendall(data)
+
+    with FakeMG400() as fake:
+        with pytest.raises(protocol.MG400ConnectionError) as info:
+            _run(fake, tmp_path, wrap=BrokenSend)
+        sent = list(fake.received)
+    assert len(sent) == 2 and info.value.mg400_recorder.failed
+
+
+def test_ctrl_c_is_still_130_when_the_record_also_fails(tmp_path, monkeypatch, capsys):
+    orig_check = observe.FeedbackRecorder.check
+    calls = [0]
+
+    def check(self, now=None):
+        calls[0] += 1
+        if calls[0] == 6:
+            raise KeyboardInterrupt
+        return orig_check(self, now)
+
+    monkeypatch.setattr(observe.FeedbackRecorder, "check", check)
+    _patch_replace(monkeypatch, lambda n, text: OSError("busy") if "KeyboardInterrupt" in text else None)
+    code, made = _main_with(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    assert code == 130 and "not an emergency stop" in out and "record also failed" in out
+
+
+def test_a_complete_run_whose_final_save_fails_is_not_a_success(tmp_path, monkeypatch, capsys):
+    _patch_replace(monkeypatch, lambda n, text: OSError("busy") if '"ended_utc"' in text else None)
+    code, made = _main_with(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    line = _lines(out, "record error:")
+    assert code == 1 and line and "report.json.tmp holds the latest" in line[0]
+    tmp = json.loads((tmp_path / "report.json.tmp").read_text(encoding="utf-8"))
+    assert tmp["complete"] is True and tmp["save_errors"]
+
+
+def test_a_file_error_is_never_called_a_connection_error(tmp_path, monkeypatch, capsys):
+    real_open = open
+
+    def fake_open(path, *a, **k):
+        if str(path).endswith("feedback.bin"):
+            raise OSError("disk full")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(observe, "open", fake_open, raising=False)
+    code, made = _main_with(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    assert code == 1 and _lines(out, "error: disk full") and "connection error" not in out
+
+
+def test_a_refused_connection_is_a_connection_error(tmp_path):
+    s = socket.socket()
+    s.bind((LOOPBACK, 0))
+    port = s.getsockname()[1]
+    s.close()                                            # nothing listens there now
+    with pytest.raises(protocol.MG400ConnectionError):
+        observe.observe(LOOPBACK, str(tmp_path), 1.0, None,
+                        connect=lambda h, p, t: observe._connect(LOOPBACK, port, t),
+                        out=lambda *a: None)
+
+
+class _ClosingFake(FakeMG400):
+    def _serve_dashboard(self, conn):
+        conn.settimeout(2.0)
+        try:
+            conn.recv(4096)          # the first command is read, so the close is a clean end
+        finally:
+            conn.close()
+
+
+class _ResettingFake(FakeMG400):
+    def _serve_dashboard(self, conn):
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        conn.close()
+
+
+@pytest.mark.parametrize("cls, text", [(_ClosingFake, "connection error: dashboard-1: connection "
+                                                      "closed by the arm"),
+                                       (_ResettingFake, "connection error: dashboard-1")])
+def test_a_connection_closed_or_reset_by_the_arm_is_a_connection_error(tmp_path, monkeypatch,
+                                                                       capsys, cls, text):
+    code, made = _main_with(monkeypatch, tmp_path, cls=cls)
+    out = capsys.readouterr().out
+    assert code == 1 and _lines(out, text), out
+
+
+def test_the_onedrive_note_depends_on_the_output_folder(tmp_path, capsys):
+    assert observe.main(["--mock", "--seconds", "1", "--out", str(tmp_path / "OneDrive" / "r")]) == 0
+    assert observe.ONEDRIVE_NOTE in capsys.readouterr().out
+    if "onedrive" not in str(tmp_path).lower():
+        assert observe.main(["--mock", "--seconds", "1", "--out", str(tmp_path / "plain")]) == 0
+        assert observe.ONEDRIVE_NOTE not in capsys.readouterr().out

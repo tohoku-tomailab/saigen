@@ -35,7 +35,9 @@ _EXACT = {
     "RobotMode": re.compile(r"RobotMode\(\)"),
     "GetErrorID": re.compile(r"GetErrorID\(\)"),
     "GetAngle": re.compile(r"GetAngle\(\)"),
-    "GetPose": re.compile(r"GetPose\((?:User=0,Tool=0)?\)"),
+    # GetPose(User=0,Tool=0) is in the guide but the bench controller refused it
+    # (ErrorID -30001, 2026-10-21), so only the bare form is allowed
+    "GetPose": re.compile(r"GetPose\(\)"),
     "PositiveSolution": re.compile(rf"PositiveSolution\({_J4},0,0\)"),
     "InverseSolution": re.compile(rf"InverseSolution\({_J4},0,0,1,\{{{_J4}\}}\)"),
 }
@@ -48,6 +50,11 @@ class MG400Error(RuntimeError):
 
 class MG400ProtocolError(MG400Error):
     """A reply that cannot be parsed or does not belong to the command sent"""
+
+
+class MG400ConnectionError(MG400Error):
+    """A Dashboard or feedback connection that could not be opened, or failed: refused,
+    timed out, reset, or closed by the arm"""
 
 
 class MG400CommandError(MG400Error):
@@ -112,10 +119,9 @@ def get_error_id() -> Command:
     return _build("GetErrorID", "")
 
 
-def get_pose(base_frames: bool = False) -> Command:
-    """``GetPose()`` uses the current global user / tool frames; ``base_frames`` asks for
-    user 0 / tool 0 explicitly (a query parameter, not a setting)"""
-    return _build("GetPose", "User=0,Tool=0" if base_frames else "")
+def get_pose() -> Command:
+    """``GetPose()``: the pose in the current global user / tool frames"""
+    return _build("GetPose", "")
 
 
 def get_angle() -> Command:

@@ -39,7 +39,7 @@ import time
 from typing import Callable, List, Optional
 
 from . import feedback, protocol
-from .protocol import Command, MG400Error, MG400ProtocolError
+from .protocol import Command, MG400ConnectionError, MG400Error
 
 DASHBOARD_PORT = 29999
 FEEDBACK_PORT = 30004
@@ -63,6 +63,9 @@ PRECONDITIONS = """Before observing (nothing is moved, but it is the arm):
   - DobotStudio Pro is disconnected from the arm; nobody else is controlling it.
   - The arm should be disabled (RobotMode 4) with no alarm; otherwise the tool stops.
   - Ctrl+C ends the observation only. It sends nothing and is NOT an emergency stop."""
+
+ONEDRIVE_NOTE = ("note: the record folder may be synced by OneDrive; if saving fails, "
+                 "use --out <folder outside OneDrive>")
 
 Connector = Callable[[str, int, float], socket.socket]
 
@@ -103,9 +106,24 @@ class ObservationEnded(MG400Error):
     """The arm is not in the state the observation requires; nothing more is sent"""
 
 
+class MG400RecordError(MG400Error):
+    """The record could not be saved. ``recorder.describe()``, called when the message is
+    printed, says what is on disk at that moment"""
+
+    def __init__(self, text: str, recorder: Optional["Recorder"] = None):
+        super().__init__(text)
+        self.recorder = recorder
+
+
+#: waits before retrying a refused rename (a sync client or a scanner holding report.json)
+REPLACE_RETRY_S = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+
 class Recorder:
     """The run folder; ``report.json`` is rewritten after every command (``complete`` false
-    until the end), so an interrupted run leaves a partial record"""
+    until the end), so an interrupted run leaves a partial record. A save writes
+    ``report.json.tmp`` and renames it; what is on disk after a failure is kept in
+    ``report_current`` / ``tmp_current`` / ``confirmed_saves`` and told by :meth:`describe`"""
 
     def __init__(self, folder: str):
         os.makedirs(folder, exist_ok=True)
@@ -114,14 +132,80 @@ class Recorder:
                        "guide": GUIDE, "complete": False, "started_utc": _utc(),
                        "commands": [], "notes": []}
         self._lock = threading.Lock()
-        self.save()
+        self.confirmed_saves = 0        # renames that succeeded in this run
+        self.report_current = False     # report.json holds the latest record
+        self.tmp_current = False        # report.json.tmp holds the latest record
+        self.failed = False             # sticky: some save of this run failed
+        self.first_error: Optional[str] = None
+        self.save()                     # before any connection: a failure opens no socket
+
+    def _write_tmp(self, tmp: str):
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_finite(self.report), f, ensure_ascii=False, indent=2, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _fail(self, text: str):
+        self.failed = True
+        if self.first_error is None:
+            self.first_error = text
+        raise MG400RecordError(text, recorder=self)
 
     def save(self):
+        """Raises MG400RecordError (nothing else) when the record could not be saved"""
         with self._lock:
             tmp = os.path.join(self.folder, "report.json.tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(_finite(self.report), f, ensure_ascii=False, indent=2, allow_nan=False)
-            os.replace(tmp, os.path.join(self.folder, "report.json"))
+            try:
+                self._write_tmp(tmp)
+            except Exception as e:  # noqa: BLE001 - open / write / flush / fsync / close
+                self.report_current = self.tmp_current = False
+                self._fail(f"could not write report.json.tmp: {e!r}")
+            err = None
+            for delay in REPLACE_RETRY_S + (None,):
+                try:
+                    os.replace(tmp, os.path.join(self.folder, "report.json"))
+                    self.confirmed_saves += 1
+                    self.report_current, self.tmp_current = True, False
+                    return
+                except PermissionError as e:
+                    err = e
+                    if delay is None:
+                        break
+                    time.sleep(delay)
+                except OSError as e:          # not a lock: retrying does not help
+                    err = e
+                    break
+            self.report_current = False
+            self.report.setdefault("save_errors", []).append(
+                {"utc": _utc(), "error": f"renaming report.json.tmp to report.json: {err!r}"})
+            try:
+                self._write_tmp(tmp)          # again, now with the error in it
+                self.tmp_current = True
+            except Exception:  # noqa: BLE001
+                self.tmp_current = False
+            self._fail(f"could not rename report.json.tmp to report.json: {err!r}")
+
+    def save_during(self):
+        """For paths where an exception is already on its way: a save failure is kept and
+        printed, never raised, so it cannot replace the original exception"""
+        try:
+            self.save()
+        except MG400RecordError as e:
+            try:
+                print(f"record error while stopping: {e}", file=sys.stderr)
+            except Exception:  # noqa: BLE001 - not even this may replace the original
+                pass
+
+    def describe(self) -> str:
+        """What is on disk now (call it after the last save)"""
+        if self.report_current:
+            return "report.json is current"
+        if self.tmp_current:
+            return "report.json.tmp holds the latest record (report.json is older or missing)"
+        if self.confirmed_saves:
+            return (f"report.json holds the last successful save of this run (save "
+                    f"{self.confirmed_saves}), not the latest; report.json.tmp may be incomplete")
+        return "no save of this run was confirmed"
 
     def note(self, text: str):
         with self._lock:
@@ -164,20 +248,32 @@ class Dashboard:
             if self._guard is not None:
                 self._guard()
             entry["sent_utc"], entry["sent_monotonic"] = _utc(), time.monotonic()
-            self._sock.sendall(command.text.encode("ascii"))
+            try:
+                self._sock.sendall(command.text.encode("ascii"))
+            except OSError as e:
+                raise MG400ConnectionError(f"{self.label}: send failed: {e}") from e
         except BaseException as e:
             entry["error"] = f"not sent: {e!r}" if "sent_utc" not in entry else f"send: {e!r}"
-            self._rec.save()
+            self._rec.save_during()
             raise
         return entry
+
+    def _recv(self) -> bytes:
+        try:
+            data = self._sock.recv(4096)
+        except socket.timeout as e:
+            raise MG400ConnectionError(
+                f"{self.label}: no reply within {self._sock.gettimeout():g} s") from e
+        except OSError as e:
+            raise MG400ConnectionError(f"{self.label}: receive failed: {e}") from e
+        if not data:
+            raise MG400ConnectionError(f"{self.label}: connection closed by the arm")
+        return data
 
     def read(self, command: Command, entry: dict) -> protocol.Reply:
         try:
             while not self._pending:
-                data = self._sock.recv(4096)
-                if not data:
-                    raise MG400ProtocolError(f"{self.label}: connection closed")
-                self._pending.extend(self._reader.feed(data))
+                self._pending.extend(self._reader.feed(self._recv()))
             reply = self._pending.pop(0)
             entry.update(reply=reply.raw, reply_utc=_utc(),
                          reply_s=round(time.monotonic() - entry["sent_monotonic"], 4))
@@ -190,14 +286,14 @@ class Dashboard:
                 judge_errors(protocol.parse_error_ids(reply.values))
             elif command.name in LENGTHS:
                 protocol.parse_numbers(reply.values, LENGTHS[command.name])
-            return reply
         except BaseException as e:
             entry.setdefault("error", repr(e))
             if self._reader.pending:
                 entry["partial_reply"] = self._reader.pending
+            self._rec.save_during()
             raise
-        finally:
-            self._rec.save()
+        self._rec.save()
+        return reply
 
     def query(self, command: Command) -> protocol.Reply:
         return self.read(command, self.write(command))
@@ -217,10 +313,10 @@ class FeedbackRecorder(threading.Thread):
     COLUMNS = ["seq", "recv_monotonic_s", "recv_unix_ms", "timestamp_minus_recv_ms"] + \
         list(feedback.FIELDS) + ["nonfinite", "out_of_range"]
 
-    def __init__(self, sock: socket.socket, folder: str):
+    def __init__(self, sock: socket.socket, folder: str, recv_timeout: float = 0.2):
         super().__init__(name="mg400-feedback", daemon=True)
         self._sock = sock
-        self._sock.settimeout(0.2)
+        self._sock.settimeout(recv_timeout)
         self._halt = threading.Event()
         self._asm = feedback.Assembler()
         self._bin = open(os.path.join(folder, "feedback.bin"), "wb")
@@ -246,12 +342,21 @@ class FeedbackRecorder(threading.Thread):
             if self.fault is None:
                 self.fault = text
 
+    def _check_gap(self, now: float):
+        """A gap is latched as a fault here, in the receiving thread: a feed that pauses and
+        resumes between two of check()'s looks still ends the observation"""
+        with self.lock:
+            last = self.last_valid_t
+        if last is not None and now - last > FEEDBACK_MAX_AGE_S and not self._halt.is_set():
+            self._fault(f"feedback gap: no valid packet for {now - last:.2f} s")
+
     def run(self):
         try:
             while not self._halt.is_set():
                 try:
                     data = self._sock.recv(65536)
                 except socket.timeout:
+                    self._check_gap(time.monotonic())
                     continue
                 except OSError as e:
                     # our own stop closes the socket: only then is a receive error expected
@@ -277,6 +382,7 @@ class FeedbackRecorder(threading.Thread):
                             self.rejected.append(reason)
                         self._fault(f"feedback packet {chunk.seq} rejected: {reason}")
                         continue
+                    self._check_gap(t)          # before this packet renews last_valid_t
                     diff = pkt["timestamp_ms"] - wall
                     self._pw.writerow([chunk.seq, f"{t:.6f}", wall, diff] +
                                       [json.dumps(pkt[k]) if isinstance(pkt[k], list) else pkt[k]
@@ -368,17 +474,20 @@ def _check_state(dash: Dashboard, fb: FeedbackRecorder):
 def observe(host: str, folder: str, seconds: float = 10.0, controller_version: Optional[str] = None,
             connect: Connector = _connect, dashboard_port: int = DASHBOARD_PORT,
             feedback_port: int = FEEDBACK_PORT, out=print) -> dict:
-    """Run the observation. Returns the report (also written to ``folder``)"""
-    rec = Recorder(folder)
+    """Run the observation. Returns the report (also written to ``folder``). Any save failure
+    of the run ends in MG400RecordError, unless another exception is already on its way
+    (that one is raised, with the recorder as ``mg400_recorder``)"""
+    rec = Recorder(folder)          # MG400RecordError(recorder=rec) here: nothing opened
     rec.report["controller_version_typed"] = controller_version
     dashes: List[Dashboard] = []
     fb: Optional[FeedbackRecorder] = None
     ended = None
+    error: Optional[BaseException] = None
     try:
-        fb = FeedbackRecorder(connect(host, feedback_port, TIMEOUT_S), folder)
+        fb = FeedbackRecorder(_open(connect, host, feedback_port), folder)
         fb.start()
         fb.wait_first()
-        dash = Dashboard(connect(host, dashboard_port, TIMEOUT_S), rec, "dashboard-1", fb.check)
+        dash = Dashboard(_open(connect, host, dashboard_port), rec, "dashboard-1", fb.check)
         dashes.append(dash)
         _check_state(dash, fb)
         out("state: disabled, no alarm")
@@ -386,14 +495,12 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
         # 1. queries
         r = {}
         r["GetPose()"] = protocol.parse_numbers(dash.query(protocol.get_pose()).values, 4)
-        r["GetPose(User=0,Tool=0)"] = protocol.parse_numbers(
-            dash.query(protocol.get_pose(base_frames=True)).values, 4)
         r["GetAngle()"] = protocol.parse_numbers(dash.query(protocol.get_angle()).values, (4, 6))
         rec.report["queries"] = r
         rec.save()
 
         # 2. a second Dashboard connection (every RobotMode / GetErrorID reply is judged)
-        dash2 = Dashboard(connect(host, dashboard_port, TIMEOUT_S), rec, "dashboard-2", fb.check)
+        dash2 = Dashboard(_open(connect, host, dashboard_port), rec, "dashboard-2", fb.check)
         dashes.append(dash2)
         two = {"interleaved": [], "outstanding": None}
         for cmd in (protocol.robot_mode(), protocol.get_error_id(), protocol.get_pose(),
@@ -423,16 +530,18 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
         _check_state(dash, fb)
         r["GetAngle() after window"] = protocol.parse_numbers(
             dash.query(protocol.get_angle()).values, (4, 6))
-        r["GetPose(User=0,Tool=0) after window"] = protocol.parse_numbers(
-            dash.query(protocol.get_pose(base_frames=True)).values, 4)
+        r["GetPose() after window"] = protocol.parse_numbers(
+            dash.query(protocol.get_pose()).values, 4)
         with fb.lock:
             last = dict(fb.latest)
+        # the packet and the replies are not one snapshot; the frames are the packet's
         rec.report["compare_mapping_unverified"] = {
             "q_actual_minus_GetAngle_first4": [
                 round(a - b, 6) for a, b in zip(last["q_actual"][:4], r["GetAngle() after window"][:4])],
-            "tool_vector_actual_minus_GetPose00_first4": [
+            "tool_vector_actual_minus_GetPose_first4": [
                 round(a - b, 6) for a, b in zip(last["tool_vector_actual"][:4],
-                                                r["GetPose(User=0,Tool=0) after window"][:4])]}
+                                                r["GetPose() after window"][:4])],
+            "packet_user_index": last["user_index"], "packet_tool_index": last["tool_index"]}
         rec.save()
 
         # 4. kinematics (compute only); the state is checked before every compute command
@@ -457,14 +566,12 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
         if fault:
             raise ObservationEnded(fault)
         rec.report["complete"] = True
-        return rec.report
     except ObservationEnded as e:
         ended = f"observation ended: {e}"
-        out(ended)
-        return rec.report
+        _say(ended, out)
     except BaseException as e:
         ended = f"stopped by {type(e).__name__}: {e}"
-        raise
+        error = e
     finally:
         if ended:
             rec.note(ended)
@@ -475,7 +582,22 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
             fb.join(timeout=2.0)
             rec.report["feedback"] = fb.summary()       # the final summary, whole recording
         rec.report["ended_utc"] = _utc()
-        rec.save()
+        rec.save_during()
+    if error is not None:
+        error.mg400_recorder = rec
+        raise error
+    if rec.failed:
+        raise MG400RecordError(rec.first_error, recorder=rec)
+    return rec.report
+
+
+def _open(connect: Connector, host: str, port: int) -> socket.socket:
+    try:
+        return connect(host, port, TIMEOUT_S)
+    except MG400Error:
+        raise
+    except OSError as e:
+        raise MG400ConnectionError(f"connecting to {host}:{port}: {e}") from e
 
 
 def dry_run(out=print):
@@ -483,11 +605,11 @@ def dry_run(out=print):
     out("feedback port %d: read only, never written; first valid packet within %g s"
         % (FEEDBACK_PORT, FEEDBACK_FIRST_S))
     for line in ("RobotMode()   (end unless 4)", "GetErrorID()  (end on any alarm)",
-                 "GetPose()", "GetPose(User=0,Tool=0)", "GetAngle()",
+                 "GetPose()", "GetAngle()",
                  "second connection: RobotMode() GetErrorID() GetPose() GetAngle() on both, interleaved",
                  "RobotMode() on 1 left outstanding while GetAngle() on 2",
                  "wait --seconds, recording feedback (end on any fault)",
-                 "RobotMode() GetErrorID() GetAngle() GetPose(User=0,Tool=0)",
+                 "RobotMode() GetErrorID() GetAngle() GetPose()",
                  "for the current joints and %d grid joint sets: RobotMode() GetErrorID() "
                  "PositiveSolution(j1,j2,j3,j4,0,0) RobotMode() GetErrorID() "
                  "InverseSolution(x,y,z,r,0,0,1,{j1,j2,j3,j4})" % len(list(kinematics_grid())),
@@ -507,6 +629,23 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _say(text: str, out=print):
+    """A notice on a path whose outcome is already decided: a failing stdout must not
+    replace the error or the exit code"""
+    try:
+        out(text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _record_also(e: BaseException) -> str:
+    """The disk state, read now (after every save), when the record also failed"""
+    rec = getattr(e, "recorder", None) or getattr(e, "mg400_recorder", None)
+    if rec is None or not rec.failed:
+        return ""
+    return " (record also failed: %s; %s)" % (rec.first_error, rec.describe())
+
+
 def main(argv=None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -521,6 +660,8 @@ def main(argv=None) -> int:
         LOG_ROOT, datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         + ("_mock" if args.mock else ""))
     print(PRECONDITIONS)
+    if "onedrive" in os.path.abspath(folder).lower():
+        print(ONEDRIVE_NOTE)
     fake = None
     try:
         if args.mock:
@@ -534,22 +675,38 @@ def main(argv=None) -> int:
             report = observe(LOOPBACK, folder, args.seconds, args.controller_version, connect=connect)
         else:
             report = observe(args.address, folder, args.seconds, args.controller_version)
-    except KeyboardInterrupt:
-        print("\nCtrl+C: observation ended. Nothing was sent to the arm; this is not an "
-              "emergency stop. Partial record in %s" % folder)
+    except KeyboardInterrupt as e:
+        _say("\nCtrl+C: observation ended. Nothing was sent to the arm; this is not an "
+             "emergency stop. Partial record in %s%s" % (folder, _record_also(e)))
         return 130
-    except MG400Error as e:
-        print("error: %s (record in %s)" % (e, folder))
+    except MG400RecordError as e:
+        rec = e.recorder
+        _say("record error: %s; %s (folder %s)"
+             % (rec.first_error if rec else e, rec.describe() if rec else "", folder))
         return 1
-    except OSError as e:
-        print("connection error: %s (record in %s)" % (e, folder))
+    except MG400ConnectionError as e:
+        _say("connection error: %s (record in %s)%s" % (e, folder, _record_also(e)))
+        return 1
+    except (MG400Error, OSError) as e:      # an OSError here is not a connection error
+        _say("error: %s (record in %s)%s" % (e, folder, _record_also(e)))
         return 1
     finally:
         if fake is not None:
             fake.close()
-    print("record: %s (complete: %s)" % (folder, report.get("complete")))
+    _say("record: %s (complete: %s)" % (folder, report.get("complete")))
     return 0 if report.get("complete") else 2
 
 
+def _exit(code: int):
+    """Exit with ``code`` even if stdout / stderr cannot be flushed: Python would otherwise
+    turn a failed flush at shutdown into exit code 120"""
+    for name in ("stdout", "stderr"):
+        try:
+            getattr(sys, name).flush()
+        except Exception:  # noqa: BLE001
+            setattr(sys, name, None)    # the shutdown flush skips None; nothing needs opening
+    sys.exit(code)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _exit(main())

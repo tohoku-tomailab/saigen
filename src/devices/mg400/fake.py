@@ -19,13 +19,14 @@ class FakeMG400:
     def __init__(self, mode: int = 4, pose=(308.141606, 0.384430, 67.673470, 18.632881),
                  angles=(0.071847, 10.278645, 16.846972, 18.555908, 0.0, 0.0),
                  errors: Optional[list] = None, period_s: float = 0.008,
-                 split_replies: bool = False):
+                 split_replies: bool = False, echo_bare=()):
         self.mode = mode
         self.pose = list(pose)
         self.angles = list(angles)
         self.errors = errors if errors is not None else [[], [], [], [], [], []]
         self.period_s = period_s
         self.split_replies = split_replies
+        self.echo_bare = set(echo_bare)            # names echoed without their parameters
         self.received: List[str] = []
         self.feedback_bytes_received = 0
         self.hold_replies = threading.Event()      # set: replies wait until cleared
@@ -131,7 +132,7 @@ class FakeMG400:
             return f"0,{{{fmt(self.fk(j))}}},{cmd};"
         if name == "InverseSolution":
             near = cmd[cmd.index("{") + 1:cmd.index("}")]
-            return f"0,{{{near}}},{cmd};"
+            return f"0,{{{near}}},{name + '()' if name in self.echo_bare else cmd};"
         return f"-10000,{{}},{cmd};"
 
     @staticmethod
