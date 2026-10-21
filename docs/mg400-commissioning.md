@@ -6,10 +6,10 @@ Field notes from the first observation runs of a Dobot MG400 in the SAIGEN lab
 sends, when it stops, what it records). The MG400 is **not** a SAIGEN robot
 type: nothing here lets a flow move it.
 
-Configuration checked: one MG400 at the same network address on both runs,
-read from a Windows 11 PC on 2026-10-21 (two runs). The controller version was not typed
-into either run (`controller_version_typed: null`). Both runs ended before the
-kinematics pairs, so §4 lists what is still open. Another unit or firmware may
+Configuration checked: one MG400 at the same network address on all three
+runs, read from a Windows 11 PC on 2026-10-21. The controller version was not
+typed into any run (`controller_version_typed: null`). No run got a
+kinematics pair, so §4 lists what is still open. Another unit or firmware may
 differ, so treat what follows as expectations to re-check, not as
 specifications.
 
@@ -41,7 +41,8 @@ disconnected.
 
 ### 3.1 Replies that matched the guide
 
-On both runs, with the arm disabled:
+On the first two runs, with the arm disabled (the third, §3.5, gave the same
+reply forms; its `reply_s` reached 62 ms):
 
 - `RobotMode()` answered `0,{4},RobotMode();` (4 = disabled).
 - `GetErrorID()` answered six empty inner lists: no alarm reported. (Which list
@@ -58,7 +59,7 @@ On both runs, with the arm disabled:
 - The packet TimeStamp was about 916 s behind the PC clock. The clocks are not
   synchronised; the difference is recorded, never read as a latency.
 
-On the second run only (the first ended before it):
+From the second run on (the first ended before it):
 
 - `GetAngle()` answered **six** values, the last two `0.000000`; the tool
   reads the first four as the joints.
@@ -98,21 +99,48 @@ the probe), so the next run separates "the first connection ends on its own"
 from "it ends when a second one opens". Only exactly that ending (end of stream
 or reset on the probe, no reply bytes, on the first connection), when no save of
 the run has failed and the record of the ending is saved, lets the observation
-continue on the second connection, after the state is checked there. If it is confirmed, a later control stage cannot keep a separate
-monitoring connection on the Dashboard port beside the controlling one.
+continue on the second connection, after the state is checked there. If it is
+confirmed, a later control stage cannot keep a separate monitoring connection
+on the Dashboard port beside the controlling one.
+
+### 3.5 Third run: the step in parts, and `InverseSolution` refused
+
+On the third run the control `RobotMode()` on the first connection alone,
+after the 1 s idle wait, was answered. After the second connection was opened
+and 0.2 s had passed, the probe on the first (0.234 s after its last reply)
+met an end of stream with no reply bytes. That is what this run showed; it
+does not show that the first connection never ends on its own, nor when it
+actually ended, nor that the second connection caused it. The end was the
+tolerated one, so the tool checked the state on the second connection and
+continued there: `GetPose()`, `GetAngle()`, the 10 s feedback wait, and
+`PositiveSolution(j1,j2,j3,j4,0,0)`, which answered four values.
+
+Over the whole recording (11.4 s, including the 10 s wait) 1401 feedback
+packets arrived, none rejected and no fault; the TimeStamp step was 7 to 12 ms,
+median 8 ms. The comparison of the packet with the replies after the wait
+(still reported as "mapping unverified") differed by at most 0.0002 in the
+joints and 0 in the pose, with user and tool index 0.
+
+The guide's form with the nearest-joints option,
+`InverseSolution(x,y,z,r,0,0,1,{j1,j2,j3,j4})`, was answered `-20000,{},...`,
+"parameter number error" in the guide's error table, and the run ended there
+(`complete: false`). The form was removed from the tool and its allowlist,
+like `GetPose(User=0,Tool=0)`; the tool now sends the six-parameter form
+`InverseSolution(x,y,z,r,0,0)`, whose solution, in the guide, is the one
+nearest the arm's current joint angles. Whether this controller accepts that
+form is not yet known. That the controller is older than the guide is a
+guess, not a finding.
 
 ## 4. Open points
 
-- A complete observation record: the remaining queries on the second
-  connection and the kinematics pairs (`PositiveSolution` /
-  `InverseSolution`) have not yet been read from this controller.
-- Whether the first-connection ending repeats, and whether it happens without
-  a second connection (the control probe answers this).
+- A complete observation record: no kinematics pair has been read yet, and the
+  six-parameter `InverseSolution` has not been tried on this controller.
+- Whether the first-connection ending repeats (seen on two runs, after a second
+  connection was opened each time).
 - The controller version, to be typed into the next run.
 - The mapping of the 6-element feedback arrays to the 4-element replies. The
-  tool always reports its comparison as "mapping unverified" (neither run got
-  that far); checking it, for example at a second pose, is a human step still
-  to be planned.
+  tool always reports its comparison as "mapping unverified"; checking it, for
+  example at a second pose, is a human step still to be planned.
 
 ## 5. Interrupting a run
 

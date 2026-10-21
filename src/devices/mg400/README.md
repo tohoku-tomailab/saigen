@@ -24,7 +24,7 @@ no way to send free text, and the final text is checked before it is written):
 | `GetPose()` | flange pose in the current global user / tool frames |
 | `GetAngle()` | joint angles |
 | `PositiveSolution(j1,j2,j3,j4,0,0)` | the controller's forward kinematics (compute only) |
-| `InverseSolution(x,y,z,r,0,0,1,{j1,j2,j3,j4})` | its inverse kinematics, nearest to the given joints (compute only) |
+| `InverseSolution(x,y,z,r,0,0)` | its inverse kinematics, the solution nearest the arm's current joints (compute only) |
 
 Port 29999 also accepts commands that change the arm's state (EnableRobot, DisableRobot,
 ClearError, EmergencyStop ...). The allowlist in `protocol.py`, not the port, keeps the
@@ -33,6 +33,13 @@ tool read-only. The feedback port 30004 is only read. The motion port 30003 is n
 The guide also documents `GetPose(User=0,Tool=0)`. The bench controller refused it
 (`-30001,{},GetPose(User=0,Tool=0);`, "the type of the first parameter is incorrect"), so
 the tool no longer sends it, and its allowlist no longer admits it.
+
+The same holds for the guide's `InverseSolution(x,y,z,r,0,0,1,{j1,j2,j3,j4})` (solution
+nearest the given joints): the bench controller answered `-20000` ("parameter number
+error"). The tool sends the six-parameter form instead, whose solution is the one nearest
+the arm's current joints, so a pair's inverse solution may be another branch than its
+joints; the record says so (`kinematics_note`). Whether the controller accepts the
+six-parameter form has not been seen yet.
 
 The observation ends, sending nothing more, as soon as any RobotMode / GetErrorID reply
 (on either connection) or any feedback packet shows a mode other than 4 (disabled), an
