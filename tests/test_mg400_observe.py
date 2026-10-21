@@ -5,6 +5,7 @@ listens on loopback only. The tests check what is written on the wire, not only 
 """
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -32,9 +33,8 @@ def test_the_six_commands_and_their_exact_text():
     assert protocol.get_angle().text == "GetAngle()"
     assert protocol.positive_solution([1, 2, 3, 4]).text == \
         "PositiveSolution(1.000000,2.000000,3.000000,4.000000,0,0)"
-    assert protocol.inverse_solution([300, 0, 50, 10], [0, 10, 20, 0]).text == \
-        ("InverseSolution(300.000000,0.000000,50.000000,10.000000,0,0,1,"
-         "{0.000000,10.000000,20.000000,0.000000})")
+    assert protocol.inverse_solution([300, 0, 50, 10]).text == \
+        "InverseSolution(300.000000,0.000000,50.000000,10.000000,0,0)"
 
 
 @pytest.mark.parametrize("text", [
@@ -47,6 +47,10 @@ def test_the_six_commands_and_their_exact_text():
     "RobotMode()EnableRobot()", "RobotMode();EnableRobot()", "RobotMode()\nEnableRobot()",
     "GetPose(EnableRobot())", "GetPose(User=0,Tool=0", "PositiveSolution(1,2,3,4,0,0)) ",
     "InverseSolution(1,2,3,4,0,0,1,{1,2,{3},4})", "getangle() ", " GetAngle()", "",
+    # the guide's isJointNear / JointNear form, refused by the bench controller (-20000)
+    "InverseSolution(1.000000,2.000000,3.000000,4.000000,0,0,1,{1.000000,2.000000,3.000000,4.000000})",
+    "InverseSolution(1.000000,2.000000,3.000000,4.000000,0,0,1)",
+    "InverseSolution(1.000000,2.000000,3.000000,4.000000,0,1)",
 ])
 def test_anything_else_is_refused_before_writing(text):
     with pytest.raises(ValueError):
@@ -59,7 +63,7 @@ def test_numbers_are_checked(bad):
     with pytest.raises(ValueError):
         protocol.positive_solution(bad)
     with pytest.raises(ValueError):
-        protocol.inverse_solution([1, 2, 3, 4], bad)
+        protocol.inverse_solution(bad)
 
 
 def test_the_dashboard_writes_only_command_objects():
@@ -132,7 +136,7 @@ def test_malformed_replies_raise(raw):
 
 
 def test_echo_rules():
-    cmd = protocol.inverse_solution([300, 0, 50, 10], [0, 10, 20, 0])
+    cmd = protocol.inverse_solution([300, 0, 50, 10])
     assert protocol.check_echo(protocol.parse_reply("0,{0,10,20,0},InverseSolution();"), cmd) == \
         "echo without parameters"
     assert protocol.check_echo(protocol.parse_reply("0,{0,10,20,0},%s;" % cmd.text), cmd) is None
@@ -140,8 +144,7 @@ def test_echo_rules():
         protocol.check_echo(protocol.parse_reply("0,{4},RobotMode();"), cmd)
     with pytest.raises(MG400ProtocolError):
         protocol.check_echo(protocol.parse_reply(
-            "0,{0,10,20,0},InverseSolution(1.000000,0.000000,50.000000,10.000000,0,0,1,"
-            "{0.000000,10.000000,20.000000,0.000000});"), cmd)
+            "0,{0,10,20,0},InverseSolution(1.000000,0.000000,50.000000,10.000000,0,0);"), cmd)
 
 
 def test_unknown_robot_mode_and_bad_numbers():
@@ -466,6 +469,47 @@ def test_reply_shapes_are_checked(tmp_path, values):
                                   if cmd.startswith("InverseSolution") else orig(cmd))
         with pytest.raises(MG400ProtocolError):
             _run(fake, tmp_path)
+
+
+def test_the_fake_refuses_the_joint_near_form_as_the_bench_did():
+    """the fake mirrors the bench reply; the tool itself can no longer build that text"""
+    old = ("InverseSolution(300.000000,0.000000,50.000000,10.000000,0,0,1,"
+           "{0.000000,10.000000,20.000000,0.000000})")
+    with pytest.raises(ValueError):
+        protocol.check_command(old)
+    with FakeMG400() as fake:
+        assert fake.reply(old) == f"-20000,{{}},{old};"
+        assert fake.reply(protocol.inverse_solution([300, 0, 50, 10]).text).startswith("0,{")
+
+
+def test_a_refused_inverse_solution_ends_the_run_and_nothing_follows(tmp_path):
+    with FakeMG400() as fake:
+        orig = fake.reply
+        fake.reply = lambda cmd: (f"-20000,{{}},{cmd};" if cmd.startswith("InverseSolution")
+                                  else orig(cmd))
+        with pytest.raises(protocol.MG400CommandError) as info:
+            _run(fake, tmp_path)
+        sent = list(fake.received)
+    assert "-20000" in str(info.value)
+    assert sent[-1].startswith("InverseSolution") and \
+        sum(c.startswith("InverseSolution") for c in sent) == 1
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["complete"] is False
+    assert report["commands"][-1]["reply"].startswith("-20000,")
+
+
+def test_only_the_six_parameter_inverse_form_is_sent_and_any_branch_is_recorded(tmp_path):
+    angles = (45.0, 30.0, 60.0, -20.0, 0.0, 0.0)       # unlike any grid joint set
+    with FakeMG400(angles=angles) as fake:
+        report = _run(fake, tmp_path)
+        sent = [c for c in fake.received if c.startswith("InverseSolution")]
+    assert report["complete"] is True
+    assert sent and all(re.fullmatch(r"InverseSolution\((-?\d+\.\d{6},){4}0,0\)", c) for c in sent)
+    assert "nearest the arm's current joint angles" in report["kinematics_note"]
+    pairs = report["kinematics"]
+    assert len(pairs) == len(sent)
+    assert all(p["inverse_solution"] == list(angles[:4]) for p in pairs)
+    assert any(p["joints"] != list(angles[:4]) for p in pairs)
 
 
 def test_an_empty_or_short_error_list_is_not_no_alarm():

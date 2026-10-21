@@ -157,8 +157,12 @@ class FakeMG400:
             j = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
             return f"0,{{{fmt(self.fk(j))}}},{cmd};"
         if name == "InverseSolution":
-            near = cmd[cmd.index("{") + 1:cmd.index("}")]
-            return f"0,{{{near}}},{name + '()' if name in self.echo_bare else cmd};"
+            # the bench controller refused the joint-near form with -20000 (its record); that
+            # it answers the six-parameter form is this fake's assumption, with the current
+            # joint angles standing in for the nearest solution
+            if "{" in cmd or cmd.count(",") != 5:
+                return f"-20000,{{}},{cmd};"
+            return f"0,{{{fmt(self.angles[:4])}}},{name + '()' if name in self.echo_bare else cmd};"
         return f"-10000,{{}},{cmd};"
 
     @staticmethod

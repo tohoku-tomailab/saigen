@@ -712,12 +712,15 @@ def observe(host: str, folder: str, seconds: float = 10.0, controller_version: O
 
         # 4. kinematics (compute only); the state is checked before every compute command
         pairs = []
+        rec.report["kinematics_note"] = (
+            "inverse_solution: six-parameter form, the solution nearest the arm's current joint "
+            "angles (not the joints of the pair); a different branch is not an error")
         current = r["GetAngle()"][:4]
         for joints in [current] + list(kinematics_grid()):
             _check_state(dash, fb)
             fk = protocol.parse_numbers(dash.query(protocol.positive_solution(joints)).values, 4)
             _check_state(dash, fb)
-            ik = protocol.parse_numbers(dash.query(protocol.inverse_solution(fk, joints)).values, 4)
+            ik = protocol.parse_numbers(dash.query(protocol.inverse_solution(fk)).values, 4)
             pairs.append({"joints": joints, "positive_solution": fk, "inverse_solution": ik})
             rec.report["kinematics"] = pairs
             rec.save()
@@ -789,7 +792,7 @@ def dry_run(out=print):
                  "RobotMode() GetErrorID() GetAngle() GetPose()",
                  "for the current joints and %d grid joint sets: RobotMode() GetErrorID() "
                  "PositiveSolution(j1,j2,j3,j4,0,0) RobotMode() GetErrorID() "
-                 "InverseSolution(x,y,z,r,0,0,1,{j1,j2,j3,j4})" % len(list(kinematics_grid())),
+                 "InverseSolution(x,y,z,r,0,0)" % len(list(kinematics_grid())),
                  "RobotMode() GetErrorID()"):
         out("  " + line)
 

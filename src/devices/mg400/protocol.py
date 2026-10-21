@@ -39,7 +39,10 @@ _EXACT = {
     # (ErrorID -30001, 2026-10-21), so only the bare form is allowed
     "GetPose": re.compile(r"GetPose\(\)"),
     "PositiveSolution": re.compile(rf"PositiveSolution\({_J4},0,0\)"),
-    "InverseSolution": re.compile(rf"InverseSolution\({_J4},0,0,1,\{{{_J4}\}}\)"),
+    # InverseSolution(...,0,0,1,{j1,j2,j3,j4}) (isJointNear, JointNear) is in the guide but the
+    # bench controller refused it (ErrorID -20000, parameter number, 2026-10-21): only the
+    # six-parameter form, whose solution is the one nearest the arm's current joint angles
+    "InverseSolution": re.compile(rf"InverseSolution\({_J4},0,0\)"),
 }
 _NAME_RE = re.compile(r"([A-Za-z]+)\(")
 
@@ -140,14 +143,14 @@ def positive_solution(joints: Sequence) -> Command:
     return _build("PositiveSolution", ",".join(_joints(joints, "PositiveSolution") + ["0", "0"]))
 
 
-def inverse_solution(pose: Sequence, near: Sequence) -> Command:
-    """Inverse kinematics in user 0 / tool 0, solution nearest to ``near`` (compute only)"""
+def inverse_solution(pose: Sequence) -> Command:
+    """Inverse kinematics in user 0 / tool 0, the solution nearest the arm's current joint
+    angles (compute only)"""
     pose = list(pose)
     if len(pose) != 4:
         raise ValueError(f"InverseSolution needs x, y, z, r, got {len(pose)} values")
     xyzr = [_number(v, f"InverseSolution {k}") for k, v in zip("xyzr", pose)]
-    near_txt = ",".join(_joints(near, "InverseSolution JointNear"))
-    return _build("InverseSolution", ",".join(xyzr + ["0", "0", "1"]) + "," + "{" + near_txt + "}")
+    return _build("InverseSolution", ",".join(xyzr + ["0", "0"]))
 
 
 class Reply(NamedTuple):
