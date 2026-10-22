@@ -38,8 +38,9 @@ The same holds for the guide's `InverseSolution(x,y,z,r,0,0,1,{j1,j2,j3,j4})` (s
 nearest the given joints): the bench controller answered `-20000` ("parameter number
 error"). The tool sends the six-parameter form instead, whose solution is the one nearest
 the arm's current joints, so a pair's inverse solution may be another branch than its
-joints; the record says so (`kinematics_note`). Whether the controller accepts the
-six-parameter form has not been seen yet.
+joints; the record says so (`kinematics_note`). The bench controller answered the
+six-parameter form with four values on the fourth run (`docs/mg400-commissioning.md`
+§3.6).
 
 The observation ends, sending nothing more, as soon as any RobotMode / GetErrorID reply
 (on either connection) or any feedback packet shows a mode other than 4 (disabled), an

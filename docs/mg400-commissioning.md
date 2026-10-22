@@ -6,12 +6,13 @@ Field notes from the first observation runs of a Dobot MG400 in the SAIGEN lab
 sends, when it stops, what it records). The MG400 is **not** a SAIGEN robot
 type: nothing here lets a flow move it.
 
-Configuration checked: one MG400 at the same network address on all three
-runs, read from a Windows 11 PC on 2026-10-21. The controller version was not
-typed into any run (`controller_version_typed: null`). No run got a
-kinematics pair, so §4 lists what is still open. Another unit or firmware may
-differ, so treat what follows as expectations to re-check, not as
-specifications.
+Configuration checked: one MG400, read from a Windows 11 PC on 2026-10-21 and
+2026-10-22 (the address typed on each run is in the operator's notes, not in
+the records). The controller version was not typed into any run
+(`controller_version_typed: null`). The first three runs ended early; the
+fourth (§3.6) is the first complete record.
+§4 lists what is still open. Another unit or firmware may differ, so treat
+what follows as expectations to re-check, not as specifications.
 
 ## 1. Scope chosen: observation only
 
@@ -127,20 +128,64 @@ The guide's form with the nearest-joints option,
 (`complete: false`). The form was removed from the tool and its allowlist,
 like `GetPose(User=0,Tool=0)`; the tool now sends the six-parameter form
 `InverseSolution(x,y,z,r,0,0)`, whose solution, in the guide, is the one
-nearest the arm's current joint angles. Whether this controller accepts that
-form is not yet known. That the controller is older than the guide is a
-guess, not a finding.
+nearest the arm's current joint angles. The fourth run (§3.6) showed that this
+controller answers that form. That the controller is older than the guide is
+a guess, not a finding.
+
+### 3.6 Fourth run: the first complete record
+
+On the fourth run (2026-10-22, arm disabled, no alarm on any reply) the tool
+ran to the end (`complete: true`). What it added:
+
+- The six-parameter `InverseSolution(x,y,z,r,0,0)` was answered with four
+  values on all 13 pairs. For every pair (the current joints and the 12 grid
+  points with j1 in {-30, 0, 30}, j2 and j3 in {0, 30}, j4 = 0) the inverse
+  solution of the forward solution differed from the pair's joints by at most
+  0.000015 degrees, so no pair came back as another branch. These are the
+  controller's own forward and inverse model agreeing with itself, not a
+  measurement of the arm.
+- `PositiveSolution` of the joints read by the first `GetAngle()` of the run
+  differed from the `GetPose()` sent 12 ms before that `GetAngle()` by at most
+  0.0006 in x, y, z and 0.0028 in r. Both readings jitter (below), so this is
+  a consistency check, not a calibration.
+- The first Dashboard connection's end was detected a third time, in the same
+  place: the control `RobotMode()` after the 1 s idle wait was answered; the
+  probe, 0.203 s after the first connection's last reply and after the second
+  connection had been opened, met an end of stream with no reply bytes. The
+  tool continued on the second connection. As before, when the connection
+  actually ended and whether the second connection caused it are not shown.
+- Feedback over the whole recording (12.1 s): 1484 packets, none rejected, no
+  fault, TimeStamp step 7 to 12 ms with median 8 ms, `robot_mode` 4 and
+  `error_status` 0 in every packet. The comparison with the replies after the
+  wait (still "mapping unverified") differed by at most 0.0002 in the joints
+  and 0 in the pose (after rounding to six decimals), with user and tool
+  index 0.
+- With the arm disabled (mode 4 and `enable_status` 0 in every packet), the
+  joint values in the packets (`q_actual`, read at the guide's offsets) varied
+  by up to 0.014 degrees (j4) over the recording, and `GetAngle()` replies on
+  the same run differed by up to 0.0055 degrees in j4. The fields read as
+  `qd_actual` and `tcp_speed_actual` were not zero in every packet: `qd_actual`
+  took a few discrete values with median 0 and a maximum absolute value of
+  about 66.2 in j4 (in the packet's unit), and `tcp_speed_actual` a maximum
+  absolute value of about 65.4 in z. Non-zero values of both fields were also in the second and third
+  runs' packets. What those fields hold for a disabled arm is not explained by
+  the guide; a later stage should not read them as motion.
+- The Dashboard `reply_s` were 0 to 47 ms, as before.
 
 ## 4. Open points
 
-- A complete observation record: no kinematics pair has been read yet, and the
-  six-parameter `InverseSolution` has not been tried on this controller.
-- Whether the first-connection ending repeats (seen on two runs, after a second
-  connection was opened each time).
+- Whether the first-connection ending repeats beyond these three runs (each
+  time after a second connection was opened), and whether it happens with
+  the arm enabled: a later control stage cannot assume a second monitoring
+  connection on the Dashboard port.
 - The controller version, to be typed into the next run.
 - The mapping of the 6-element feedback arrays to the 4-element replies. The
   tool always reports its comparison as "mapping unverified"; checking it, for
   example at a second pose, is a human step still to be planned.
+- The meaning of the non-zero `qd_actual` / `tcp_speed_actual` fields on a
+  disabled arm (§3.6).
+- The next stage (enable / disable, a first small move, stopping) needs its
+  own reviewed plan; the observation record it needed is now complete.
 
 ## 5. Interrupting a run
 
