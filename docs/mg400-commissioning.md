@@ -21,8 +21,12 @@ The Dashboard port 29999 accepts commands that change the arm's state
 no protection by itself. The tool builds only six read-only commands from typed
 numbers and checks the final text against an exact-form allowlist before it is
 written; it reads the feedback port 30004 and never opens the motion port
-30003. Enabling, a first small move and stopping are a later stage with its
-own reviewed plan; they need the complete observation record first.
+30003. After the observation record was complete, a second tool was
+implemented to its own reviewed plan: `jog.py` (`src/devices/mg400/README.md`,
+"Jog tool"), which enables the arm, makes one small joint move and back, and
+disables it. It has not been run on the arm yet (§4). The observation tool
+itself stayed read-only; the control commands it shares a module with are
+refused on its connections.
 
 ## 2. Order of work
 
@@ -37,6 +41,24 @@ disconnected.
    subnet. The address belongs in your own notes, never in tracked files.
 4. The real run, with `--out` pointing **outside** any synced folder
    (see §3.3), and `--controller-version` as DobotStudio Pro shows it.
+
+The jog tool comes after a complete observation record, and only on the
+human's request in the session:
+
+5. `python -m src.devices.mg400.jog --dry-run`, then `--mock`.
+6. In DobotStudio Pro: the arm disabled, no alarm, nothing on the flange; note
+   the playback joint speed / acceleration and the global speed ratio (the tool
+   bounds only the ratio in its command); then close DobotStudio Pro.
+7. Check that the arc of the rotation (default J1 +5 deg and back; at most
+   10 deg) is clear for the whole arm and its cables, and that the emergency-
+   stop button is within reach. Stay at the arm for the run.
+8. The real run: `python -m src.devices.mg400.jog <arm IP> --controller-version
+   <V> --note "<speed settings>" --out <folder outside any synced folder>`. The
+   tool prints the plan and waits for Enter; the human presses it. Ctrl+C after
+   that starts the tool's orderly stop (ResetRobot, DisableRobot, then
+   EmergencyStop unless the arm showed itself disabled, or in alarm with its
+   joints still, and the Enable's outcome is known); it is not the emergency
+   stop, the button is.
 
 ## 3. What the bench showed
 
@@ -184,11 +206,40 @@ ran to the end (`complete: true`). What it added:
   example at a second pose, is a human step still to be planned.
 - The meaning of the non-zero `qd_actual` / `tcp_speed_actual` fields on a
   disabled arm (§3.6).
-- The next stage (enable / disable, a first small move, stopping) needs its
-  own reviewed plan; the observation record it needed is now complete.
+- What the jog tool will show on the bench, none of it yet observed: whether
+  `ResetRobot()` on a disabled arm answers 0 and leaves it disabled; how long
+  `EnableRobot()` takes to show mode 5 on the Dashboard and in the feedback;
+  whether `JointMovJ` at a 10 % ratio is accepted, how its echo looks (the
+  guide's Return line shows the joints only), how long a 5 deg J1 move takes
+  and whether `RobotMode()` shows 7 during it; whether J2 / J3 stay; whether
+  the arm returns to the start joints within the 0.2 deg tolerance; how long
+  `DisableRobot()` takes; whether the Dashboard and motion connections survive.
+  The jog tool's limits (J1 / J4 only, 1..10 deg, ratio at most 30 %) are
+  design choices, not measurements, and its speed is bounded only relative to
+  the controller's own settings.
 
 ## 5. Interrupting a run
 
 Ctrl+C ends the observation only: the tool sends nothing to the arm and it is
 not an emergency stop. Use the arm's own emergency stop for that. A run that
 ends early leaves `complete: false` in the record, with the reason in `notes`.
+
+In the jog tool, Ctrl+C before the Enter ends the run with no control command
+sent (only the read-only checks before the prompt had gone out). After
+the Enter, and until the arm has reported disabled again (the RobotMode 4 after
+the DisableRobot of step 8), it starts the tool's stop sequence (ResetRobot,
+DisableRobot, polls, then EmergencyStop unless the arm showed itself disabled,
+or in alarm with its reported joints within the stop threshold, and the Enable's
+outcome is known), bounded by 15 s, during which a second Ctrl+C is ignored.
+After that RobotMode 4 a fault or Ctrl+C adds no stop sequence (only the final read-only
+queries follow). After the Enter a Ctrl+C
+is taken before the tool's next send (within 0.1 s normally, about 6 s at most: the send
+and reply timeouts of the command in progress), never in the middle of a send.
+In both cases the record is then written (normally a few seconds); one more Ctrl+C
+during that is deferred to its end, a second one ends it at once, with the record
+possibly incomplete. A Ctrl+C after that gives exit 130 with the advice to check the
+arm and the record; only while that advice is printed and while the process itself exits
+after it is a Ctrl+C Python's own (a traceback, the record written). It is still not an
+emergency stop: that is the button on the controller. The record's `stop`
+section says what was sent, what the arm answered, and which `stop_state` was
+reached; the printed guidance line says what the human should do next.
