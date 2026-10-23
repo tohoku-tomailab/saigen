@@ -82,10 +82,12 @@ def _finite(value):
     """Copy for JSON: non-finite floats become None (the raw packets keep the bytes)"""
     if isinstance(value, float) and not math.isfinite(value):
         return None
+    # list(...) snapshots a container in one C call: the jog tool saves from a background
+    # thread while the main thread still adds to the report
     if isinstance(value, dict):
-        return {k: _finite(v) for k, v in value.items()}
+        return {k: _finite(v) for k, v in list(value.items())}
     if isinstance(value, (list, tuple)):
-        return [_finite(v) for v in value]
+        return [_finite(v) for v in list(value)]
     return value
 
 
@@ -245,13 +247,24 @@ class Dashboard:
     in their exact form; every RobotMode / GetErrorID reply on any connection is judged at once"""
 
     def __init__(self, sock: socket.socket, recorder: Recorder, label: str,
-                 guard: Optional[Callable[[], None]] = None, port: Optional[int] = None):
+                 guard: Optional[Callable[[], None]] = None, port: Optional[int] = None,
+                 control: bool = False, strict_record: bool = True):
         self._sock = sock
         self._guard = guard            # called right before every send; raises to stop it
         self._reader = protocol.ReplyReader()
         self._pending: List[protocol.Reply] = []
         self._rec = recorder
         self.label = label
+        # control=True (the jog tool only) lets protocol.CONTROL commands pass; the
+        # observation tool never sets it. judge_mode decides what a RobotMode reply means
+        # (the default ends the observation unless 4); strict_record=False lets a send go
+        # out although the record could not be saved (the jog tool's stop connection)
+        self.control = control is True
+        self.judge_mode: Callable[[int], None] = judge_mode
+        self.strict_record = strict_record
+        self.names: Optional[frozenset] = None     # if set, the only command names this connection may send
+        self.guard = guard
+        self.outstanding = 0                       # commands written whose reply was not read
         self.last_reply: Optional[tuple] = None           # (utc, monotonic) of the last reply
         # the connection's record; on disk with the next save, before anything is sent on it
         self.conn = {"label": label, "port": port, "opened_utc": _utc(),
@@ -279,7 +292,9 @@ class Dashboard:
     def write(self, command: Command, tag: Optional[str] = None) -> dict:
         if not isinstance(command, Command):
             raise TypeError("only protocol.Command objects can be sent")
-        protocol.check_command(command.text, command.name)
+        protocol.check_command(command.text, command.name, control=self.control)
+        if self.names is not None and command.name not in self.names:
+            raise ValueError(f"{command.name} may not be sent on {self.label}")
         entry = {"id": len(self._rec.report["commands"]) + 1, "connection": self.label,
                  "command": command.text, "planned_utc": _utc(), "reply": None}
         if tag is not None:
@@ -287,13 +302,19 @@ class Dashboard:
         self._rec.report["commands"].append(entry)       # recorded before the bytes leave
         try:
             self._rec.save()
+        except MG400RecordError as e:
+            if self.strict_record:
+                _attribute(e, entry)
+                raise
+            entry["record_error"] = str(e)                # noted; the stop command still goes
         except BaseException as e:
             _attribute(e, entry)
             raise
         try:
-            if self._guard is not None:
-                self._guard()
+            if self.guard is not None:
+                self.guard()
             entry["sent_utc"], entry["sent_monotonic"] = _utc(), time.monotonic()
+            self.outstanding += 1                  # before sendall: an interrupted send may have arrived
             try:
                 self._sock.sendall(command.text.encode("ascii"))
             except OSError as e:
@@ -305,9 +326,28 @@ class Dashboard:
             raise
         return entry
 
-    def _recv(self) -> bytes:
+    @property
+    def clean(self) -> bool:
+        """No request without its reply, no unread or partial reply bytes, no end seen"""
+        return (self.outstanding == 0 and not self._pending and not self._reader.pending
+                and "end_seen" not in self.conn)
+
+    def _recv(self, deadline: Optional[float] = None) -> bytes:
+        """One read; ``deadline`` (monotonic) bounds the whole reply, not only this read: a
+        peer that trickles bytes cannot stretch a reply beyond the socket timeout"""
         try:
-            data = self._sock.recv(4096)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("reply deadline")
+                base = self._sock.gettimeout()
+                self._sock.settimeout(min(base, remaining) if base is not None else remaining)
+                try:
+                    data = self._sock.recv(4096)
+                finally:
+                    self._sock.settimeout(base)
+            else:
+                data = self._sock.recv(4096)
         except OSError as e:
             raise self._connection_error("recv", e) from e
         if not data:
@@ -318,20 +358,34 @@ class Dashboard:
             raise err
         return data
 
-    def read(self, command: Command, entry: dict) -> protocol.Reply:
+    def read(self, command: Command, entry: dict, deadline: Optional[float] = None) -> protocol.Reply:
+        """``deadline`` (monotonic, optional) caps the whole reply in addition to the socket
+        timeout: the jog tool's stop sequence passes its total deadline"""
         try:
+            timeout = self._sock.gettimeout()
+            own = time.monotonic() + timeout if timeout is not None else None
+            if deadline is not None:
+                deadline = min(deadline, own) if own is not None else deadline
+            else:
+                deadline = own
             while not self._pending:
-                self._pending.extend(self._reader.feed(self._recv()))
+                self._pending.extend(self._reader.feed(self._recv(deadline)))
             reply = self._pending.pop(0)
+            self.outstanding = max(0, self.outstanding - 1)
             now = time.monotonic()
             entry.update(reply=reply.raw, reply_utc=_utc(),
                          reply_s=round(now - entry["sent_monotonic"], 4))
             self.last_reply = (entry["reply_utc"], now)
             entry["echo_note"] = protocol.check_echo(reply, command)
+            if deadline is not None and time.monotonic() > deadline:
+                # read (and recorded) but past the deadline, whether the bytes or the checks
+                # above took it there: the caller must not act on it as a success
+                raise MG400ConnectionError(f"{self.label}: reply after the deadline", label=self.label,
+                                           op="recv", kind="timeout")
             if reply.error_id != 0:
                 raise protocol.MG400CommandError(f"{command.text} -> ErrorID {reply.error_id}")
             if command.name == "RobotMode":
-                judge_mode(protocol.parse_robot_mode(reply.values))
+                self.judge_mode(protocol.parse_robot_mode(reply.values))
             elif command.name == "GetErrorID":
                 judge_errors(protocol.parse_error_ids(reply.values))
             elif command.name in LENGTHS:
@@ -345,13 +399,22 @@ class Dashboard:
             raise
         try:
             self._rec.save()
+        except MG400RecordError as e:
+            if self.strict_record:
+                _attribute(e, entry)
+                raise
+            entry["record_error"] = str(e)
         except BaseException as e:
             _attribute(e, entry)
             raise
         return reply
 
-    def query(self, command: Command, tag: Optional[str] = None) -> protocol.Reply:
-        return self.read(command, self.write(command, tag))
+    def query(self, command: Command, tag: Optional[str] = None,
+              deadline: Optional[float] = None) -> protocol.Reply:
+        return self.read(command, self.write(command, tag), deadline)
+
+    def set_timeout(self, seconds: float):
+        self._sock.settimeout(seconds)
 
     def close(self):
         if "end_seen" not in self.conn:
@@ -385,6 +448,12 @@ class FeedbackRecorder(threading.Thread):
         self._pw = csv.writer(self._parsed)
         self._pw.writerow(self.COLUMNS)
         self.lock = threading.Lock()
+        # the modes a packet may show without being a fault; the observation keeps {4}, the
+        # jog tool widens it per phase (under the lock). ``narrow`` = (monotonic time, set):
+        # from that time on, packets are judged by that set instead (the jog tool's grace
+        # for packets of the previous phase, evaluated here, in the receiving thread)
+        self.allowed_modes = {protocol.MODE_DISABLED}
+        self.narrow: Optional[tuple] = None
         self.latest: Optional[dict] = None
         self.last_valid_t: Optional[float] = None
         self.recv_times: List[float] = []
@@ -434,8 +503,15 @@ class FeedbackRecorder(threading.Thread):
                         self._ended("eof detected")
                         self._fault("feedback connection closed")
                     return
-                t = time.monotonic()
-                wall = int(time.time() * 1000)
+                with self.lock:
+                    # the receive time and the set that applies at it, taken together under the
+                    # lock (a phase change cannot land between the two) and before the file
+                    # writes: a change while this chunk is being written must not re-judge it
+                    t = time.monotonic()
+                    wall = int(time.time() * 1000)
+                    allowed = set(self.allowed_modes)
+                    if self.narrow is not None and t >= self.narrow[0]:
+                        allowed = set(self.narrow[1])
                 for chunk in self._asm.feed(data):
                     self._bin.write(chunk.data)
                     try:
@@ -461,7 +537,7 @@ class FeedbackRecorder(threading.Thread):
                         self.recv_times.append(t)
                         self.timestamps.append(pkt["timestamp_ms"])
                         self.clock_diffs.append(diff)
-                    if pkt["robot_mode"] != protocol.MODE_DISABLED or pkt["error_status"]:
+                    if pkt["robot_mode"] not in allowed or pkt["error_status"]:
                         self._fault(f"feedback packet {chunk.seq}: mode {pkt['robot_mode']}, "
                                     f"error_status {pkt['error_status']}")
                     elif pkt["out_of_range"] or pkt["nonfinite"]:

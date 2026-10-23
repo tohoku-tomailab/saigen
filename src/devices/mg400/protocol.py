@@ -5,13 +5,16 @@ Source: Dobot "TCP_IP Remote Control Interface Guide (4axis)", 2024-04-19
 every reply is ``ErrorID,{values},Name(params);`` where ErrorID 0 means the command
 was received, and ``{values}`` may span several lines and nest (``GetErrorID``).
 
-This module builds **only** the six commands the observation tool may send. None of
-them enables, disables, moves or configures the arm: four read state, two compute
-forward / inverse kinematics (guide section 2.3). Port 29999 also accepts commands that
-change the arm's state (EnableRobot, DisableRobot, ClearError, EmergencyStop ...); the
-allowlist below, not the port, is what keeps the tool read-only. There is no way to send
-free text: each command is built from typed numbers, and :func:`check_command` re-checks
-the final text before it is written.
+This module builds two groups of commands. ``ALLOWED`` are the six read-only commands of
+the observation tool: four read state, two compute forward / inverse kinematics (guide
+section 2.3); none of them enables, disables, moves or configures the arm. ``CONTROL`` are
+the commands of the jog tool (``jog.py``, plan reviewed 2026-10-22): EnableRobot,
+DisableRobot, ResetRobot, EmergencyStop on the Dashboard port and JointMovJ on the motion
+port. A control command is built here like any other, but :func:`check_command` refuses it
+unless the caller passes ``control=True``: the observation tool never does, so its
+connections cannot send one even by mistake. There is no way to send free text: each
+command is built from typed numbers, and :func:`check_command` re-checks the final text
+before it is written.
 """
 import json
 import math
@@ -20,6 +23,13 @@ from typing import List, NamedTuple, Optional, Sequence
 
 ALLOWED = ("RobotMode", "GetErrorID", "GetPose", "GetAngle",
            "PositiveSolution", "InverseSolution")
+#: commands that change the arm's state; refused unless check_command(..., control=True)
+CONTROL = ("EnableRobot", "DisableRobot", "ResetRobot", "EmergencyStop", "JointMovJ")
+#: the control commands that stop or de-energise the arm (never a motion)
+STOP = ("ResetRobot", "DisableRobot", "EmergencyStop")
+#: the only motion command, on port 30003; its speed / acceleration ratio is capped here
+MOTION = ("JointMovJ",)
+MAX_SPEED_RATIO = 30                # % of the controller's playback setting x global ratio
 
 #: RobotMode values (guide section 2.3)
 ROBOT_MODES = {1: "INIT", 2: "BRAKE_OPEN", 3: "POWER_STATUS", 4: "DISABLED", 5: "ENABLE",
@@ -43,6 +53,13 @@ _EXACT = {
     # bench controller refused it (ErrorID -20000, parameter number, 2026-10-21): only the
     # six-parameter form, whose solution is the one nearest the arm's current joint angles
     "InverseSolution": re.compile(rf"InverseSolution\({_J4},0,0\)"),
+    # control commands (jog tool only): no parameters, so no load or offset can be typed in
+    "EnableRobot": re.compile(r"EnableRobot\(\)"),
+    "DisableRobot": re.compile(r"DisableRobot\(\)"),
+    "ResetRobot": re.compile(r"ResetRobot\(\)"),
+    "EmergencyStop": re.compile(r"EmergencyStop\(\)"),
+    # absolute joint target with the speed and acceleration ratio always given, equal, 1..30 %
+    "JointMovJ": re.compile(rf"JointMovJ\({_J4},SpeedJ=(?P<s>[1-9]|[12]\d|30),AccJ=(?P=s)\)"),
 }
 _NAME_RE = re.compile(r"([A-Za-z]+)\(")
 
@@ -75,6 +92,10 @@ class Command(NamedTuple):
     name: str
     text: str
 
+    @property
+    def control(self) -> bool:
+        return self.name in CONTROL
+
 
 def _number(value, what: str) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -94,16 +115,20 @@ def _joints(values: Sequence, what: str) -> List[str]:
     return [_number(v, f"{what} J{i + 1}") for i, v in enumerate(values)]
 
 
-def check_command(text: str, name: Optional[str] = None) -> str:
+def check_command(text: str, name: Optional[str] = None, control: bool = False) -> str:
     """Exactly one allowed command in exactly the form its builder produces (finite
     numbers with six decimals, the fixed frame arguments, nothing before or after).
-    ``name``, if given, must be the command's name. Returns the name; raises ValueError"""
+    ``name``, if given, must be the command's name. A ``CONTROL`` command passes only with
+    ``control=True`` (the jog tool's connections); the observation tool never passes it.
+    Returns the name; raises ValueError"""
     if not isinstance(text, str):
         raise ValueError(f"command must be text: {text!r}")
     m = _NAME_RE.match(text)
-    if not m or m.group(1) not in ALLOWED:
-        raise ValueError(f"command {text[:40]!r} is not allowed (read-only tool)")
+    if not m or m.group(1) not in ALLOWED + CONTROL:
+        raise ValueError(f"command {text[:40]!r} is not allowed")
     found = m.group(1)
+    if found in CONTROL and control is not True:
+        raise ValueError(f"{found} changes the arm's state: refused on a read-only connection")
     if not _EXACT[found].fullmatch(text):
         raise ValueError(f"not the exact form of {found}: {text!r}")
     if name is not None and name != found:
@@ -117,8 +142,41 @@ def check_command(text: str, name: Optional[str] = None) -> str:
 
 def _build(name: str, params: str) -> Command:
     text = f"{name}({params})"
-    check_command(text, name)
+    check_command(text, name, control=name in CONTROL)
     return Command(name, text)
+
+
+# -- control commands (jog tool only; a connection must be opened with control=True) ------
+def enable_robot() -> Command:
+    """``EnableRobot()`` without load or offset (the controller keeps its own setting)"""
+    return _build("EnableRobot", "")
+
+
+def disable_robot() -> Command:
+    return _build("DisableRobot", "")
+
+
+def reset_robot() -> Command:
+    """``ResetRobot()``: stop the arm and clear the planned command queue (guide 2.1)"""
+    return _build("ResetRobot", "")
+
+
+def emergency_stop() -> Command:
+    """``EmergencyStop()``: the arm powers off and alarms; the alarm must be cleared by the
+    human (DobotStudio Pro) before the arm can be enabled again"""
+    return _build("EmergencyStop", "")
+
+
+def joint_mov_j(joints: Sequence, speed_ratio: int) -> Command:
+    """``JointMovJ(j1,j2,j3,j4,SpeedJ=s,AccJ=s)``: absolute joint target (deg) with the
+    speed and acceleration ratio ``s`` in 1..MAX_SPEED_RATIO (guide 3: the actual speed is
+    this ratio x the playback setting x the global ratio)"""
+    if isinstance(speed_ratio, bool) or not isinstance(speed_ratio, int):
+        raise ValueError(f"speed ratio must be an integer: {speed_ratio!r}")
+    if not 1 <= speed_ratio <= MAX_SPEED_RATIO:
+        raise ValueError(f"speed ratio must be 1..{MAX_SPEED_RATIO}: {speed_ratio}")
+    return _build("JointMovJ", ",".join(_joints(joints, "JointMovJ")
+                                        + [f"SpeedJ={speed_ratio}", f"AccJ={speed_ratio}"]))
 
 
 def robot_mode() -> Command:
@@ -177,8 +235,13 @@ def check_echo(reply: Reply, command: Command) -> Optional[str]:
     _, sent = _echo_parts(command.text)
     if params.replace(" ", "") == sent:
         return None
-    if params.strip() == "":
+    if params.strip() == "" and command.name not in MOTION:
         return "echo without parameters"
+    # the guide's Return line for JointMovJ shows the joints only: the optional SpeedJ / AccJ
+    # may be left out of the echo, but the joints must be there (a motion reply must name
+    # its target)
+    if command.name in MOTION and sent.startswith(params.replace(" ", "") + ",SpeedJ="):
+        return "echo without optional parameters"
     raise MG400ProtocolError(f"reply to {command.text!r} echoes other parameters: {reply.echo!r}")
 
 

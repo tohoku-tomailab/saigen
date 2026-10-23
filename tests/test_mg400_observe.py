@@ -87,12 +87,8 @@ def test_the_dashboard_writes_only_command_objects():
     assert Sock.sent == []
 
 
-def test_no_motion_port_anywhere_in_the_package():
-    folder = os.path.join(REPO_ROOT, "src", "devices", "mg400")
-    for name in os.listdir(folder):
-        if name.endswith(".py"):
-            with open(os.path.join(folder, name), encoding="utf-8") as f:
-                assert "30003" not in f.read(), name
+# the motion port and the control commands: tests/test_mg400_jog.py checks (by AST) that
+# observe.py never names the port, never arms a connection and never builds a control command
 
 
 # ----------------------------------------------------------------------
