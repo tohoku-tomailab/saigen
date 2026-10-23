@@ -53,13 +53,9 @@ Configuration (environment variables, all optional except the host):
                                ``{"type": "auth", "token": ...}`` as the first
                                line of every connection; it must equal
                                SENSOR_DASHBOARD_PI_TOKEN on the PC.
-    SENSOR_AGENT_TEMP_OFFSET_C  Added to the BME280 temperature reading before it
-                               is sent, in degrees C. Default: 0.0. Use this to
-                               compensate a sensor's self-heating bias, as
-                               determined by calibration against a reference.
 
-Command-line arguments ``--host``, ``--port``, ``--interval`` and
-``--temp-offset`` override the corresponding environment variables. If neither an env var nor ``--host`` is
+Command-line arguments ``--host``, ``--port`` and ``--interval`` override the
+corresponding environment variables. If neither an env var nor ``--host`` is
 given, the agent prints an error and exits with status 1 instead of guessing an
 address. It also exits with status 1 when the I2C bus cannot be opened or no
 sensor answers at all, so systemd restarts it and the failure is visible.
@@ -496,7 +492,6 @@ def parse_args():
     parser.add_argument("--host", default=None, help="Dashboard PC hostname or IP (overrides SENSOR_AGENT_PC_HOST)")
     parser.add_argument("--port", type=int, default=None, help="Dashboard TCP port (overrides SENSOR_AGENT_PC_PORT, default 50001)")
     parser.add_argument("--interval", type=float, default=None, help="Seconds between samples (overrides SENSOR_AGENT_INTERVAL_S, default 0.1)")
-    parser.add_argument("--temp-offset", type=float, default=None, help="Degrees C added to the BME280 temperature (overrides SENSOR_AGENT_TEMP_OFFSET_C, default 0.0)")
     return parser.parse_args()
 
 
@@ -507,11 +502,10 @@ def resolve_config(args):
         sys.exit(1)
     port = args.port if args.port is not None else int(os.environ.get("SENSOR_AGENT_PC_PORT", "50001"))
     interval = args.interval if args.interval is not None else float(os.environ.get("SENSOR_AGENT_INTERVAL_S", "0.1"))
-    temp_offset = args.temp_offset if args.temp_offset is not None else float(os.environ.get("SENSOR_AGENT_TEMP_OFFSET_C", "0.0"))
-    return host, port, interval, temp_offset
+    return host, port, interval
 
 
-def start_agent(host, port, interval, token=None, temp_offset=0.0):
+def start_agent(host, port, interval, token=None):
     """Run the sampling loop forever. Returns a non-zero exit status on a fatal error."""
     import platform
     my_name = platform.node()  # local hostname, sent with each sample
@@ -547,7 +541,6 @@ def start_agent(host, port, interval, token=None, temp_offset=0.0):
                     s.sendall(auth_line(token))
                 while True:
                     t, h = bme.read_data()
-                    t += temp_offset
                     acc, gyr = imu.read_accel_gyro()
                     lx = light.read_raw_ch0()
                     uvv = uv.read_uv()
@@ -564,7 +557,5 @@ def start_agent(host, port, interval, token=None, temp_offset=0.0):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    _host, _port, _interval, _temp_offset = resolve_config(parse_args())
-    sys.exit(start_agent(_host, _port, _interval,
-                         token=os.environ.get("SENSOR_AGENT_TOKEN") or None,
-                         temp_offset=_temp_offset))
+    _host, _port, _interval = resolve_config(parse_args())
+    sys.exit(start_agent(_host, _port, _interval, os.environ.get("SENSOR_AGENT_TOKEN") or None))

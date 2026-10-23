@@ -148,10 +148,6 @@ not directly comparable with new ones at humidity far from 50 %RH.
    # then edit SENSOR_AGENT_PC_HOST on the Pi to your PC's real address
    # (and SENSOR_AGENT_TOKEN if the PC sets SENSOR_DASHBOARD_PI_TOKEN)
    ```
-   The example file also documents optional tuning variables, including
-   `SENSOR_AGENT_TEMP_OFFSET_C` (degrees C added to the BME280 reading, to
-   compensate that sensor's self-heating bias as determined by calibration;
-   default `0.0`).
 8. Install and enable the systemd service:
    ```bash
    ssh pi@<pi-host> "sudo cp ~/sensor-agent.service /etc/systemd/system/ && \
