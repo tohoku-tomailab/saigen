@@ -15,6 +15,10 @@ tube B with the same liquid until both tubes weigh the same within a tolerance (
 Both 50 mL tubes stand open in a rack on the balance for the whole run; the
 operator places them, the arm never lifts a tube.
 
+Setting it up on another PC with a Dobot, step by step (Japanese):
+[`SETUP_DOBOT_ja.md`](SETUP_DOBOT_ja.md). Positions are read without moving the
+arm by `python -m src.devices.dobot.read_pose` (hand-guide the tip, then `--save NAME`).
+
 ```bash
 cp src/flow/balance_runner/balance.example.csv src/flow/balance_runner/balance.csv   # then edit
 python -m src.flow.balance_runner.run_balance --validate-only   # sheet + workspace, opens nothing

@@ -58,3 +58,4 @@ backups/
 
 # MaxArm taught positions (lab-specific, written by src/devices/maxarm/teach.py)
 maxarm_positions*.json
+dobot_positions*.json
