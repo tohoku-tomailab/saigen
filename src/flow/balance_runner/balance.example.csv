@@ -1,5 +1,5 @@
 parameter,value,note
-robot_id,4,MaxArm robot id in config.yaml (type: maxarm)
+robot_id,4,robot id in config.yaml: a Dobot (dobot_port + picus2_address) or a MaxArm (type: maxarm)
 volume_a_mL,20,volume put into tube A (mL)
 tolerance_g,0.1,stop when |A - B| is at most this (g)
 liquid_density_g_per_mL,1.0,expected density of the liquid (g/mL); used for planning and the density check

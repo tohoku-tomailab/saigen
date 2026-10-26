@@ -1,11 +1,19 @@
-# `src/flow/balance_runner` — centrifuge-tube balancing with the MaxArm
+# `src/flow/balance_runner` — centrifuge-tube balancing with a robot arm
 
 Both tubes already hold a sample. Fills tube A with a fixed volume, then fills
 tube B with the same liquid until both tubes weigh the same within a tolerance (default
-0.1 g). The Hiwonder MaxArm (robot 4, `type: maxarm`) carries a Picus 2
-pipette in a 3D-printed adapter. Both 50 mL tubes stand open in a rack on the
-balance for the whole run; the operator places them, the arm never lifts a
-tube.
+0.1 g). The arm is `robot_id` in `config.yaml`:
+
+- **a Dobot Magician** with its Picus 2 in the usual holder
+  (`cad/pipette-holder/`); `robots.<id>` needs `dobot_port` and
+  `picus2_address`. This is the recommended arm.
+- **a Hiwonder MaxArm** (`type: maxarm`) carrying a Picus 2 in an adapter.
+  Not recommended with a 10 mL Picus 2: on 2026-10-20 a 250 g load held
+  60 mm in front of the nozzle tipped the (unfastened) arm over at
+  (0, −200, 195).
+
+Both 50 mL tubes stand open in a rack on the balance for the whole run; the
+operator places them, the arm never lifts a tube.
 
 ```bash
 cp src/flow/balance_runner/balance.example.csv src/flow/balance_runner/balance.csv   # then edit
@@ -61,19 +69,26 @@ pipette port, 3 a target outside the MaxArm's workspace, 130 interrupted.
 
 ## Before the first real run
 
-These depend on the cell and the adapter and cannot be checked from software.
+These depend on the cell and cannot be checked from software.
 
-- **Payload.** A Picus 2 with a 10 mL tip, the adapter and the USB cable are
+- **Dobot: home pose.** SAIGEN takes the Dobot's pose at connection as its
+  home, and the run starts and ends with `go_home`. Start with the arm
+  parked above everything, clear of the tubes and the reservoir.
+- **Dobot: positions.** Move the tip to each position (hand-guide the arm
+  with the unlock button on its forearm, or jog it) and read the pose, then
+  copy the x, y, z of the tip into `balance.csv`. They are checked against
+  the `workspace` box in `config.yaml` before anything opens.
+- **MaxArm: payload.** A Picus 2 with a 10 mL tip, the adapter and the USB cable are
   far heavier than a suction cup. Jog the arm with the pipette mounted
   (`python -m src.devices.maxarm.teach`) and watch the read-back: the
   client stops a move whose read-back is more than `move_tolerance_mm`
   (10 mm) off. Do not run with an arm that sags.
-- **Height.** The tip must clear the tube rims (balance pan + rack + 115 mm
+- **MaxArm: height.** The tip must clear the tube rims (balance pan + rack + 115 mm
   tube) at `travel_z`, and `travel_z` must be reachable at every position
   (the MaxArm reaches only about 196–210 mm near the top of its workspace;
   `--validate-only` names the highest reachable z for a refused target). A
   riser under the arm or a short adapter may be needed.
-- **Teach the positions** with `teach.py` (jog, `save`) and copy them into
+- **MaxArm: positions.** Teach them with `teach.py` (jog, `save`) and copy them into
   `balance.csv`: reservoir centre and aspiration height, the lowest safe
   aspiration height, tube A and tube B openings, dispense height (tip just
   inside the mouth, above the 45 mL mark), travel height. The values in
@@ -88,7 +103,7 @@ These depend on the cell and the adapter and cannot be checked from software.
   and `stabilization_count` (median of 5 readings) are there for that.
   Increase them if successive readings of a still pan differ.
 - **Pipette port.** Give it with `--pipette-port`, the sheet's
-  `pipette_port`, or `robots.4.picus2_address` in `config.yaml`.
+  `pipette_port`, or `robots.<id>.picus2_address` in `config.yaml`.
 
 The tube-volume, reservoir and density checks are guards, not guarantees:
 liquid that misses a tube but lands on the rack is still weighed and would be

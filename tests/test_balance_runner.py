@@ -25,6 +25,21 @@ SHEET = {
 }
 
 
+DOBOT_PORTS = {3: {"type": "dobot", "dobot_port": "COM99", "picus2_address": "COM98"}}
+DOBOT_SHEET = {
+    "robot_id": "3", "travel_z": "100", "reservoir_x": "200", "reservoir_y": "-120",
+    "reservoir_aspirate_z": "-60", "reservoir_min_z": "-70",
+    "tube_a_x": "230", "tube_a_y": "60", "tube_b_x": "230", "tube_b_y": "95",
+    "dispense_z": "40", "blow_out_after_dispense": "0", "settle_s": "0",
+}
+
+
+def dobot_params(**over):
+    raw = dict(DOBOT_SHEET)
+    raw.update({k: str(v) for k, v in over.items()})
+    return rb.parse_params(raw)
+
+
 def params(**over):
     raw = dict(SHEET)
     raw.update({k: str(v) for k, v in over.items()})
@@ -35,12 +50,12 @@ async def _no_sleep(_s):
     await asyncio.sleep(0)
 
 
-def run_mock(p, tmp_path, **bench_kw):
+def run_mock(p, tmp_path, ports=None, **bench_kw):
     bench = rb.SimulatedBench(p, **bench_kw)
     sheet = tmp_path / "balance.csv"
     sheet.write_text("parameter,value,note\n", encoding="utf-8")
     results = asyncio.run(rb.run_balancing(
-        p, str(sheet), mock=True, robot_ports=ROBOT_PORTS, shared_config={},
+        p, str(sheet), mock=True, robot_ports=ports or ROBOT_PORTS, shared_config={},
         bench=bench, sleep=_no_sleep, logs_dir=str(tmp_path / "logs")))
     return results, bench
 
@@ -157,9 +172,15 @@ class TestPreflight:
         _, problems = rb.preflight(params(reservoir_min_z=30), ROBOT_PORTS)
         assert any("aspiration (lowest)" in p for p in problems)
 
-    def test_non_maxarm_robot_is_refused(self):
-        _, problems = rb.preflight(params(robot_id=1), {1: {"dobot_port": "COM3"}})
-        assert problems and "not a MaxArm" in problems[0]
+    def test_unknown_robot_type_is_refused(self):
+        _, problems = rb.preflight(params(robot_id=1), {1: {"type": "slider"}})
+        assert problems and "'slider'" in problems[0]
+
+    def test_dobot_targets_use_the_dobot_workspace(self):
+        _, problems = rb.preflight(dobot_params(), DOBOT_PORTS)
+        assert problems == []
+        _, problems = rb.preflight(dobot_params(travel_z=400), DOBOT_PORTS)
+        assert problems and any("travel height" in p for p in problems)
 
     def test_run_refuses_before_opening_anything(self, tmp_path):
         with pytest.raises(rb.run_flow.PreflightError):
@@ -244,3 +265,41 @@ class TestMockRun:
         with open(out, encoding="utf-8-sig") as f:
             table = dict(csv.reader(f))
         assert table["balanced"] == "True" and table["volume_a_mL"] == "20.0"
+
+
+class TestDobot:
+    def test_mock_run_on_a_dobot(self, tmp_path):
+        results, bench = run_mock(dobot_params(), tmp_path, ports=DOBOT_PORTS)
+        assert results["balanced"], results.get("error")
+        assert abs(bench.gross("A") - bench.gross("B")) <= 0.11
+        import json
+        with open(os.path.join(results["log_dir"], "metadata.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        assert "dobot" in json.dumps(meta)
+
+    def test_real_dobot_needs_its_port(self, tmp_path):
+        ports = {3: {"type": "dobot", "picus2_address": "COM98"}}
+        with pytest.raises(ValueError, match="dobot_port"):
+            asyncio.run(rb.run_balancing(dobot_params(), "x.csv", mock=False, robot_ports=ports,
+                                         shared_config={}, pipette_port="COM98",
+                                         logs_dir=str(tmp_path)))
+        assert not os.listdir(tmp_path)
+
+    def test_pipette_port_override_reaches_the_dobot(self, tmp_path):
+        seen = {}
+
+        def factory(robot_id, *, use_picus2, ports, workspace_validator):
+            seen.update(ports=ports, use_picus2=use_picus2)
+            raise RuntimeError("stop here")
+
+        from src.flow import experiment_session as es
+        orig = es.default_robot_factory
+        es.default_robot_factory = factory
+        try:
+            results = asyncio.run(rb.run_balancing(
+                dobot_params(), "x.csv", mock=False, robot_ports=DOBOT_PORTS, shared_config={},
+                pipette_port="COM42", logs_dir=str(tmp_path)))
+        finally:
+            es.default_robot_factory = orig
+        assert not results["balanced"]
+        assert seen["use_picus2"] is True and seen["ports"]["picus2_address"] == "COM42"

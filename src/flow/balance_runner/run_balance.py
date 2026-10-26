@@ -1,8 +1,9 @@
 """
-run_balance.py - balance two 50 mL centrifuge tubes with the MaxArm and a pipette
+run_balance.py - balance two 50 mL centrifuge tubes with a robot arm and a pipette
 
-The MaxArm (``type: maxarm`` robot, robot 4 by default) carries a Picus 2 pipette
-in a 3D-printed adapter. Both tubes stand open in a rack on the balance for the
+The arm is ``robot_id`` in config.yaml: a Dobot Magician with its Picus 2
+(``picus2_address`` of that robot), or a MaxArm (``type: maxarm``) carrying a
+Picus 2 in an adapter. Both tubes stand open in a rack on the balance for the
 whole run; the operator places them, the arm never lifts a tube.
 
     python -m src.flow.balance_runner.run_balance --validate-only   # check the sheet, open nothing
@@ -28,8 +29,8 @@ Sequence:
 
 The balance is read only with the tip lifted to ``travel_z`` and after
 ``settle_s``. Every absolute target (reservoir, both tubes, at working and
-travel height, and the lowest aspiration height) is checked against the MaxArm
-workspace and its inverse kinematics before any device is opened.
+travel height, and the lowest aspiration height) is checked against the robot's
+workspace (a MaxArm's also against its inverse kinematics) before any device is opened.
 
 Exit codes: 0 balanced, 1 not balanced / run failed, 2 bad sheet, 3 workspace
 violation, 130 interrupted (Ctrl+C = emergency stop, the arm halts where it is).
@@ -71,8 +72,11 @@ LOGS_DIR = os.path.join(_REPO_ROOT, "logs")
 WORKFLOW_NAME = "tube_balancing"
 WORKFLOW_DESCRIPTION = (
     "Centrifuge-tube balancing: tube A gets a fixed volume, tube B the same liquid "
-    "until both tubes weigh the same (MaxArm + pipette, both tubes in a rack on the balance)"
+    "until both tubes weigh the same (robot arm + pipette, both tubes in a rack on the balance)"
 )
+
+#: Robot types the runner can drive.
+SUPPORTED_TYPES = ("dobot", "maxarm")
 
 #: Smallest / largest volume the pipette handles in one stroke (same as LabRobot).
 MIN_ML = LabRobot.DEFAULT_MIN_PIPETTE_VOLUME
@@ -103,7 +107,7 @@ class BalanceError(RuntimeError):
 REQUIRED = object()
 
 #: name -> (type, min, max, default). min/max None = unchecked here (coordinates
-#: are checked by the MaxArm workspace validator instead).
+#: are checked by the robot's workspace validator instead).
 PARAM_SPECS: Dict[str, tuple] = {
     "robot_id":                 (int,   1,    9,     4),
     "volume_a_mL":              (float, MIN_ML, 50.0, 20.0),
@@ -254,17 +258,26 @@ def motion_targets(params: dict) -> List[Tuple[str, float, float, float]]:
     ]
 
 
+def robot_ports_for(params: dict, robot_ports: dict) -> dict:
+    rid = params["robot_id"]
+    return robot_ports.get(rid) or robot_ports.get(str(rid)) or {}
+
+
 def preflight(params: dict, robot_ports: dict) -> Tuple[object, List[str]]:
     """Check the robot type and every target; open no device.
+
+    A Dobot's targets are checked against its workspace box (the same check its
+    ``move_xyz`` does); a MaxArm's also against the arm's inverse kinematics.
 
     Returns:
         (validator, problems). ``problems`` is empty when the run may start.
     """
     rid = params["robot_id"]
-    ports = robot_ports.get(rid) or robot_ports.get(str(rid)) or {}
-    if robot_type(ports) != "maxarm":
-        return None, [f"robot {rid} is not a MaxArm (config.yaml robots.{rid}.type must be "
-                      "'maxarm')"]
+    ports = robot_ports_for(params, robot_ports)
+    rtype = robot_type(ports)
+    if rtype not in SUPPORTED_TYPES:
+        return None, [f"robot {rid} is of type '{rtype}'; the runner drives "
+                      + " or ".join(SUPPORTED_TYPES)]
     try:
         validator = validator_for_robot(rid, robot_ports=robot_ports)
     except lab_config.ConfigError as e:
@@ -676,9 +689,7 @@ def resolve_pipette_port(params: dict, robot_ports: dict, cli_port: Optional[str
         return cli_port
     if params.get("pipette_port"):
         return params["pipette_port"]
-    rid = params["robot_id"]
-    ports = robot_ports.get(rid) or robot_ports.get(str(rid)) or {}
-    return ports.get("picus2_address") or ""
+    return robot_ports_for(params, robot_ports).get("picus2_address") or ""
 
 
 async def run_balancing(params: dict, csv_path: str, *, mock: bool, robot_ports: dict,
@@ -691,9 +702,16 @@ async def run_balancing(params: dict, csv_path: str, *, mock: bool, robot_ports:
     if problems:
         raise run_flow.PreflightError(None, "; ".join(problems))
     rid = params["robot_id"]
+    rtype = robot_type(robot_ports_for(params, robot_ports))
     if not mock and not pipette_port:
         raise ValueError(f"no pipette port: give --pipette-port, the sheet's pipette_port, or "
                          f"robots.{rid}.picus2_address in config.yaml")
+    if not mock and rtype == "dobot" and not robot_ports_for(params, robot_ports).get("dobot_port"):
+        raise ValueError(f"robot {rid} has no dobot_port in config.yaml (robots.{rid})")
+    if rtype == "dobot" and pipette_port:
+        # the Dobot's own LabRobot opens its pipette from robots.<id>.picus2_address
+        robot_ports = {**robot_ports, rid: {**robot_ports_for(params, robot_ports),
+                                            "picus2_address": pipette_port}}
 
     if mock and bench is None:
         bench = SimulatedBench(params)
@@ -704,7 +722,7 @@ async def run_balancing(params: dict, csv_path: str, *, mock: bool, robot_ports:
 
     exp_logger = ExperimentLogger(WORKFLOW_NAME, WORKFLOW_DESCRIPTION, csv_path,
                                   base_dir=logs_dir, mode="mock" if mock else "real")
-    exp_logger.record_resources([rid], [rid], robot_types={rid: "maxarm"})
+    exp_logger.record_resources([rid], [rid], robot_types={rid: rtype})
     logger.info(f"experiment log folder: {exp_logger.dir}")
 
     session_kwargs = {}
@@ -715,16 +733,21 @@ async def run_balancing(params: dict, csv_path: str, *, mock: bool, robot_ports:
     holder = {"pipette": None, "run": None}
 
     async def body():
-        arm = await session.add_robot(rid)
         if mock:
+            arm = await session.add_robot(rid)
             bench.arm = arm
             pipette = BenchPipette(bench)
+        elif rtype == "dobot":
+            # the Dobot's LabRobot carries the pipette; the session closes both
+            arm = pipette = await session.add_robot(rid, use_picus2=True)
         else:
+            arm = await session.add_robot(rid)
             pipette = LabRobot(use_dobot=False, use_picus2=True, picus2_address=pipette_port,
                                picus2_connection_type="usb")
-        holder["pipette"] = pipette
-        if not await pipette.initialize():
-            raise RuntimeError("the pipette did not initialise")
+        if pipette is not arm:
+            holder["pipette"] = pipette
+            if not await pipette.initialize():
+                raise RuntimeError("the pipette did not initialise")
         scale = await session.add_shared(use_scale=True)
         run = BalanceRun(params, arm, pipette, scale, operator or terminal_operator,
                          exp_logger=exp_logger, sleep=sleep)
@@ -765,7 +788,7 @@ async def run_balancing(params: dict, csv_path: str, *, mock: bool, robot_ports:
 # CLI
 # ======================================================================
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Balance two centrifuge tubes with the MaxArm and a pipette")
+    p = argparse.ArgumentParser(description="Balance two centrifuge tubes with a robot arm and a pipette")
     p.add_argument("--csv", default=None,
                    help="parameter sheet (default: balance.csv here, else balance.example.csv)")
     p.add_argument("--mock", action="store_true", help="simulated arm, pipette and balance")
@@ -774,6 +797,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pipette-port", default=None,
                    help="Picus 2 port (default: sheet pipette_port, then robots.<id>.picus2_address)")
     p.add_argument("--maxarm-port", default=None, help="MaxArm port (default: config.yaml)")
+    p.add_argument("--dobot-port", default=None, help="Dobot port (default: config.yaml)")
     p.add_argument("--scale-port", default=None, help="balance port (default: SCALE_PORT / config.yaml)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(camera_index=None)
@@ -798,6 +822,8 @@ def main(argv=None) -> int:
     rid = params["robot_id"]
     if args.maxarm_port:
         setattr(args, f"robot{rid}_maxarm", args.maxarm_port)
+    if args.dobot_port:
+        setattr(args, f"robot{rid}_dobot", args.dobot_port)
     try:
         robot_ports, shared_config = run_flow.resolve_ports(args)
     except lab_config.ConfigError as e:
