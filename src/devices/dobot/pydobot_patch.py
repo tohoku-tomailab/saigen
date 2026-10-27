@@ -42,6 +42,12 @@ pydobot (1.3.2) の通信部分を差し替えるモンキーパッチ
     初期化コマンドが失敗したときに、開いたシリアルポートを閉じてから例外を再送出
     する（Windows では閉じないと COM ポートが掴まれたままになる）。
 
+``pydobot.dobot.serial.Serial`` （接続時のリセット・無応答対策）
+    pyserial の既定の open は RTS / DTR を立てる。CP2102N の個体ではこれでコントローラ
+    がリセットされ、CH9102 (1A86:55D4) の個体でも、上流の open の直後から電源を入れ
+    直すまで一切応答しなくなった（2026-10-27, 最初のコマンド id=240 が無応答）。
+    read_pose.open_quiet と同じく、RTS / DTR を下げたまま開く。
+
 著作権表示:
     差し替え対象のメソッドは pydobot (https://github.com/luismesas/pydobot)
     Copyright 2017 Luis Mesas, MIT License に由来する。全文は
@@ -273,6 +279,32 @@ def _patched_send_command(self, msg, wait=False):
         time.sleep(QUEUE_POLL_INTERVAL_S)
 
 
+def open_serial_quiet(port, **settings):
+    """``serial.Serial(port, **settings)`` と同じポートを、RTS / DTR を立てずに開く。"""
+    import serial
+    ser = serial.Serial()
+    ser.port = port
+    for name, value in settings.items():
+        setattr(ser, name, value)
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    return ser
+
+
+def _quiet_serial_module():
+    """Serial だけを open_serial_quiet に差し替え、ほかは本物の serial を見せるモジュール。"""
+    import types
+
+    import serial
+
+    module = types.ModuleType("serial_quiet_open")
+    module.__getattr__ = lambda name: getattr(serial, name)
+    module.Serial = open_serial_quiet
+    module._saigen_patched = True
+    return module
+
+
 def _wrap_init(orig_init):
     def __init__(self, *args, **kwargs):
         try:
@@ -296,10 +328,13 @@ def apply_pydobot_patch() -> bool:
     モジュール全体が読み込めなくなるのを避けるため、False を返すだけにする。
     """
     try:
+        import pydobot.dobot as upstream
         from pydobot.dobot import Dobot
     except ImportError:
         logger.warning("pydobot not installed: patch skipped")
         return False
+    if not getattr(upstream.serial, "_saigen_patched", False):
+        upstream.serial = _quiet_serial_module()
     Dobot._send_message = _patched_send_message
     Dobot._read_message = _patched_read_message
     Dobot._send_command = _patched_send_command

@@ -298,8 +298,38 @@ def test_dobot_init_failure_closes_serial(monkeypatch):
 
 def test_patch_is_idempotent():
     init = Dobot.__init__
+    import pydobot.dobot as upstream
+    module = upstream.serial
     assert pp.apply_pydobot_patch()
     assert Dobot.__init__ is init
+    assert upstream.serial is module
+
+
+def test_upstream_opens_port_without_rts_dtr(monkeypatch):
+    """pydobot の open は RTS / DTR を下げた状態で行われる（接続時のリセット対策）。"""
+    import pydobot.dobot as upstream
+    import serial
+
+    events = []
+
+    class RecordingSerial:
+        def __setattr__(self, name, value):
+            events.append((name, value))
+            object.__setattr__(self, name, value)
+
+        def open(self):
+            events.append(("open", None))
+
+    monkeypatch.setattr(serial, "Serial", RecordingSerial)
+    assert upstream.serial.Serial is pp.open_serial_quiet
+    assert upstream.serial.PARITY_NONE == serial.PARITY_NONE   # 定数は本物の serial から
+    upstream.serial.Serial("COMX", baudrate=115200, bytesize=serial.EIGHTBITS)
+    names = [name for name, _ in events]
+    assert names[-1] == "open"
+    assert ("dtr", False) in events and ("rts", False) in events
+    assert names.index("dtr") < names.index("open")
+    assert names.index("rts") < names.index("open")
+    assert ("port", "COMX") in events and ("baudrate", 115200) in events
 
 
 # ---------------------------------------------------------------------------
