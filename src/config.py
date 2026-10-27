@@ -61,6 +61,7 @@ DEFAULTS = {
     },
     "shared_devices": {
         "scale_port": "COM8",
+        "scale_type": "bce8221",
         "camera_index": 0,
         "microscope_index": 2,
         "microscope_port": "",

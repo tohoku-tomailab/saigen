@@ -248,6 +248,7 @@ def default_shared_factory(*, use_scale, use_camera, config, use_microscope=Fals
         use_microscope=use_microscope,
         use_microscope_serial=use_microscope_serial,
         scale_port=config["scale_port"],
+        scale_type=config.get("scale_type", "bce8221"),
         camera_index=config["camera_index"],
         microscope_index=config.get("microscope_index", 2),
         microscope_port=config.get("microscope_port", ""),

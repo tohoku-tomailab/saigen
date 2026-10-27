@@ -61,6 +61,7 @@ robots:
 # Devices shared by all robots.
 shared_devices:
   scale_port: COM8        # BCE8221 balance
+  scale_type: bce8221     # bce8221 = Sartorius BCE822i (9600 8O1), ek610i = A&D EK-610i (2400 7E1)
   camera_index: 0         # webcam used by capture_and_save
   microscope_index: 2     # USB digital microscope (UVC, e.g. 400-CAM106) used by capture_microscope
   microscope_port: ""     # its control serial port (CP210x, e.g. COM10) for microscope_led; "" = no LED control

@@ -58,7 +58,9 @@ class SharedDevices:
             use_microscope_serial: 顕微鏡の制御ポート（LED・フォーカスモーター）を使用するか
                 （microscope_led / microscope_focus）。microscope_port が必要
             **device_configs: デバイス固有の設定
-                - scale_port: str (デフォルト: 'COM4') - BCE8221天秤のCOMポート
+                - scale_port: str (デフォルト: 'COM4') - 天秤のCOMポート
+                - scale_type: str (デフォルト: 'bce8221') - 天秤の機種
+                  ('bce8221' = Sartorius BCE822i, 'ek610i' = A&D EK-610i)
                 - camera_index: int (デフォルト: 1) - Webcamのデバイスインデックス
                 - microscope_index: int (デフォルト: 2) - 顕微鏡のデバイスインデックス
                 - microscope_port: str (デフォルト: '') - 顕微鏡の制御用シリアルポート
@@ -124,25 +126,32 @@ class SharedDevices:
             return False
 
     async def _initialize_scale(self) -> bool:
-        """BCE8221電子天秤を初期化"""
+        """電子天秤を初期化（scale_type: bce8221 = Sartorius BCE822i, ek610i = A&D EK-610i）"""
+        scale_type = (self.device_configs.get('scale_type') or 'bce8221').lower()
         try:
-            logger.info("BCE8221電子天秤を初期化中...")
-            from src.devices.scale.BCE8221 import SerialBalance
+            if scale_type == 'bce8221':
+                from src.devices.scale.BCE8221 import SerialBalance as balance_class
+            elif scale_type == 'ek610i':
+                from src.devices.scale.ek610i_balance import EK610iBalance as balance_class
+            else:
+                logger.error(f"未対応の scale_type です: {scale_type!r} (bce8221 / ek610i)")
+                return False
+            logger.info(f"電子天秤（{scale_type}）を初期化中...")
 
             scale_port = self.device_configs.get('scale_port', 'COM4')
-            self.scale = SerialBalance(port=scale_port)
+            self.scale = balance_class(port=scale_port)
 
             # 接続テスト（重量を取得してみる）
             weight = self.scale.get_weight()
             if weight is None:
-                logger.error("BCE8221電子天秤から重量を取得できませんでした")
+                logger.error(f"電子天秤（{scale_type}）から重量を取得できませんでした")
                 return False
 
-            logger.info(f"✓ BCE8221電子天秤初期化完了: {weight:.3f}g")
+            logger.info(f"✓ 電子天秤（{scale_type}）初期化完了: {weight:.3f}g")
             return True
 
         except Exception as e:
-            logger.error(f"BCE8221電子天秤初期化エラー: {e}")
+            logger.error(f"電子天秤（{scale_type}）初期化エラー: {e}")
             return False
 
     async def _initialize_camera(self) -> bool:
@@ -281,7 +290,7 @@ class SharedDevices:
             raise RuntimeError("BCE8221電子天秤が初期化されていません")
 
         try:
-            logger.info("BCE8221電子天秤を風袋引き中...")
+            logger.info("電子天秤を風袋引き中...")
             self.scale.tare()
             await asyncio.sleep(delay)
             logger.info("✓ 風袋引き完了")
@@ -498,9 +507,9 @@ class SharedDevices:
         try:
             if self.scale:
                 self.scale.close()
-                logger.info("✓ BCE8221電子天秤切断完了")
+                logger.info("✓ 電子天秤切断完了")
         except Exception as e:
-            logger.error(f"BCE8221電子天秤切断エラー: {e}")
+            logger.error(f"電子天秤切断エラー: {e}")
 
         try:
             if self.camera:

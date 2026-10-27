@@ -311,6 +311,8 @@ def settings_to_session_args(settings: dict):
     shared = settings.get("shared") or {}
     shared_config = {
         "scale_port": shared.get("scale_port", ""),
+        # The balance model is not editable in the sidebar; it comes from config.yaml.
+        "scale_type": lab_config.get_shared_devices().get("scale_type", "bce8221"),
         "camera_index": int(shared.get("camera_index", 0) or 0),
     }
     return robot_ports, shared_config
