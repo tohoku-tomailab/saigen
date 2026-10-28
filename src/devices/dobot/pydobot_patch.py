@@ -38,6 +38,12 @@ pydobot (1.3.2) の通信部分を差し替えるモンキーパッチ
     同じ index 値の応答どうし（連続する GET_QUEUED_CMD_CURRENT_INDEX など）は
     プロトコルに通番が無いため区別できない。送信前のフラッシュで大半は防げる。
 
+    完了（index 到達）を確認したら GetAlarmsState を読み、アラームが立っていれば
+    DobotAlarmError を送出する。2026-10-28、関節の限界付近への移動で Dobot が
+    アラーム 0x22（動作中の逆運動学の限界）を出して途中で止まったが、キュー index
+    は進み続け、上流の待機は「移動完了」を返した。続く分注は目標と違う場所で行われ、
+    Dobot の座標も実位置とずれた（復帰には電源の入れ直しとホーミングが必要だった）。
+
 ``Dobot.__init__``
     初期化コマンドが失敗したときに、開いたシリアルポートを閉じてから例外を再送出
     する（Windows では閉じないと COM ポートが掴まれたままになる）。
@@ -66,10 +72,40 @@ DEFAULT_READ_TIMEOUT_S = 2.0
 DEFAULT_MOVE_TIMEOUT_S = 60.0
 QUEUE_POLL_INTERVAL_S = 0.1
 ID_GET_QUEUED_CMD_CURRENT_INDEX = 246
+ID_GET_ALARMS_STATE = 20
+
+#: Dobot Magician のアラーム番号（GetAlarmsState のビット位置）の一部。
+ALARM_NAMES = {
+    0x00: "reset",
+    0x04: "angle sensor",
+    0x10: "planning: inverse kinematics singularity",
+    0x11: "planning: inverse kinematics has no solution",
+    0x12: "planning: inverse kinematics limit",
+    0x20: "motion: inverse kinematics singularity",
+    0x21: "motion: inverse kinematics has no solution",
+    0x22: "motion: inverse kinematics limit (a joint would leave its range)",
+    0x40: "over speed",
+    0x50: "joint 1 positive limit", 0x51: "joint 1 negative limit",
+    0x52: "joint 2 positive limit", 0x53: "joint 2 negative limit",
+    0x54: "joint 3 positive limit", 0x55: "joint 3 negative limit",
+    0x56: "joint 4 positive limit", 0x57: "joint 4 negative limit",
+}
 
 
 class DobotReplyError(ConnectionError):
     """一致する応答がタイムアウト内に得られなかった。"""
+
+
+class DobotAlarmError(RuntimeError):
+    """コマンドの完了後に Dobot がアラームを出していた（アームは目標に届いていないことがある）。"""
+
+    def __init__(self, alarms, what=""):
+        self.alarms = list(alarms)
+        names = ", ".join(f"0x{a:02X} {ALARM_NAMES.get(a, 'unknown')}" for a in self.alarms)
+        super().__init__(
+            f"Dobot alarm after {what or 'a command'}: {names}. The arm may have stopped short "
+            "of its target and its reported pose may be wrong: clear the cause, power-cycle "
+            "and home the Dobot before continuing")
 
 
 class DobotWaitTimeout(TimeoutError):
@@ -244,6 +280,24 @@ def _patched_get_queued_cmd_current_index(self):
     return queue_index(self._send_command(msg).params)
 
 
+def alarm_bits(params) -> list:
+    """GetAlarmsState の応答（ビット列、LSB から）で立っているアラーム番号。"""
+    return [i * 8 + k for i, b in enumerate(bytes(params)) for k in range(8) if b >> k & 1]
+
+
+def read_alarms(dev) -> list:
+    """立っているアラーム番号（読み取りのみ）。"""
+    from pydobot.message import Message
+    msg = Message()
+    msg.id = ID_GET_ALARMS_STATE
+    with dev.lock:
+        dev._send_message(msg)
+        response = dev._read_message(expected_id=ID_GET_ALARMS_STATE)
+    if response is None:
+        raise DobotReplyError("Dobot: no valid reply to GetAlarmsState (id=20)")
+    return alarm_bits(response.params)
+
+
 def _patched_send_command(self, msg, wait=False):
     if wait:
         clear_stop(self)   # 呼び出し側が新しい動作を指示した → 以前の停止要求を下ろす
@@ -270,6 +324,10 @@ def _patched_send_command(self, msg, wait=False):
         except DobotReplyError as e:   # 一時的な通信失敗は期限まで待ち直す
             logger.warning(f"pydobot: queue index poll failed: {e}")
         if current is not None and current >= expected:
+            # index は止まったアームでも進む: 完了をアラームで確かめる
+            alarms = read_alarms(self)
+            if alarms:
+                raise DobotAlarmError(alarms, f"command id={msg_id} (queue index {expected})")
             return response
         if time.monotonic() >= deadline:
             raise DobotWaitTimeout(

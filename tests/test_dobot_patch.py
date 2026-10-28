@@ -356,3 +356,83 @@ def test_move_z_uses_matching_pose_reply():
     ctrl.verbose = False
     ctrl.move_Z(-10)
     assert moves[0][1:] == pytest.approx((POSE[0], POSE[1], POSE[2] - 10, POSE[3]))
+
+
+# ---------------------------------------------------------------------------
+# アラーム（2026-10-28: 0x22 で止まったのに「移動完了」になった）
+# ---------------------------------------------------------------------------
+ID_ALARMS = 20
+
+
+def alarm_params(*codes):
+    raw = bytearray(16)
+    for c in codes:
+        raw[c // 8] |= 1 << (c % 8)
+    return bytes(raw)
+
+
+def move_responder(alarms=(), seen=None):
+    def fw(req_id, ctrl, params):
+        if seen is not None:
+            seen.append(req_id)
+        if req_id == ID_SET_PTP_CMD:
+            return [frame(ID_SET_PTP_CMD, struct.pack("<Q", 5), ctrl)]
+        if req_id == ID_QUEUE_INDEX:
+            return [frame(ID_QUEUE_INDEX, struct.pack("<Q", 5))]   # index reached
+        if req_id == ID_ALARMS:
+            return [frame(ID_ALARMS, alarm_params(*alarms))]
+        if req_id == ID_GET_POSE:
+            return [frame(ID_GET_POSE, pose_params())]
+        return [frame(req_id, b"", ctrl)]
+    return fw
+
+
+def test_alarm_bits():
+    assert pp.alarm_bits(alarm_params(0x22)) == [0x22]
+    assert pp.alarm_bits(alarm_params(0x04, 0x55)) == [0x04, 0x55]
+    assert pp.alarm_bits(bytes(16)) == []
+
+
+def test_move_with_alarm_raises_although_the_queue_finished():
+    seen = []
+    dev = make_dobot(move_responder(alarms=(0x22,), seen=seen))
+    with pytest.raises(pp.DobotAlarmError, match="0x22 motion: inverse kinematics limit") as e:
+        dev.move_to(281.0, 13.0, 114.8, 0.0, wait=True)
+    assert e.value.alarms == [0x22]
+    assert seen[-1] == ID_ALARMS            # checked after the index was reached
+
+
+def test_move_without_alarm_completes_and_checks_once():
+    seen = []
+    dev = make_dobot(move_responder(seen=seen))
+    dev.move_to(281.0, 13.0, 114.8, 0.0, wait=True)
+    assert seen.count(ID_ALARMS) == 1
+
+
+def test_immediate_commands_do_not_read_alarms():
+    seen = []
+    dev = make_dobot(move_responder(alarms=(0x22,), seen=seen))
+    assert dev.pose() == pytest.approx(POSE)
+    assert ID_ALARMS not in seen
+
+
+def test_unanswered_alarm_query_fails_safe():
+    def fw(req_id, ctrl, params):
+        if req_id == ID_ALARMS:
+            return []
+        return move_responder()(req_id, ctrl, params)
+
+    dev = make_dobot(fw)
+    with pytest.raises(pp.DobotReplyError, match="GetAlarmsState"):
+        dev.move_to(281.0, 13.0, 114.8, 0.0, wait=True)
+
+
+def test_alarm_reaches_the_controller_caller():
+    """PyDobotController.move_XYZ_abs で例外として上がる（LabRobot はそれを再送出する）。"""
+    ctrl = object.__new__(pc.PyDobotController)
+    ctrl.port_name = "TEST"
+    ctrl.device = make_dobot(move_responder(alarms=(0x22,)))
+    ctrl._connected = True
+    ctrl.verbose = False
+    with pytest.raises(pp.DobotAlarmError):
+        ctrl.move_XYZ_abs(281.0, 13.0, 114.8)
