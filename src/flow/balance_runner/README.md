@@ -15,6 +15,18 @@ tube B with the same liquid until both tubes weigh the same within a tolerance (
 Both 50 mL tubes stand open in a rack on the balance for the whole run; the
 operator places them, the arm never lifts a tube.
 
+With `single_position=1` in the sheet the balance holds **one tube at a time**,
+in one place (`tube_a_x`, `tube_a_y`; no `tube_b_*`). The operator is asked
+for: the empty holder (tare), then tube A with its cap; the arm fills A and
+parks at home; then A off and tube B with its cap on. B is weighed and filled
+until it matches A. Each tube's gross mass is read directly against the tare.
+Because B is weighed only after A is filled, a B that is already heavier than
+the filled A, or would need more than `max_tube_volume_mL`, is found after A
+has its liquid (the run stops before B gets any). A reading within one pipette
+minimum of A also stops the run: that is what tube A left on the balance looks
+like. `allow_extra_in_a` is not available in this mode (A is no longer on the
+balance when B is filled).
+
 Setting it up on another PC with a Dobot, step by step (Japanese):
 [`SETUP_DOBOT_ja.md`](SETUP_DOBOT_ja.md). Positions are read without moving the
 arm by `python -m src.devices.dobot.read_pose` (hand-guide the tip, then `--save NAME`).
@@ -50,6 +62,12 @@ moving one.
 4. Tube B gets the volume that leaves it `top_up_reserve_mL` short of A, then
    weighed top-ups, each converted with the effective density, until
    `|A - B| <= tolerance_g`.
+
+With `air_gap_mL` > 0 (at least 0.5 mL, the pipette minimum), every
+aspiration is followed by lifting the tip out of the liquid to `travel_z` and
+drawing that much air, so the liquid does not drip on the way; the dispense
+then pushes out liquid and air together. `max_aspirate_mL + air_gap_mL` must
+fit in the 10 mL pipette.
 
 The Picus 2 cannot dispense less than 0.5 mL, and liquid cannot be taken back
 out. That is why the bulk stops short: the last top-up is then at least
@@ -108,6 +126,13 @@ These depend on the cell and cannot be checked from software.
   Increase them if successive readings of a still pan differ.
 - **Pipette port.** Give it with `--pipette-port`, the sheet's
   `pipette_port`, or `robots.<id>.picus2_address` in `config.yaml`.
+
+- **Short dispenses.** Every dispense is weighed; one that delivers less than
+  `min_delivery_pct` (default 50 %) of the expected mass stops the run before
+  the next dispense. Raise it (e.g. 90) once the pipette is known to deliver
+  steadily: a short dispense would otherwise lower the effective density and
+  make the last top-up overfill B (seen on the bench: 65 % once, B then 0.22 g
+  too heavy).
 
 The tube-volume, reservoir and density checks are guards, not guarantees:
 liquid that misses a tube but lands on the rack is still weighed and would be

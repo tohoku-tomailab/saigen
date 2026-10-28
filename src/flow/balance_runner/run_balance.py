@@ -32,6 +32,15 @@ The balance is read only with the tip lifted to ``travel_z`` and after
 travel height, and the lowest aspiration height) is checked against the robot's
 workspace (a MaxArm's also against its inverse kinematics) before any device is opened.
 
+With ``single_position=1`` the balance holds one tube at a time, in one place
+(``tube_a_x``, ``tube_a_y``; ``tube_b_*`` are not used): empty holder (tare),
+tube A with its cap, the arm fills A; then (arm parked at home) the operator
+swaps A for B with its cap, B is weighed and the arm fills B until it matches A.
+B is weighed only after A is filled, so the checks on B (not heavier than A,
+not needing more than ``max_tube_volume_mL``) come after A has its liquid.
+Liquid is only ever dispensed into the tube that is on the balance, so
+``allow_extra_in_a`` is not available in this mode.
+
 Exit codes: 0 balanced, 1 not balanced / run failed, 2 bad sheet, 3 workspace
 violation, 130 interrupted (Ctrl+C = emergency stop, the arm halts where it is).
 """
@@ -87,8 +96,9 @@ BLOW_OUT_SPEED = 1
 #: Pause with the tip in the liquid after aspirating, and after dispensing, s.
 AFTER_ASPIRATE_S = 1.0
 AFTER_DISPENSE_S = 0.5
-#: A dispense that delivers less than this fraction of the expected mass stops the run.
-MIN_DELIVERY_FRACTION = 0.5
+#: A dispense that delivers less than this % of the expected mass stops the run
+#: (sheet ``min_delivery_pct``; this is its default).
+MIN_DELIVERY_PCT = 50.0
 #: The balance must read within this of zero right after taring, g.
 TARE_CHECK_G = 0.05
 #: A 50 mL tube alone weighs ~13 g; less than this means "no tube there", g.
@@ -114,6 +124,7 @@ PARAM_SPECS: Dict[str, tuple] = {
     "tolerance_g":              (float, 0.01, 5.0,   0.1),
     "liquid_density_g_per_mL":  (float, 0.5,  3.0,   1.0),
     "density_check_pct":        (float, 1.0,  50.0,  15.0),
+    "min_delivery_pct":         (float, 10.0, 100.0, MIN_DELIVERY_PCT),
     "travel_z":                 (float, None, None,  REQUIRED),
     "reservoir_x":              (float, None, None,  REQUIRED),
     "reservoir_y":              (float, None, None,  REQUIRED),
@@ -122,12 +133,14 @@ PARAM_SPECS: Dict[str, tuple] = {
     "reservoir_min_z":          (float, None, None,  None),     # default: reservoir_aspirate_z
     "tube_a_x":                 (float, None, None,  REQUIRED),
     "tube_a_y":                 (float, None, None,  REQUIRED),
-    "tube_b_x":                 (float, None, None,  REQUIRED),
-    "tube_b_y":                 (float, None, None,  REQUIRED),
+    "single_position":          (bool,  None, None,  False),
+    "tube_b_x":                 (float, None, None,  None),     # required unless single_position
+    "tube_b_y":                 (float, None, None,  None),
     "dispense_z":               (float, None, None,  REQUIRED),
     "aspirate_speed":           (int,   1,    9,     3),
     "dispense_speed":           (int,   1,    9,     3),
     "max_aspirate_mL":          (float, MIN_ML, MAX_ML, MAX_ML),
+    "air_gap_mL":               (float, 0.0,  2.0,   0.0),      # 0 = no air gap
     "blow_out_after_dispense":  (bool,  None, None,  True),
     "top_up_reserve_mL":        (float, MIN_ML, 5.0,  1.0),
     "max_top_ups":              (int,   1,    20,    6),
@@ -198,6 +211,16 @@ def parse_params(raw: Dict[str, str]) -> dict:
         params[name] = value
 
     if not errors:
+        if params["single_position"]:
+            # one place on the balance: B stands where A stood
+            params["tube_b_x"], params["tube_b_y"] = params["tube_a_x"], params["tube_a_y"]
+            if params["allow_extra_in_a"]:
+                errors.append("allow_extra_in_a needs both tubes on the balance; "
+                              "it is not available with single_position=1")
+        else:
+            errors += [f"{k}: required (unless single_position=1)"
+                       for k in ("tube_b_x", "tube_b_y") if params[k] is None]
+    if not errors:
         if params["reservoir_min_z"] is None:
             params["reservoir_min_z"] = params["reservoir_aspirate_z"]
         tz = params["travel_z"]
@@ -208,11 +231,17 @@ def parse_params(raw: Dict[str, str]) -> dict:
             errors.append("reservoir_min_z must not be above reservoir_aspirate_z")
         sep = math.hypot(params["tube_a_x"] - params["tube_b_x"],
                          params["tube_a_y"] - params["tube_b_y"])
-        if sep < MIN_TUBE_SEPARATION_MM:
+        if not params["single_position"] and sep < MIN_TUBE_SEPARATION_MM:
             errors.append(f"tube A and tube B are only {sep:.1f} mm apart "
                           f"(at least {MIN_TUBE_SEPARATION_MM} mm expected)")
         if params["volume_a_mL"] > params["max_tube_volume_mL"]:
             errors.append("volume_a_mL is larger than max_tube_volume_mL")
+        air = params["air_gap_mL"]
+        if 0 < air < MIN_ML:
+            errors.append(f"air_gap_mL must be 0 (off) or at least the pipette minimum of {MIN_ML} mL")
+        if params["max_aspirate_mL"] + air > MAX_ML + 1e-9:
+            errors.append(f"max_aspirate_mL + air_gap_mL must not exceed the pipette's {MAX_ML} mL "
+                          f"(lower max_aspirate_mL to {MAX_ML - air:g})")
     if errors:
         raise ValueError("balance sheet: " + "; ".join(errors))
     return params
@@ -247,10 +276,17 @@ def motion_targets(params: dict) -> List[Tuple[str, float, float, float]]:
     """Every absolute (x, y, z) the run can command, with a label."""
     p = params
     tz = p["travel_z"]
-    return [
+    targets = [
         ("reservoir, travel height", p["reservoir_x"], p["reservoir_y"], tz),
         ("reservoir, aspiration (full)", p["reservoir_x"], p["reservoir_y"], p["reservoir_aspirate_z"]),
         ("reservoir, aspiration (lowest)", p["reservoir_x"], p["reservoir_y"], p["reservoir_min_z"]),
+    ]
+    if p.get("single_position"):
+        return targets + [
+            ("tube (A, then B), travel height", p["tube_a_x"], p["tube_a_y"], tz),
+            ("tube (A, then B), dispense", p["tube_a_x"], p["tube_a_y"], p["dispense_z"]),
+        ]
+    return targets + [
         ("tube A, travel height", p["tube_a_x"], p["tube_a_y"], tz),
         ("tube A, dispense", p["tube_a_x"], p["tube_a_y"], p["dispense_z"]),
         ("tube B, travel height", p["tube_b_x"], p["tube_b_y"], tz),
@@ -315,6 +351,7 @@ class SimulatedBench:
         self.hit_radius_mm = hit_radius_mm
         self.rng = random.Random(seed)
         self.on_pan: Dict[str, float] = {}
+        self.off_pan: Dict[str, float] = {}    # tubes set aside by the operator
         self.tare_g = 0.0
         self.arm = None
 
@@ -324,8 +361,11 @@ class SimulatedBench:
             self.on_pan["rack"] = self.rack_g
         elif key == "tube_b":
             self.on_pan["B"] = self.tube_b_g + self.sample_b_g
-        elif key == "tube_a":
+        elif key in ("tube_a", "tube_a_single"):
             self.on_pan["A"] = self.tube_a_g + self.sample_g
+        elif key == "swap_to_b":
+            self.off_pan["A"] = self.on_pan.pop("A")
+            self.on_pan["B"] = self.tube_b_g + self.sample_b_g
 
     # balance
     def reading(self) -> float:
@@ -347,16 +387,19 @@ class SimulatedBench:
 
     def deliver(self, volume_ml: float):
         p = self.params
-        for tube, x, y in (("A", p["tube_a_x"], p["tube_a_y"]), ("B", p["tube_b_x"], p["tube_b_y"])):
-            if self._near(x, y):
-                if tube not in self.on_pan:
-                    raise RuntimeError(f"[MOCK] dispensing into tube {tube}, which is not there")
-                self.on_pan[tube] += volume_ml * self.density * self.bias + self.rng.gauss(0, self.noise_g)
-                return
-        raise RuntimeError("[MOCK] dispensing with the tip above no tube")
+        # with single_position both tubes share one place: the one on the pan gets it
+        near = [tube for tube, x, y in (("A", p["tube_a_x"], p["tube_a_y"]),
+                                        ("B", p["tube_b_x"], p["tube_b_y"])) if self._near(x, y)]
+        if not near:
+            raise RuntimeError("[MOCK] dispensing with the tip above no tube")
+        present = [tube for tube in near if tube in self.on_pan]
+        if not present:
+            raise RuntimeError(f"[MOCK] dispensing into tube {near[0]}, which is not there")
+        tube = present[0]
+        self.on_pan[tube] += volume_ml * self.density * self.bias + self.rng.gauss(0, self.noise_g)
 
     def gross(self, tube: str) -> float:
-        return self.on_pan[tube]
+        return self.on_pan[tube] if tube in self.on_pan else self.off_pan[tube]
 
 
 class BenchPipette(MockLabRobot):
@@ -365,15 +408,27 @@ class BenchPipette(MockLabRobot):
     def __init__(self, bench: SimulatedBench):
         super().__init__(use_picus2=True)
         self.bench = bench
+        self.air_ml = 0.0    # air taken in at travel height (air gap); weighs nothing
 
     async def aspirate(self, volume, speed=5):
+        z = self.bench.arm.get_current_position()[2]
+        if abs(z - self.bench.params["travel_z"]) <= 0.5:
+            result = await super().aspirate(volume, speed)
+            self.air_ml += volume
+            return result
         self.bench.check_aspirate()
         return await super().aspirate(volume, speed)
 
     async def dispense(self, volume, speed=5):
         result = await super().dispense(volume, speed)
-        self.bench.deliver(volume)
+        air = min(self.air_ml, volume)
+        self.air_ml -= air
+        self.bench.deliver(volume - air)
         return result
+
+    async def blow_out(self, *args, **kwargs):
+        self.air_ml = 0.0
+        return await super().blow_out(*args, **kwargs)
 
 
 class BenchScale(MockSharedDevices):
@@ -405,6 +460,13 @@ PROMPTS = {
               "the caps go into the centrifuge, lay B's cap beside it on the rack. Press Enter.",
     "tube_a": "Put tube A (with its sample, cap off) into the A position of the rack, "
               "with its cap the same way. Press Enter.",
+    # single_position=1: one tube on the balance at a time
+    "tube_a_single": "Put tube A (with its sample, cap off) in the holder on the balance. If "
+                     "the caps go into the centrifuge, lay A's cap beside it on the holder. "
+                     "Press Enter.",
+    "swap_to_b": "Tube A is done. Take tube A and its cap off the balance and set them aside. "
+                 "Put tube B (with its sample, cap off) in the same holder, with its cap the "
+                 "same way. Press Enter.",
 }
 
 Operator = Callable[[str, str], Awaitable[None]]
@@ -442,6 +504,9 @@ class BalanceRun:
         self.g_per_mL = params["liquid_density_g_per_mL"]
         self.dispenses: List[dict] = []
         self.top_ups = 0
+        self.single = bool(params.get("single_position"))
+        self.zero = 0.0               # balance reading right after taring the empty holder
+        self.on_balance = None        # single_position: the tube now on the balance
 
     # -------------------------------------------------------------- records
     def _record(self, action, t0, result=None, status="ok", error=None, robot=True):
@@ -491,6 +556,8 @@ class BalanceRun:
     async def transfer(self, tube: str, volume_ml: float):
         """Reservoir -> tube, in portions; weigh after each portion."""
         p = self.p
+        if self.single and tube != self.on_balance:
+            raise BalanceError(f"tube {tube} is not on the balance (tube {self.on_balance} is)")
         tx, ty = self._tube_xy(tube)
         for v in planner.split_volume(volume_ml, p["max_aspirate_mL"], MIN_ML):
             if self.liquid_ml[tube] + v > p["max_tube_volume_mL"] + 1e-9:
@@ -507,8 +574,14 @@ class BalanceRun:
             await self._do("aspirate", self.pipette.aspirate(v, p["aspirate_speed"]))
             await self.sleep(AFTER_ASPIRATE_S)
             self.consumed_ml += v
+            air = p["air_gap_mL"]
+            if air > 0:
+                # tip out of the liquid first, then air below the liquid against drips
+                await self._do("move_xyz", self.arm.move_xyz(
+                    p["reservoir_x"], p["reservoir_y"], p["travel_z"]))
+                await self._do("aspirate", self.pipette.aspirate(air, p["aspirate_speed"]))
             await self.goto(tx, ty, p["dispense_z"])
-            await self._do("dispense", self.pipette.dispense(v, p["dispense_speed"]))
+            await self._do("dispense", self.pipette.dispense(v + air, p["dispense_speed"]))
             if p["blow_out_after_dispense"]:
                 await self._do("blow_out", self.pipette.blow_out(
                     go_home=True, speed=BLOW_OUT_SPEED, delay_ms=BLOW_OUT_DELAY_MS))
@@ -530,11 +603,15 @@ class BalanceRun:
             })
             logger.info(f"    arrived {delta:.3f} g; A {self.mass['A']:.2f} g, "
                         f"B {self.mass['B']:.2f} g, A-B {self.mass['A'] - self.mass['B']:+.3f} g")
+            # checked before the next dispense: a short one would also skew the
+            # effective density that converts the top-ups, and overfill B
             expected = v * p["liquid_density_g_per_mL"]
-            if delta < MIN_DELIVERY_FRACTION * expected:
+            if delta < p["min_delivery_pct"] / 100.0 * expected:
                 raise BalanceError(
-                    f"only {delta:.2f} g arrived for {v:.2f} mL (expected ~{expected:.2f} g): "
-                    "check the tip, the reservoir level and the tube position")
+                    f"only {delta:.2f} g arrived for {v:.2f} mL (expected ~{expected:.2f} g, "
+                    f"{delta / expected * 100:.0f} % < min_delivery_pct={p['min_delivery_pct']:g} %): "
+                    "check the tip, the reservoir level and the tube position. "
+                    f"Now A {self.mass['A']:.2f} g, B {self.mass['B']:.2f} g")
 
     def _update_density(self):
         self.g_per_mL = planner.effective_density(self.delivered_g, self.commanded_ml)
@@ -554,7 +631,19 @@ class BalanceRun:
         zero = await self.measure("after tare")
         if abs(zero) > TARE_CHECK_G:
             raise BalanceError(f"the balance reads {zero:.2f} g right after taring; check the pan")
-        self.reading = zero
+        self.reading = self.zero = zero
+
+        if self.single:
+            # B is weighed after A is filled (swap_to_b)
+            await self.operator("tube_a_single", PROMPTS["tube_a_single"])
+            w = await self.measure("holder + tube A")
+            self.start_a = self.mass["A"] = w - self.zero
+            self.reading = w
+            self.on_balance = "A"
+            if self.start_a < MIN_TUBE_G:
+                raise BalanceError(f"tube A weighs {self.start_a:.2f} g: is it in the holder?")
+            logger.info(f"tube A {self.start_a:.2f} g (with its sample)")
+            return
 
         await self.operator("tube_b", PROMPTS["tube_b"])
         w = await self.measure("rack + tube B")
@@ -584,10 +673,42 @@ class BalanceRun:
                 f"{p['max_tube_volume_mL']}; nothing has been dispensed")
         logger.info(f"tube B will need about {need_b_ml:.1f} mL")
 
+    async def swap_to_b(self):
+        """single_position: A is done; park the arm, have A swapped for B, weigh B."""
+        p = self.p
+        await self._do("go_home", self.arm.go_home())
+        await self.operator("swap_to_b", PROMPTS["swap_to_b"])
+        w = await self.measure("holder + tube B")
+        self.start_b = self.mass["B"] = w - self.zero
+        self.reading = w
+        self.on_balance = "B"
+        logger.info(f"tube A {self.mass['A']:.2f} g (filled), tube B {self.start_b:.2f} g "
+                    "(with its sample)")
+        nothing_yet = "tube A is filled; nothing has been put into B"
+        if self.start_b < MIN_TUBE_G:
+            raise BalanceError(f"tube B weighs {self.start_b:.2f} g: is it in the holder? "
+                               f"({nothing_yet})")
+        gap_g = self.mass["A"] - self.start_b
+        if gap_g < MIN_ML * self.g_per_mL:
+            # also what a tube A left on the balance looks like
+            raise BalanceError(
+                f"the balance reads {self.start_b:.2f} g for tube B, only {gap_g:+.2f} g from "
+                f"tube A ({self.mass['A']:.2f} g): is tube A still on the balance? Otherwise B "
+                f"is too heavy for the pipette minimum of {MIN_ML} mL to close the gap "
+                f"({nothing_yet})")
+        need_b_ml = gap_g / self.g_per_mL
+        if need_b_ml > p["max_tube_volume_mL"]:
+            raise BalanceError(
+                f"tube B would need ~{need_b_ml:.1f} mL, more than max_tube_volume_mL="
+                f"{p['max_tube_volume_mL']} ({nothing_yet})")
+        logger.info(f"tube B will need about {need_b_ml:.1f} mL")
+
     async def balance(self) -> planner.Decision:
         p = self.p
         await self.transfer("A", p["volume_a_mL"])
         self._update_density()
+        if self.single:
+            await self.swap_to_b()
 
         bulk = planner.bulk_volume_for_b(self.mass["A"] - self.mass["B"], self.g_per_mL,
                                          p["top_up_reserve_mL"], MIN_ML)

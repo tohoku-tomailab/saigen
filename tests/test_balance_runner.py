@@ -303,3 +303,204 @@ class TestDobot:
             es.default_robot_factory = orig
         assert not results["balanced"]
         assert seen["use_picus2"] is True and seen["ports"]["picus2_address"] == "COM42"
+
+
+# ----------------------------------------------------------------- single_position
+def single_params(**over):
+    raw = {k: v for k, v in DOBOT_SHEET.items() if not k.startswith("tube_b_")}
+    raw["single_position"] = "1"
+    raw.update({k: str(v) for k, v in over.items()})
+    return rb.parse_params(raw)
+
+
+def run_single(p, tmp_path, operator_for=None, **bench_kw):
+    """Mock run with single_position; ``operator_for(bench)`` may replace the operator."""
+    bench = rb.SimulatedBench(p, **bench_kw)
+    asked = []
+
+    async def operator(key, message):
+        asked.append(key)
+        bench.place(key)
+
+    sheet = tmp_path / "balance.csv"
+    sheet.write_text("parameter,value,note\n", encoding="utf-8")
+    results = asyncio.run(rb.run_balancing(
+        p, str(sheet), mock=True, robot_ports=DOBOT_PORTS, shared_config={},
+        bench=bench, operator=operator_for(bench, asked) if operator_for else operator,
+        sleep=_no_sleep, logs_dir=str(tmp_path / "logs")))
+    return results, bench, asked
+
+
+class TestSinglePosition:
+    def test_sheet_needs_no_tube_b(self):
+        p = single_params()
+        assert p["single_position"] is True
+        assert (p["tube_b_x"], p["tube_b_y"]) == (p["tube_a_x"], p["tube_a_y"])
+
+    def test_tube_b_still_required_without_it(self):
+        raw = {k: v for k, v in DOBOT_SHEET.items() if k != "tube_b_y"}
+        with pytest.raises(ValueError, match="tube_b_y: required"):
+            rb.parse_params(raw)
+
+    def test_extra_in_a_is_refused(self):
+        with pytest.raises(ValueError, match="not available with single_position"):
+            single_params(allow_extra_in_a=1)
+
+    def test_targets_name_one_tube_place(self):
+        labels = [t[0] for t in rb.motion_targets(single_params())]
+        assert not any(label.startswith("tube A") or label.startswith("tube B") for label in labels)
+        assert sum(label.startswith("tube (A, then B)") for label in labels) == 2
+        _, problems = rb.preflight(single_params(), DOBOT_PORTS)
+        assert problems == []
+
+    def test_balances_with_one_tube_on_the_balance(self, tmp_path):
+        results, bench, asked = run_single(single_params(), tmp_path)
+        assert results["balanced"], results.get("error")
+        assert asked == ["rack", "tube_a_single", "swap_to_b"]
+        assert abs(bench.gross("A") - bench.gross("B")) <= 0.1 + 0.01
+        assert set(bench.on_pan) == {"rack", "B"} and set(bench.off_pan) == {"A"}
+        assert results["liquid_into_A_mL"] == 20.0
+        with open(os.path.join(results["log_dir"], "balance_log.csv"), encoding="utf-8-sig") as f:
+            tubes = [r["tube"] for r in csv.DictReader(f)]
+        assert tubes[:2] == ["A", "A"] and set(tubes[2:]) == {"B"}
+
+    @pytest.mark.parametrize("sample_a, sample_b", [(2.47, 1.83), (1.0, 4.5)])
+    def test_gross_masses_with_samples(self, tmp_path, sample_a, sample_b):
+        results, bench, _ = run_single(single_params(), tmp_path,
+                                       sample_g=sample_a, sample_b_g=sample_b)
+        assert results["balanced"]
+        assert results["tube_a_start_g"] == pytest.approx(13.31 + sample_a)
+        assert results["tube_b_start_g"] == pytest.approx(13.22 + sample_b)
+        assert abs(bench.gross("A") - bench.gross("B")) <= 0.11
+
+    def test_tube_a_left_on_the_balance_stops_before_b(self, tmp_path):
+        def operator_for(bench, asked):
+            async def operator(key, message):
+                asked.append(key)
+                if key == "swap_to_b":
+                    return            # the operator leaves tube A on the balance
+                bench.place(key)
+            return operator
+
+        results, bench, asked = run_single(single_params(), tmp_path, operator_for=operator_for)
+        assert not results["balanced"] and "is tube A still on the balance" in results["error"]
+        assert results["liquid_into_A_mL"] == 20.0 and results["liquid_into_B_mL"] == 0.0
+
+    def test_heavy_b_stops_before_b_gets_liquid(self, tmp_path):
+        # B (sample 23 g, 36.2 g) outweighs A after 20 mL (~35.5 g): found only after A is filled
+        results, bench, _ = run_single(single_params(), tmp_path, sample_b_g=23.0)
+        assert not results["balanced"] and "nothing has been put into B" in results["error"]
+        assert bench.gross("B") == pytest.approx(13.22 + 23.0)
+        assert results["liquid_into_B_mL"] == 0.0
+
+    def test_b_capacity_checked_before_b_gets_liquid(self, tmp_path):
+        results, bench, _ = run_single(single_params(max_tube_volume_mL=21), tmp_path,
+                                       sample_g=8.0)
+        assert not results["balanced"] and "max_tube_volume_mL" in results["error"]
+        assert bench.gross("B") == pytest.approx(13.22 + 1.83)
+
+    def test_dispense_only_into_the_tube_on_the_balance(self):
+        p = single_params()
+        run = rb.BalanceRun(p, arm=None, pipette=None, scale=None, operator=None)
+        run.on_balance = "A"
+        with pytest.raises(rb.BalanceError, match="tube B is not on the balance"):
+            asyncio.run(run.transfer("B", 1.0))
+
+    def test_two_position_runs_are_unchanged(self, tmp_path):
+        results, bench = run_mock(dobot_params(), tmp_path, ports=DOBOT_PORTS)
+        assert results["balanced"] and bench.off_pan == {}
+
+
+# ----------------------------------------------------------------- air gap
+class TestAirGap:
+    @pytest.mark.parametrize("over, fragment", [
+        ({"air_gap_mL": "0.3"}, "at least the pipette minimum"),
+        ({"air_gap_mL": "0.5"}, "must not exceed"),                       # 10 + 0.5 > 10
+        ({"air_gap_mL": "0.5", "max_aspirate_mL": "9.6"}, "must not exceed"),
+    ])
+    def test_rejected(self, over, fragment):
+        with pytest.raises(ValueError, match=fragment):
+            dobot_params(**over)
+
+    def test_off_by_default(self):
+        assert dobot_params()["air_gap_mL"] == 0.0
+
+    def _record_aspirations(self, monkeypatch):
+        seen = []
+        orig = rb.BenchPipette.aspirate
+
+        async def aspirate(self, volume, speed=5):
+            seen.append((round(self.bench.arm.get_current_position()[2], 1), volume))
+            return await orig(self, volume, speed)
+
+        monkeypatch.setattr(rb.BenchPipette, "aspirate", aspirate)
+        return seen
+
+    def test_air_is_drawn_with_the_tip_out_of_the_liquid(self, tmp_path, monkeypatch):
+        seen = self._record_aspirations(monkeypatch)
+        p = dobot_params(air_gap_mL=0.5, max_aspirate_mL=9.5)
+        results, bench = run_mock(p, tmp_path, ports=DOBOT_PORTS)
+        assert results["balanced"], results.get("error")
+        # every liquid stroke (in the reservoir) is followed by 0.5 mL of air at travel_z
+        assert seen[0][0] == p["reservoir_aspirate_z"] and seen[1] == (p["travel_z"], 0.5)
+        liquid = [v for z, v in seen if z != p["travel_z"]]
+        air = [v for z, v in seen if z == p["travel_z"]]
+        assert len(air) == len(liquid) and all(v == 0.5 for v in air)
+        assert max(liquid) <= 9.5
+        # the air weighs nothing: the bench's true masses balance
+        assert abs(bench.gross("A") - bench.gross("B")) <= 0.11
+        assert results["liquid_into_A_mL"] == 20.0
+
+    def test_no_air_without_the_parameter(self, tmp_path, monkeypatch):
+        seen = self._record_aspirations(monkeypatch)
+        p = dobot_params()
+        results, _ = run_mock(p, tmp_path, ports=DOBOT_PORTS)
+        assert results["balanced"]
+        assert all(z != p["travel_z"] for z, _ in seen)
+
+    def test_air_gap_in_single_position(self, tmp_path):
+        results, bench, _ = run_single(single_params(air_gap_mL=0.5, max_aspirate_mL=9.5), tmp_path)
+        assert results["balanced"], results.get("error")
+        assert abs(bench.gross("A") - bench.gross("B")) <= 0.11
+
+
+# ----------------------------------------------------------------- short dispense
+class TestShortDispense:
+    """2026-10-28 on the bench: one dispense into B delivered 65 %; the skewed
+    effective density then made the last top-up overfill B by 0.22 g."""
+
+    def _short_nth(self, monkeypatch, n, fraction):
+        orig = rb.SimulatedBench.deliver
+        count = {"n": 0}
+
+        def deliver(self, volume_ml):
+            count["n"] += 1
+            return orig(self, volume_ml * (fraction if count["n"] == n else 1.0))
+
+        monkeypatch.setattr(rb.SimulatedBench, "deliver", deliver)
+
+    def test_short_dispense_stops_before_b_is_overfilled(self, tmp_path, monkeypatch):
+        self._short_nth(monkeypatch, 4, 0.65)     # 2 into A, then the 2nd into B
+        p = single_params(volume_a_mL=19, max_aspirate_mL=9.5, air_gap_mL=0.5,
+                          min_delivery_pct=90)
+        results, bench, _ = run_single(p, tmp_path)
+        assert not results["balanced"]
+        assert "min_delivery_pct=90" in results["error"] and "Now A" in results["error"]
+        assert bench.gross("B") < bench.gross("A")           # B short, never overfilled
+        assert results["dispenses"] == 4
+
+    def test_default_threshold_is_unchanged(self, tmp_path, monkeypatch):
+        self._short_nth(monkeypatch, 4, 0.65)
+        results, _, _ = run_single(single_params(volume_a_mL=19, max_aspirate_mL=9.5,
+                                                 air_gap_mL=0.5), tmp_path)
+        assert results["dispenses"] > 4                      # 65 % passes the 50 % default
+        assert "min_delivery_pct" not in (results.get("error") or "")
+
+    def test_normal_pipette_bias_passes_90_percent(self, tmp_path):
+        results, _, _ = run_single(single_params(min_delivery_pct=90), tmp_path, bias=0.98)
+        assert results["balanced"], results.get("error")
+
+    @pytest.mark.parametrize("value", ["5", "101"])
+    def test_range(self, value):
+        with pytest.raises(ValueError, match="min_delivery_pct"):
+            dobot_params(min_delivery_pct=value)
