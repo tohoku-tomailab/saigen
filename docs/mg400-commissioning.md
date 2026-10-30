@@ -16,10 +16,12 @@ check: the arm was in alarm, and nothing was sent to it. Its second run the
 same day, after the alarms were cleared, is the first complete jog record
 (§3.8): J1 +5 deg and back, 9.2 s from start to end. A repeat (§3.9) showed
 the same things again; a J4 +5 deg run (§3.10) was reported by the
-controller as a move that the operator did not see, two runs ended on
-ErrorID -1 because the controller's remote-control mode was no longer
-TCP/IP (§3.11), and a J4 +10 deg run with a mark on the flange was seen to
-turn (§3.12).
+controller as a move that the operator did not see, five invocations ended
+on ErrorID -1 because the controller's remote-control mode was no longer
+TCP/IP (§3.11; three of them reused record folders and overwrote the
+records of §3.8, §3.10 and an earlier -1 run), and a J4 +10 deg run with a
+mark on the flange was seen to turn (§3.12; it overwrote a fourth record,
+the -1 run before it).
 §4 lists what is still open. Another unit or firmware may differ, so treat
 what follows as expectations to re-check, not as specifications.
 
@@ -245,7 +247,13 @@ The tool's exit code for a run ended before the Enter is 2.
 
 Seventeen minutes later, after the alarms had been cleared in DobotStudio Pro
 and J2 moved back inside its limit, the same command (new record folder) ran
-to the end: `complete: true`, `armed: true`, `disabled_confirmed: true`, no
+to the end. **This record no longer exists on disk**: at 05:12 UTC a later
+invocation reused its `--out` folder and the tool overwrote it (§3.11). The
+numbers in this section are from a read of the record made before that,
+kept verbatim in a text file next to the records
+(`overwritten_records_read_before_overwrite.txt`); they can no longer be
+checked against the raw packets. What that read showed:
+`complete: true`, `armed: true`, `disabled_confirmed: true`, no
 notes, no stop sequence, 65 commands, all three connections (feedback,
 dashboard-1, motion) closed by the tool at the end. Start joints
 [1.60, -14.68, 20.25, 48.17], target J1 +5 deg, SpeedJ = AccJ = 10. What
@@ -269,8 +277,11 @@ the record shows, by §4's questions:
   of the target) was met after 0.93 s on both legs, with 10 polls each. In
   the feedback, mode 7 lasted 94 packets (about 0.77 s) on each leg, and
   `q_target` led `q_actual` by at most 0.55 deg during the motion. The
-  feedback's `velocity_ratio` field read 10 in exactly one packet before
-  each mode-7 run and 50 otherwise; the two xyz ratios stayed 50.
+  feedback's `velocity_ratio` field read 10 in exactly one packet at the
+  start of each move (here the last mode-5 packet before each mode-7 run; in
+  §3.9 the last mode-5 packet on the first leg and the first mode-7 packet
+  on the second; in §3.12 the first mode-7 packet on both) and 50 otherwise;
+  the two xyz ratios stayed 50.
 - J2 and J3 stayed within 0.08 and 0.11 deg of their start over the whole
   recording (the J3 excursion above is at the enable, not in the moves);
   J4 within 0.011 deg. J1's extremes were 1.598 and 6.604 deg.
@@ -304,13 +315,17 @@ both JointMovJ echoed in full (148 and 171 ms), mode 7 on four polls and 94
 feedback packets per leg, arrival after 0.93 and 0.94 s, DisableRobot
 1.03 s, 985 feedback packets, none rejected, no fault. The once-seen items
 of §3.8 were seen again: J3 rose by 0.12 deg for 11 packets while enabling;
-`velocity_ratio` read 10 in one packet before each move; after the disable
+`velocity_ratio` read 10 in one packet at the start of each move (the last
+mode-5 packet on the first leg, the first mode-7 packet on the second); after the disable
 J1 settled by 0.023 deg (final minus start [+0.023, -0.002, +0.008, 0.000]);
 `speed_scaling` 97.0 throughout.
 
 ### 3.10 Jog tool, fourth run: a J4 move the controller reported and the operator did not see
 
-Forty seconds later, `--j1 0 --j4 5` (record `jog_04`). The record has the
+Forty seconds later, `--j1 0 --j4 5` (record `jog_04`). **This record was
+overwritten too**, at 05:05 UTC by an invocation that reused the folder
+(§3.11); the numbers here are from the read kept in the same text file as
+§3.8's. That read showed a record of the
 same shape as §3.8 and §3.9 (`complete: true`, 65 commands, no fault), and
 by the controller's word J4 moved: `GetAngle()` went from 49.81 to 54.81 deg
 over the four mode-7 polls of the first leg and back to 49.81 on the second;
@@ -324,56 +339,70 @@ the arm, saw nothing move. Two more things in the J4 readings:
   earlier had read 48.17: a change of 1.65 deg with the arm disabled between
   the runs.
 - About 0.3 s after the feedback showed mode 4 at the end of the run, the J4
-  reading jumped from 49.82 to 51.13 deg between two packets (8 ms), and the
+  reading jumped from 49.82 to 51.13 deg within 70 ms (between the sampled
+  packets at 7.97 s and 8.04 s of the read, every eighth packet), and the
   final `GetAngle()` read 51.13: final minus start J4 = +1.31 deg, far above
   the 0.00 to 0.04 deg of the other joints and of J4 in the earlier runs.
 
 The tool's arrival criterion is the controller's reported joints, so it
 cannot tell a reported move from a physical one. The operator then checked
 the arm: the J4 motor is fitted. With nothing on the flange, a 5 deg turn
-moves its edge by about 2 mm in 0.6 s, which may simply not have been
-visible; a run with a mark on the flange is the way to settle it (§4). The
-two J4 reading changes with the arm disabled are not explained by that.
+moves its edge by about 2 mm in 0.6 s (an estimate for an assumed flange
+diameter of 40 mm; the flange was not measured), which may simply not have
+been visible; a run with a mark on the flange settled it (§3.12). The two
+J4 reading changes with the arm disabled are not explained by that.
 
-### 3.11 Jog tool, fifth run: the first `RobotMode()` answered ErrorID -1
+### 3.11 ErrorID -1 to the first `RobotMode()`: five invocations, three records overwritten
 
-Eleven minutes later, `--j1 0 --j4 10` with a tape mark on the flange
-(record `jog_05`). The feedback was normal (15 packets in 0.1 s, mode 4,
-`error_status` 0, `enable_status` 0), but the first Dashboard command,
-`RobotMode()`, was answered `-1,{},RobotMode();` after 72 ms, and the tool
-ended there as designed (`stopped by MG400CommandError: RobotMode() ->
-ErrorID -1`, `armed: false`, `complete: false`, nothing else sent, exit 2).
-It is the first non-zero ErrorID on a read-only command in any record
-(§3.2's -20000 and -30001 were parameter refusals). What else the record
-shows: the feedback joints were [-0.31, -19.77, 20.30, -28.90] against
-[1.69, -14.70, 20.29, 51.13] at the end of §3.10, so J1, J2 and J4 had been
-moved between the runs (J4 by 80 deg), by what is not in the record. What
-the controller was doing at that moment (DobotStudio Pro connected or just
-closed, a jog from it still in effect) is the operator's to say.
+Between 05:05 and 05:14 UTC the tool was started five times and every time
+ended on the first Dashboard command: `RobotMode()` was answered
+`-1,{},RobotMode();` and the tool stopped there as designed (`stopped by
+MG400CommandError: RobotMode() -> ErrorID -1`, `armed: false`, `complete:
+false`, nothing else sent, exit 2). The feedback was normal each time (mode
+4, `error_status` 0, `enable_status` 0, `velocity_ratio` 50). It is the
+first non-zero ErrorID on a read-only command in any record (§3.2's -20000
+and -30001 were parameter refusals). The arguments of a run that ends
+before its plan is shown are not in its record; the `--note` typed is.
 
-Five minutes later the operator restarted DobotStudio Pro, disconnected it
-and closed it, and ran the same command again (`jog_06`): the same
-`-1,{},RobotMode();` to the first command, after 28 ms, with the feedback
-again normal (mode 4, no alarm, joints unchanged from `jog_05`). So the -1
-did not depend on DobotStudio Pro being open, and it persisted across its
-restart. The operator then found the cause in DobotStudio Pro: its
-remote-control mode was no longer TCP/IP. With it set back to TCP/IP, the
-next run went through (§3.12). So ErrorID -1 to a read-only query is what
-the controller answers when TCP/IP remote control is off; the feedback port
-keeps streaming regardless, so the tool's feedback check cannot see it.
+| started (UTC) | folder written | reply after | feedback packets | note typed |
+|---|---|---|---|---|
+| 05:05:26 | `jog_04` (over §3.10's record) | 27 ms | 8 | speed settings only |
+| 05:08:43 | `jog_05` | 72 ms | 15 | speed settings; tape mark on the flange |
+| 05:09:14 | `jog_05` (over the row above) | 50.5 ms | 11 | the same |
+| 05:12:46 | `jog_02` (over §3.8's record) | 15.6 ms | 5 | the same |
+| 05:14:00 | `jog_06` | 28 ms | 8 | the same; DobotStudio Pro restarted then closed |
 
-The second `jog_06` was written into the same folder with `--out`, and
-the tool overwrote the first `jog_06` record (the -1 run) without a
-warning; the numbers above are from a read of it before that. A record
-folder should not be reused (§4).
+The rows of 05:08:43 and 05:14:00 are from reads made before those folders
+were overwritten (the first by the next row, the second by §3.12's run);
+the other three rows are what the folders hold now. Four bench records
+were lost this way: the complete runs of §3.8 and §3.10 and the -1 run of
+05:08:43 to rows of this table, and the -1 run of 05:14:00 to §3.12's
+run. The joints in the feedback were [-0.31, -19.77, 20.30, -28.90] in
+every row (J1 -0.29 in the first) against [1.69, -14.70, 20.29, 51.13] at
+the end of §3.10, so J1, J2 and J4 had been moved between §3.10 and the
+first row (J4 by 80 deg), by what is not in any record. The operator
+restarted DobotStudio Pro, disconnected it and closed it before the last
+row, so the -1 did not depend on DobotStudio Pro being open and persisted
+across its restart. The operator then found the cause in DobotStudio Pro:
+its remote-control mode was no longer TCP/IP. With it set back to TCP/IP,
+the next run went through (§3.12). So ErrorID -1 to a read-only query is
+what the controller answers when TCP/IP remote control is off; the feedback
+port keeps streaming regardless, so the tool's feedback check cannot see
+it.
 
-### 3.12 Jog tool, seventh run: J4 +10 deg, the mark on the flange seen to turn
+The tool wrote into the reused `--out` folders without a warning. Since
+this day it refuses a `--out` folder that already holds files (exit 2,
+before anything is opened); a new folder name per run was the rule before
+and is enforced now.
 
-Four minutes after the second -1, with the remote-control mode back on
+### 3.12 Jog tool, the run of 05:17:47 UTC: J4 +10 deg, the mark on the flange seen to turn
+
+Four minutes after the last -1 of §3.11, with the remote-control mode back on
 TCP/IP, `--j1 0 --j4 10` ran to the end (record in the `jog_06` folder,
 started 05:17:47 UTC; `complete: true`, 65 commands, no fault, 1589
-feedback packets over 13.0 s, of which 6.6 s before the Enter). The
-operator saw the tape mark on the flange turn and come back. By the
+feedback packets over 13.0 s, of which 5.9 s before the Enter). The
+operator saw the tape mark on the flange turn (the return is the
+controller's word, below, not reported as seen). By the
 controller: J4 from -27.94 to -17.94 deg and back, mode 7 on four polls and
 97 feedback packets per leg (about 0.8 s, against 78 and 79 for 5 deg),
 arrival after 0.93 and 0.94 s, `q_actual` J4 lagging `q_target` by up to
@@ -381,8 +410,9 @@ arrival after 0.93 and 0.94 s, `q_actual` J4 lagging `q_target` by up to
 J3 excursion while enabling again, 0.12 deg over 9 packets). ResetRobot
 170 ms, EnableRobot 1.21 s, DisableRobot 1.03 s, the same as every run.
 
-J4's reading again changed with the arm disabled: it was -28.91 at the
-start of the two -1 runs and -27.94 at the start of this one (0.97 deg over
+J4's reading again changed with the arm disabled: it was about -28.90 to
+-28.91 at the start of every -1 invocation of §3.11 (-28.91 in the 05:14:00
+read) and -27.94 at the start of this one (0.97 deg over
 four minutes), and after the disable the final `GetAngle()` read -26.83,
 1.11 deg above the start (1.31 in §3.10). Final minus start:
 [+0.003, -0.003, +0.009, +1.112].
@@ -395,8 +425,10 @@ four minutes), and after the disable the final `GetAngle()` read -26.83,
   connection on the Dashboard port.
 - The controller version, typed into the jog run of 2026-10-30 (`2.8.5`,
   §3.7); not yet into a complete observation record.
-- The alarm of 2026-10-30 (§3.7): its ID, its cause, and whether the arm's
-  changed joints since 2026-10-22 are related. When the first feedback packet
+- The alarm of 2026-10-30 (§3.7): the `GetErrorID()` reply of that run was
+  never taken (DobotStudio Pro's panel showed codes 67 and 85 afterwards);
+  its cause, when it arose, and whether the arm's changed joints since
+  2026-10-22 are related, are open. When the first feedback packet
   shows an alarm, neither tool records a `GetErrorID()`; whether they should
   send that read-only query before ending is a change to the tools and needs
   a reviewed plan like any other.
@@ -405,13 +437,16 @@ four minutes), and after the disable the final `GetAngle()` read -26.83,
   example at a second pose, is a human step still to be planned.
 - The meaning of the non-zero `qd_actual` / `tcp_speed_actual` fields on a
   disabled arm (§3.6).
-- From the complete jog records (§3.8 to §3.10, J1 +5 deg twice and J4
-  +5 deg once, at a 10 % ratio with the controller at 50 %): the 0.10 to
-  0.12 deg J3 excursion while enabling; the one-packet `velocity_ratio` 10
-  before each move; the 0.02 to 0.04 deg J1 settling after the disable; the
-  constant `speed_scaling` 97.0. Each was seen in every run, none is
-  explained by the guide. Nothing was tried with other sizes or ratios. The
-  jog tool's limits (J1 / J4 only, 1..10 deg, ratio at most 30 %) are design
+- From the complete jog records (§3.8, §3.9, §3.10, §3.12: J1 +5 deg twice,
+  J4 +5 deg once, J4 +10 deg once, all at a 10 % ratio with the controller
+  at 50 %; two of the four records survive on disk): the 0.10 to 0.12 deg
+  J3 excursion while enabling; the one-packet `velocity_ratio` 10 at the
+  start of each move; the J1 reading settling after the disable (0.02 to
+  0.04 deg in the J1 runs; in the J4 runs final minus start J1 was 0.000 and
+  0.003 deg); the constant
+  `speed_scaling` 97.0. Each was seen in every run, none is explained by
+  the guide. J1 was moved only by 5 deg, nothing at another ratio. The jog
+  tool's limits (J1 / J4 only, 1..10 deg, ratio at most 30 %) are design
   choices, not measurements, and its speed is bounded only relative to the
   controller's own settings. The stop sequence has not run on the arm.
 - J4 (§3.10, §3.12): the 5 deg move was not seen, the 10 deg move with a
@@ -421,10 +456,10 @@ four minutes), and after the disable the final `GetAngle()` read -26.83,
   therefore ends with a J4 reading about 1 deg from its start, which the
   tool records and does not judge. The tool's reported arrival is the
   controller's word only.
-- The jog tool writes into an existing `--out` folder and overwrites the
-  record there (§3.11). Refusing a non-empty folder is a change to the tool
-  and needs a reviewed plan like any other; until then, a new folder name
-  per run.
+- Four records of 2026-10-30 were overwritten by reused `--out` folders
+  (§3.11: three during the -1 retries, one by the run of §3.12) and survive
+  only as reads made before that; the tool now refuses
+  a folder that holds files. The observation tool still does not.
 
 ## 5. Interrupting a run
 
