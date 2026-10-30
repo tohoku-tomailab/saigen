@@ -15,8 +15,11 @@ arm (2026-10-30, controller version 2.8.5 typed, §3.7) ended at its first
 check: the arm was in alarm, and nothing was sent to it. Its second run the
 same day, after the alarms were cleared, is the first complete jog record
 (§3.8): J1 +5 deg and back, 9.2 s from start to end. A repeat (§3.9) showed
-the same things again, and a J4 run (§3.10) was reported by the controller
-as a move that the operator did not see.
+the same things again; a J4 +5 deg run (§3.10) was reported by the
+controller as a move that the operator did not see, two runs ended on
+ErrorID -1 because the controller's remote-control mode was no longer
+TCP/IP (§3.11), and a J4 +10 deg run with a mark on the flange was seen to
+turn (§3.12).
 §4 lists what is still open. Another unit or firmware may differ, so treat
 what follows as expectations to re-check, not as specifications.
 
@@ -53,9 +56,11 @@ The jog tool comes after a complete observation record, and only on the
 human's request in the session:
 
 5. `python -m src.devices.mg400.jog --dry-run`, then `--mock`.
-6. In DobotStudio Pro: the arm disabled, no alarm, nothing on the flange; note
-   the playback joint speed / acceleration and the global speed ratio (the tool
-   bounds only the ratio in its command); then close DobotStudio Pro.
+6. In DobotStudio Pro: the arm disabled, no alarm, nothing on the flange, the
+   remote-control mode TCP/IP (otherwise the first `RobotMode()` is answered
+   ErrorID -1 and the tool ends, §3.11); note the playback joint speed /
+   acceleration and the global speed ratio (the tool bounds only the ratio in
+   its command); then close DobotStudio Pro.
 7. Check that the arc of the rotation (default J1 +5 deg and back; at most
    10 deg) is clear for the whole arm and its cables, and that the emergency-
    stop button is within reach. Stay at the arm for the run.
@@ -351,7 +356,36 @@ and closed it, and ran the same command again (`jog_06`): the same
 `-1,{},RobotMode();` to the first command, after 28 ms, with the feedback
 again normal (mode 4, no alarm, joints unchanged from `jog_05`). So the -1
 did not depend on DobotStudio Pro being open, and it persisted across its
-restart; what cleared it, if anything, is to be added here.
+restart. The operator then found the cause in DobotStudio Pro: its
+remote-control mode was no longer TCP/IP. With it set back to TCP/IP, the
+next run went through (§3.12). So ErrorID -1 to a read-only query is what
+the controller answers when TCP/IP remote control is off; the feedback port
+keeps streaming regardless, so the tool's feedback check cannot see it.
+
+The second `jog_06` was written into the same folder with `--out`, and
+the tool overwrote the first `jog_06` record (the -1 run) without a
+warning; the numbers above are from a read of it before that. A record
+folder should not be reused (§4).
+
+### 3.12 Jog tool, seventh run: J4 +10 deg, the mark on the flange seen to turn
+
+Four minutes after the second -1, with the remote-control mode back on
+TCP/IP, `--j1 0 --j4 10` ran to the end (record in the `jog_06` folder,
+started 05:17:47 UTC; `complete: true`, 65 commands, no fault, 1589
+feedback packets over 13.0 s, of which 6.6 s before the Enter). The
+operator saw the tape mark on the flange turn and come back. By the
+controller: J4 from -27.94 to -17.94 deg and back, mode 7 on four polls and
+97 feedback packets per leg (about 0.8 s, against 78 and 79 for 5 deg),
+arrival after 0.93 and 0.94 s, `q_actual` J4 lagging `q_target` by up to
+1.16 deg during the motion; J1, J2, J3 within 0.02, 0.11 and 0.12 deg (the
+J3 excursion while enabling again, 0.12 deg over 9 packets). ResetRobot
+170 ms, EnableRobot 1.21 s, DisableRobot 1.03 s, the same as every run.
+
+J4's reading again changed with the arm disabled: it was -28.91 at the
+start of the two -1 runs and -27.94 at the start of this one (0.97 deg over
+four minutes), and after the disable the final `GetAngle()` read -26.83,
+1.11 deg above the start (1.31 in §3.10). Final minus start:
+[+0.003, -0.003, +0.009, +1.112].
 
 ## 4. Open points
 
@@ -380,18 +414,17 @@ restart; what cleared it, if anything, is to be added here.
   jog tool's limits (J1 / J4 only, 1..10 deg, ratio at most 30 %) are design
   choices, not measurements, and its speed is bounded only relative to the
   controller's own settings. The stop sequence has not run on the arm.
-- J4 (§3.10): the controller reported a 5 deg move and back that the
-  operator did not see, the reading changed by 1.65 deg between two runs
-  with the arm disabled and jumped by 1.31 deg in one feedback step after
-  the disable. The J4 motor is fitted (operator's check); whether the flange
-  turned is to be settled with a mark on it and a larger J4 offset, and the
-  two reading changes with the arm disabled are unexplained. Until then, no
-  J4 run should be read as a move, and the tool's reported arrival is the
+- J4 (§3.10, §3.12): the 5 deg move was not seen, the 10 deg move with a
+  mark on the flange was. The J4 reading changes with the arm disabled,
+  by 1.65 and 0.97 deg between runs and by 1.31 and 1.11 deg right after a
+  disable (the other joints by at most 0.04 deg), are unexplained; a J4 run
+  therefore ends with a J4 reading about 1 deg from its start, which the
+  tool records and does not judge. The tool's reported arrival is the
   controller's word only.
-- ErrorID -1 to a `RobotMode()` (§3.11): when the controller answers it and
-  what clears it. Seen twice in a row, with DobotStudio Pro open and after
-  it was restarted and closed, after the arm had been moved by 80 deg in J4
-  between runs; not seen in the four runs before that.
+- The jog tool writes into an existing `--out` folder and overwrites the
+  record there (§3.11). Refusing a non-empty folder is a change to the tool
+  and needs a reviewed plan like any other; until then, a new folder name
+  per run.
 
 ## 5. Interrupting a run
 

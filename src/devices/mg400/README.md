@@ -229,7 +229,9 @@ The address of a real run must be a numeric IP literal; every connection, includ
 stop sequence's, connects to it directly with a timeout and no name lookup. `--mock`
 ignores the address and connects to the fake on 127.0.0.1 only (a test asserts it).
 
-Preconditions of a real run (the human's): `--mock` passed; DobotStudio Pro closed and no
+Preconditions of a real run (the human's): `--mock` passed; the controller's remote-control
+mode TCP/IP (set in DobotStudio Pro; otherwise the first `RobotMode()` is answered ErrorID
+-1 and the tool ends before enabling); DobotStudio Pro closed and no
 other PC or program sending to the arm; nothing on the flange; the arc clear for the whole
 arm and its cables; the speed settings noted; the controller version typed; the e-stop
 button within reach. The agent never runs it (CLAUDE.md rule 1).
