@@ -222,6 +222,14 @@ was answered. What the two feedback packets (8 ms apart) showed:
   way before opening the Dashboard port, so it would end there too. The alarm
   has to be read and cleared in DobotStudio Pro.
 
+DobotStudio Pro's alarm panel, opened after the run, listed four controller
+errors: code 67, level 5, "Joint2 exceeds negative limit", and code 85, level
+0, three times, "Hardware emergency stop button press or software emergency
+stop trigger" (its suggested fix: release the hardware button, or click the
+software emergency stop again). The J2 reading of about -28.7 deg in the
+packets is consistent with code 67; how the arm got there, and when the
+emergency stop was pressed, are not recorded anywhere.
+
 The tool's exit code for a run ended before the Enter is 2.
 
 ## 4. Open points
