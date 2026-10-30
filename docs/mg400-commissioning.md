@@ -12,7 +12,9 @@ the records). The controller version was not typed into any run
 (`controller_version_typed: null`). The first three runs ended early; the
 fourth (§3.6) is the first complete record. The jog tool's first run on the
 arm (2026-10-30, controller version 2.8.5 typed, §3.7) ended at its first
-check: the arm was in alarm, and nothing was sent to it.
+check: the arm was in alarm, and nothing was sent to it. Its second run the
+same day, after the alarms were cleared, is the first complete jog record
+(§3.8): J1 +5 deg and back, 9.2 s from start to end.
 §4 lists what is still open. Another unit or firmware may differ, so treat
 what follows as expectations to re-check, not as specifications.
 
@@ -27,7 +29,7 @@ written; it reads the feedback port 30004 and never opens the motion port
 implemented to its own reviewed plan: `jog.py` (`src/devices/mg400/README.md`,
 "Jog tool"), which enables the arm, makes one small joint move and back, and
 disables it. Its first run on the arm ended before any command was sent
-(§3.7); none of its control commands has reached the arm yet (§4). The observation tool
+(§3.7); its second ran to the end (§3.8). The observation tool
 itself stayed read-only; the control commands it shares a module with are
 refused on its connections.
 
@@ -232,6 +234,60 @@ emergency stop was pressed, are not recorded anywhere.
 
 The tool's exit code for a run ended before the Enter is 2.
 
+### 3.8 Jog tool, second attempt: the first complete jog record
+
+Seventeen minutes later, after the alarms had been cleared in DobotStudio Pro
+and J2 moved back inside its limit, the same command (new record folder) ran
+to the end: `complete: true`, `armed: true`, `disabled_confirmed: true`, no
+notes, no stop sequence, 65 commands, all three connections (feedback,
+dashboard-1, motion) closed by the tool at the end. Start joints
+[1.60, -14.68, 20.25, 48.17], target J1 +5 deg, SpeedJ = AccJ = 10. What
+the record shows, by §4's questions:
+
+- `ResetRobot()` on the disabled arm was answered `0,{}` after 166 ms;
+  `RobotMode()` right after it was 4 and `GetErrorID()` empty; the joints
+  after it differed from the start by at most 0.006 deg.
+- `EnableRobot()` was answered `0,{}` after 1.24 s, and the next
+  `RobotMode()` (1 ms later) was already 5; in the feedback, mode 5 and
+  `enable_status` 1 began 2.9 s after the first packet. While enabling, the
+  feedback's J3 rose by 0.10 deg for about 0.1 s (12 packets, from 20.25 to
+  20.35 and back); the `GetAngle()` 0.5 s after the enable matched the start
+  within 0.003 deg, so the tool's "enabling moved the arm" check passed.
+- Both `JointMovJ(...,SpeedJ=10,AccJ=10)` were accepted on the motion port and
+  answered `0,{},JointMovJ(<the full command as sent>);` after 156 and
+  147 ms: the echo carries the whole command, SpeedJ and AccJ included (the
+  guide's Return line shows the joints only).
+- Each leg: `RobotMode()` 7 on the four polls that followed the move
+  command, then 5; the arrival criterion (mode 5, then joints within 0.2 deg
+  of the target) was met after 0.93 s on both legs, with 10 polls each. In
+  the feedback, mode 7 lasted 94 packets (about 0.77 s) on each leg, and
+  `q_target` led `q_actual` by at most 0.55 deg during the motion. The
+  feedback's `velocity_ratio` field read 10 in exactly one packet before
+  each mode-7 run and 50 otherwise; the two xyz ratios stayed 50.
+- J2 and J3 stayed within 0.08 and 0.11 deg of their start over the whole
+  recording (the J3 excursion above is at the enable, not in the moves);
+  J4 within 0.011 deg. J1's extremes were 1.598 and 6.604 deg.
+- `DisableRobot()` was answered `0,{}` after 1.05 s and the next
+  `RobotMode()` was 4; the feedback showed mode 4 and `enable_status` 0 for
+  the last 122 packets. After the disable, J1 settled from 1.603 to 1.639 deg
+  (in the feedback and in the final `GetAngle()`): the final joints minus the
+  start joints were [+0.037, -0.004, +0.008, -0.003] deg.
+- Timeline: armed 2.0 s after the start; enabling 0.2 s after that; the two
+  moves and their dwells 1.9 s to 6.1 s after the armed point; disabled
+  7.1 s after it; record written and connections closed at 9.2 s.
+- Feedback over the 9.2 s: 1122 packets, none rejected, no fault, step 7 to
+  12 ms (median 8 ms), `pause_cmd_flag` 0 and `brake_status` 0 throughout,
+  `run_queued_cmd` 0 and 1. `speed_scaling` read 97.0 in every packet, as in
+  §3.7; what it holds is not explained by the guide.
+- The Dashboard connection stayed up for the whole run (the tool opens only
+  one, so the §3.4 ending was not exercised). `reply_s` were 0.5 ms to 1.24 s;
+  the three above 0.15 s were ResetRobot, EnableRobot and DisableRobot.
+- `qd_actual` again took values up to about 66 (in j4) with the arm still
+  (§3.6).
+
+What the operator saw at the arm is not in the record and is to be added
+from the operator's notes.
+
 ## 4. Open points
 
 - Whether the first-connection ending repeats beyond these three runs (each
@@ -250,18 +306,14 @@ The tool's exit code for a run ended before the Enter is 2.
   example at a second pose, is a human step still to be planned.
 - The meaning of the non-zero `qd_actual` / `tcp_speed_actual` fields on a
   disabled arm (§3.6).
-- What the jog tool will show on the bench, none of it yet observed (its
-  first run, §3.7, ended before any command): whether
-  `ResetRobot()` on a disabled arm answers 0 and leaves it disabled; how long
-  `EnableRobot()` takes to show mode 5 on the Dashboard and in the feedback;
-  whether `JointMovJ` at a 10 % ratio is accepted, how its echo looks (the
-  guide's Return line shows the joints only), how long a 5 deg J1 move takes
-  and whether `RobotMode()` shows 7 during it; whether J2 / J3 stay; whether
-  the arm returns to the start joints within the 0.2 deg tolerance; how long
-  `DisableRobot()` takes; whether the Dashboard and motion connections survive.
-  The jog tool's limits (J1 / J4 only, 1..10 deg, ratio at most 30 %) are
-  design choices, not measurements, and its speed is bounded only relative to
-  the controller's own settings.
+- From the first complete jog record (§3.8, one run, J1 +5 deg at a 10 %
+  ratio with the controller at 50 %): the 0.10 deg J3 excursion while
+  enabling; the one-packet `velocity_ratio` 10 before each move; the 0.037 deg
+  J1 settling after the disable; the constant `speed_scaling` 97.0. None has
+  been seen twice, and nothing was tried with J4, other sizes or ratios. The
+  jog tool's limits (J1 / J4 only, 1..10 deg, ratio at most 30 %) are design
+  choices, not measurements, and its speed is bounded only relative to the
+  controller's own settings. The stop sequence has not run on the arm.
 
 ## 5. Interrupting a run
 
