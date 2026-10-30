@@ -330,6 +330,22 @@ moves its edge by about 2 mm in 0.6 s, which may simply not have been
 visible; a run with a mark on the flange is the way to settle it (§4). The
 two J4 reading changes with the arm disabled are not explained by that.
 
+### 3.11 Jog tool, fifth run: the first `RobotMode()` answered ErrorID -1
+
+Eleven minutes later, `--j1 0 --j4 10` with a tape mark on the flange
+(record `jog_05`). The feedback was normal (15 packets in 0.1 s, mode 4,
+`error_status` 0, `enable_status` 0), but the first Dashboard command,
+`RobotMode()`, was answered `-1,{},RobotMode();` after 72 ms, and the tool
+ended there as designed (`stopped by MG400CommandError: RobotMode() ->
+ErrorID -1`, `armed: false`, `complete: false`, nothing else sent, exit 2).
+It is the first non-zero ErrorID on a read-only command in any record
+(§3.2's -20000 and -30001 were parameter refusals). What else the record
+shows: the feedback joints were [-0.31, -19.77, 20.30, -28.90] against
+[1.69, -14.70, 20.29, 51.13] at the end of §3.10, so J1, J2 and J4 had been
+moved between the runs (J4 by 80 deg), by what is not in the record. What
+the controller was doing at that moment (DobotStudio Pro connected or just
+closed, a jog from it still in effect) is the operator's to say.
+
 ## 4. Open points
 
 - Whether the first-connection ending repeats beyond these three runs (each
@@ -365,6 +381,9 @@ two J4 reading changes with the arm disabled are not explained by that.
   two reading changes with the arm disabled are unexplained. Until then, no
   J4 run should be read as a move, and the tool's reported arrival is the
   controller's word only.
+- ErrorID -1 to a `RobotMode()` (§3.11): when the controller answers it, and
+  whether it is tied to DobotStudio Pro being connected or to a jog from it;
+  seen once.
 
 ## 5. Interrupting a run
 
