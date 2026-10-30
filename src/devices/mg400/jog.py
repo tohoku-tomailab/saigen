@@ -1191,6 +1191,17 @@ def _main(ap, args) -> int:
     folder = args.out or os.path.join(
         LOG_ROOT, datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         + ("_mock" if args.mock else ""))
+    # a record is never overwritten (2026-10-30: four bench records were lost to a reused
+    # --out); checked before anything is opened, so nothing reaches the arm
+    try:
+        held = os.path.isdir(folder) and bool(os.listdir(folder))
+    except OSError as e:
+        _say("the record folder %s cannot be checked: %s" % (folder, e))
+        return 2
+    if held:
+        _say("the record folder %s already holds files: give a new --out (a run never "
+             "overwrites a record)" % folder)
+        return 2
     print(PRECONDITIONS)
     if "onedrive" in os.path.abspath(folder).lower():
         print(ONEDRIVE_NOTE)

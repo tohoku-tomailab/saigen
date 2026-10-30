@@ -2564,3 +2564,43 @@ def test_cli_answers_a_ctrl_c_in_its_own_last_statements(monkeypatch, tmp_path, 
     assert code == 130
     out = capsys.readouterr().out
     assert "check the arm, then the record" in out and str(tmp_path) in out     # the folder named, not "above"
+
+
+# ---------------------------------------------------------------------------
+# After the bench of 2026-10-30: a reused --out folder overwrote four records.
+# The CLI refuses a folder that already holds files, before anything is opened.
+# ---------------------------------------------------------------------------
+
+
+def test_main_refuses_an_out_folder_that_holds_files(tmp_path, capsys, monkeypatch):
+    (tmp_path / "report.json").write_text("{}", encoding="utf-8")
+    opened = []
+    monkeypatch.setattr(jog, "jog", lambda *a, **k: opened.append(a) or {})
+    assert jog.main(["--mock", "--out", str(tmp_path)]) == 2
+    assert opened == []                                        # jog() never ran: nothing opened
+    assert (tmp_path / "report.json").read_text(encoding="utf-8") == "{}"   # the record untouched
+    out = capsys.readouterr().out
+    assert "already holds files" in out and str(tmp_path) in out
+    assert "Before jogging" not in out                         # refused before the preconditions
+
+
+def test_main_accepts_an_empty_existing_out_folder(tmp_path):
+    (tmp_path / "empty").mkdir()
+    assert jog.main(["--mock", "--out", str(tmp_path / "empty")]) == 0
+    assert (tmp_path / "empty" / "report.json").exists()
+
+
+def test_main_treats_an_unreadable_out_folder_as_a_record_error(tmp_path, capsys, monkeypatch):
+    import os as _os
+    real = _os.listdir
+
+    def denied(path):
+        if _os.path.abspath(path) == _os.path.abspath(str(tmp_path)):
+            raise PermissionError("denied")
+        return real(path)
+    monkeypatch.setattr(jog.os, "listdir", denied)
+    opened = []
+    monkeypatch.setattr(jog, "jog", lambda *a, **k: opened.append(a) or {})
+    assert jog.main(["--mock", "--out", str(tmp_path)]) == 2
+    assert opened == []
+    assert "cannot be checked" in capsys.readouterr().out

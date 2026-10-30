@@ -206,7 +206,9 @@ out of a clean-up stuck on a disk or a terminal. The emergency stop is the butto
 controller: the human must have it within reach, standing at the arm, for the whole run.
 
 Exit codes: 0 complete (final mode 4, no alarm, every save confirmed); 2 ended before the
-Enter (precondition, limits, prompt, record error); 1 otherwise (a fault after the Enter:
+Enter (precondition, limits, prompt, record error, or a `--out` folder that already holds
+files when the tool starts: each run gets a new folder; two runs started into the same
+empty folder at once are not guarded against); 1 otherwise (a fault after the Enter:
 the stop sequence ran and its state is printed, unless the arm had already reported
 disabled at step 8, in which case no stop sequence was added and the message says to check the
 arm anyway; or the arm's sequence completed but the background I/O reported errors, or
