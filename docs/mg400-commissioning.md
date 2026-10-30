@@ -285,8 +285,8 @@ the record shows, by §4's questions:
 - `qd_actual` again took values up to about 66 (in j4) with the arm still
   (§3.6).
 
-What the operator saw at the arm is not in the record and is to be added
-from the operator's notes.
+The operator at the arm saw it move and return, with no unexpected motion
+and no unusual sound, and DobotStudio Pro showed no alarm afterwards.
 
 ## 4. Open points
 
