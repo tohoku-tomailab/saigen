@@ -14,7 +14,9 @@ fourth (§3.6) is the first complete record. The jog tool's first run on the
 arm (2026-10-30, controller version 2.8.5 typed, §3.7) ended at its first
 check: the arm was in alarm, and nothing was sent to it. Its second run the
 same day, after the alarms were cleared, is the first complete jog record
-(§3.8): J1 +5 deg and back, 9.2 s from start to end.
+(§3.8): J1 +5 deg and back, 9.2 s from start to end. A repeat (§3.9) showed
+the same things again, and a J4 run (§3.10) was reported by the controller
+as a move that the operator did not see.
 §4 lists what is still open. Another unit or firmware may differ, so treat
 what follows as expectations to re-check, not as specifications.
 
@@ -288,6 +290,45 @@ the record shows, by §4's questions:
 The operator at the arm saw it move and return, with no unexpected motion
 and no unusual sound, and DobotStudio Pro showed no alarm afterwards.
 
+### 3.9 Jog tool, third run: the repeat
+
+Seven minutes after §3.8, the same command again (record `jog_03`, start
+joints [1.67, -14.69, 20.27, 48.17]) ran to the end with the same shape:
+65 commands, ResetRobot 166 ms, EnableRobot 1.21 s then mode 5 at once,
+both JointMovJ echoed in full (148 and 171 ms), mode 7 on four polls and 94
+feedback packets per leg, arrival after 0.93 and 0.94 s, DisableRobot
+1.03 s, 985 feedback packets, none rejected, no fault. The once-seen items
+of §3.8 were seen again: J3 rose by 0.12 deg for 11 packets while enabling;
+`velocity_ratio` read 10 in one packet before each move; after the disable
+J1 settled by 0.023 deg (final minus start [+0.023, -0.002, +0.008, 0.000]);
+`speed_scaling` 97.0 throughout.
+
+### 3.10 Jog tool, fourth run: a J4 move the controller reported and the operator did not see
+
+Forty seconds later, `--j1 0 --j4 5` (record `jog_04`). The record has the
+same shape as §3.8 and §3.9 (`complete: true`, 65 commands, no fault), and
+by the controller's word J4 moved: `GetAngle()` went from 49.81 to 54.81 deg
+over the four mode-7 polls of the first leg and back to 49.81 on the second;
+the feedback's `q_actual` J4 followed `q_target` with a lag of up to
+0.85 deg, mode 7 lasted 78 and 79 packets (about 0.64 s per leg, against 94
+for the J1 legs), and `tool_vector_actual` r changed by 5 deg with it. J1,
+J2 and J3 stayed within 0.03, 0.09 and 0.12 deg. The operator, standing at
+the arm, saw nothing move. Two more things in the J4 readings:
+
+- This run's start J4 was 49.81 deg, while §3.9's final `GetAngle()` 40 s
+  earlier had read 48.17: a change of 1.65 deg with the arm disabled between
+  the runs.
+- About 0.3 s after the feedback showed mode 4 at the end of the run, the J4
+  reading jumped from 49.82 to 51.13 deg between two packets (8 ms), and the
+  final `GetAngle()` read 51.13: final minus start J4 = +1.31 deg, far above
+  the 0.00 to 0.04 deg of the other joints and of J4 in the earlier runs.
+
+The tool's arrival criterion is the controller's reported joints, so it
+cannot tell a reported move from a physical one. Whether this unit has a J4
+drive fitted, and what the controller's J4 reading is when none is, are for
+the operator to establish (§4); until then the J4 runs are not evidence
+that the tool moves J4.
+
 ## 4. Open points
 
 - Whether the first-connection ending repeats beyond these three runs (each
@@ -306,14 +347,22 @@ and no unusual sound, and DobotStudio Pro showed no alarm afterwards.
   example at a second pose, is a human step still to be planned.
 - The meaning of the non-zero `qd_actual` / `tcp_speed_actual` fields on a
   disabled arm (§3.6).
-- From the first complete jog record (§3.8, one run, J1 +5 deg at a 10 %
-  ratio with the controller at 50 %): the 0.10 deg J3 excursion while
-  enabling; the one-packet `velocity_ratio` 10 before each move; the 0.037 deg
-  J1 settling after the disable; the constant `speed_scaling` 97.0. None has
-  been seen twice, and nothing was tried with J4, other sizes or ratios. The
+- From the complete jog records (§3.8 to §3.10, J1 +5 deg twice and J4
+  +5 deg once, at a 10 % ratio with the controller at 50 %): the 0.10 to
+  0.12 deg J3 excursion while enabling; the one-packet `velocity_ratio` 10
+  before each move; the 0.02 to 0.04 deg J1 settling after the disable; the
+  constant `speed_scaling` 97.0. Each was seen in every run, none is
+  explained by the guide. Nothing was tried with other sizes or ratios. The
   jog tool's limits (J1 / J4 only, 1..10 deg, ratio at most 30 %) are design
   choices, not measurements, and its speed is bounded only relative to the
   controller's own settings. The stop sequence has not run on the arm.
+- J4 (§3.10): the controller reported a 5 deg move and back that the
+  operator did not see, the reading changed by 1.65 deg between two runs
+  with the arm disabled and jumped by 1.31 deg in one feedback step after
+  the disable. Whether a J4 drive is fitted on this unit, what DobotStudio
+  Pro's own J4 jog does, and what the reading means if none is fitted, are
+  the operator's to check at the arm. Until then, no J4 run should be read
+  as a move, and the tool's reported arrival is the controller's word only.
 
 ## 5. Interrupting a run
 
