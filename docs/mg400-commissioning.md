@@ -324,10 +324,11 @@ the arm, saw nothing move. Two more things in the J4 readings:
   the 0.00 to 0.04 deg of the other joints and of J4 in the earlier runs.
 
 The tool's arrival criterion is the controller's reported joints, so it
-cannot tell a reported move from a physical one. Whether this unit has a J4
-drive fitted, and what the controller's J4 reading is when none is, are for
-the operator to establish (§4); until then the J4 runs are not evidence
-that the tool moves J4.
+cannot tell a reported move from a physical one. The operator then checked
+the arm: the J4 motor is fitted. With nothing on the flange, a 5 deg turn
+moves its edge by about 2 mm in 0.6 s, which may simply not have been
+visible; a run with a mark on the flange is the way to settle it (§4). The
+two J4 reading changes with the arm disabled are not explained by that.
 
 ## 4. Open points
 
@@ -359,10 +360,11 @@ that the tool moves J4.
 - J4 (§3.10): the controller reported a 5 deg move and back that the
   operator did not see, the reading changed by 1.65 deg between two runs
   with the arm disabled and jumped by 1.31 deg in one feedback step after
-  the disable. Whether a J4 drive is fitted on this unit, what DobotStudio
-  Pro's own J4 jog does, and what the reading means if none is fitted, are
-  the operator's to check at the arm. Until then, no J4 run should be read
-  as a move, and the tool's reported arrival is the controller's word only.
+  the disable. The J4 motor is fitted (operator's check); whether the flange
+  turned is to be settled with a mark on it and a larger J4 offset, and the
+  two reading changes with the arm disabled are unexplained. Until then, no
+  J4 run should be read as a move, and the tool's reported arrival is the
+  controller's word only.
 
 ## 5. Interrupting a run
 
