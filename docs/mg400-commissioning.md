@@ -346,6 +346,13 @@ moved between the runs (J4 by 80 deg), by what is not in the record. What
 the controller was doing at that moment (DobotStudio Pro connected or just
 closed, a jog from it still in effect) is the operator's to say.
 
+Five minutes later the operator restarted DobotStudio Pro, disconnected it
+and closed it, and ran the same command again (`jog_06`): the same
+`-1,{},RobotMode();` to the first command, after 28 ms, with the feedback
+again normal (mode 4, no alarm, joints unchanged from `jog_05`). So the -1
+did not depend on DobotStudio Pro being open, and it persisted across its
+restart; what cleared it, if anything, is to be added here.
+
 ## 4. Open points
 
 - Whether the first-connection ending repeats beyond these three runs (each
@@ -381,9 +388,10 @@ closed, a jog from it still in effect) is the operator's to say.
   two reading changes with the arm disabled are unexplained. Until then, no
   J4 run should be read as a move, and the tool's reported arrival is the
   controller's word only.
-- ErrorID -1 to a `RobotMode()` (§3.11): when the controller answers it, and
-  whether it is tied to DobotStudio Pro being connected or to a jog from it;
-  seen once.
+- ErrorID -1 to a `RobotMode()` (§3.11): when the controller answers it and
+  what clears it. Seen twice in a row, with DobotStudio Pro open and after
+  it was restarted and closed, after the arm had been moved by 80 deg in J4
+  between runs; not seen in the four runs before that.
 
 ## 5. Interrupting a run
 
