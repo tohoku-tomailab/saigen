@@ -211,9 +211,11 @@ def test_observe_mock_run_opens_only_read_only_connections(tmp_path, monkeypatch
     assert set(names(fake.received)) <= set(protocol.ALLOWED)
 
 
-def test_the_motion_port_is_named_only_by_the_jog_tool_and_the_fake():
+def test_the_motion_port_is_named_only_by_the_control_core_the_jog_tool_and_the_fake():
+    # observe.py (read-only) and protocol.py never hold the number; since the stage-one split the
+    # connection code lives in control.py, which therefore names it
     for name in os.listdir(MG400_DIR):
-        if name.endswith(".py") and name not in ("jog.py", "fake.py"):
+        if name.endswith(".py") and name not in ("control.py", "jog.py", "fake.py"):
             with open(os.path.join(MG400_DIR, name), encoding="utf-8") as f:
                 tree = ast.parse(f.read())
             for node in ast.walk(tree):
@@ -441,7 +443,7 @@ def test_an_enable_that_moves_the_arm_is_a_fault(tmp_path):
 # The stop sequence
 # ----------------------------------------------------------------------
 def test_stuck_running_reset_then_disable_no_emergency_stop(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     try:
         report = run_failing(fake, tmp_path, exc=jog.JogFault)
@@ -499,7 +501,7 @@ def test_alarm_with_the_arm_moving_emergency_stop(tmp_path):
 
 
 def test_disable_without_effect_emergency_stop(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True, disable_fails=True)
     try:
         report = run_failing(fake, tmp_path, exc=jog.JogFault)
@@ -516,7 +518,7 @@ def test_disable_without_effect_emergency_stop(tmp_path, monkeypatch):
 
 
 def test_reset_and_disable_without_effect_while_running_emergency_stop(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True, disable_fails=True, reset_fails=True)
     try:
         report = run_failing(fake, tmp_path, exc=jog.JogFault)
@@ -533,7 +535,7 @@ def test_a_disabled_reading_that_does_not_hold_disables_again_then_emergency_sto
                                                                                     flips, expected):
     """Mode 4 read once, then 5 again (a late Enable): a second DisableRobot; if that does not
     hold either, the last resort"""
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     polls_after_disable = []
     flipped = []
@@ -564,7 +566,7 @@ def test_a_disabled_reading_that_does_not_hold_disables_again_then_emergency_sto
 def test_an_enable_not_shown_complete_ends_in_emergency_stop(tmp_path, monkeypatch):
     """Enable acknowledged but RobotMode 5 never read: a mode 4 that holds now proves nothing
     about an Enable that may still take effect, so the last resort is used anyway"""
-    monkeypatch.setattr(jog, "ENABLE_DEADLINE_S", 0.5)
+    monkeypatch.setattr(jog.control, "ENABLE_DEADLINE_S", 0.5)
     fake = FakeMG400(enable_s=None)
     try:
         report = run_failing(fake, tmp_path, exc=jog.JogFault)
@@ -584,7 +586,7 @@ def test_a_late_enable_cannot_slip_past_the_stop(tmp_path, monkeypatch):
     """The Enable completes 2.8 s after it was sent: after Reset, Disable and the hold, the arm
     would become enabled with the tool gone. The EmergencyStop sent because the Enable's
     outcome was unknown leaves it in alarm instead"""
-    monkeypatch.setattr(jog, "ENABLE_DEADLINE_S", 0.5)
+    monkeypatch.setattr(jog.control, "ENABLE_DEADLINE_S", 0.5)
     fake = FakeMG400(enable_s=2.8)
     try:
         report = run_failing(fake, tmp_path, exc=jog.JogFault)
@@ -613,7 +615,7 @@ def test_an_enable_whose_reply_was_lost_is_unresolved(tmp_path):
 def test_a_hold_that_replies_stop_showing_is_unconfirmed(tmp_path, monkeypatch):
     """First RobotMode after the Disable: 4; afterwards RobotMode is refused while GetAngle
     keeps answering: the hold is not shown, so EmergencyStop follows within hold + grace"""
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     real_reply = fake.reply
     after = []
@@ -640,7 +642,7 @@ def test_a_hold_shown_only_by_a_late_reply_is_unconfirmed(tmp_path, monkeypatch)
     """After the first 4, RobotMode is refused for 1.3 s; the next RobotMode is answered 4 but
     only after 0.9 s (within the 1 s socket timeout), at about 2.3 s after the first 4: past
     hold + grace, so it must not confirm the hold (review 3 M1)"""
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     real_reply = fake.reply
     first4 = {}
@@ -724,7 +726,7 @@ def test_refused_motion_stops_and_the_arm_never_moved(tmp_path):
 
 
 def test_a_refused_reset_in_the_stop_sequence_does_not_stop_the_sequence(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     real_reply = fake.reply
 
@@ -779,7 +781,7 @@ def test_feedback_mode_outside_the_phase_is_a_fault(tmp_path):
 
 
 def test_connection_lost_at_reset_goes_to_a_new_connection(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
 
     def on_command(cmd):
@@ -799,8 +801,8 @@ def test_connection_lost_at_reset_goes_to_a_new_connection(tmp_path, monkeypatch
 
 
 def test_no_connection_at_all_is_unconfirmed(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
-    monkeypatch.setattr(jog, "STOP_POLL_S", 0.5)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "STOP_POLL_S", 0.5)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
 
     def on_command(cmd):
@@ -833,8 +835,8 @@ def test_no_connection_at_all_is_unconfirmed(tmp_path, monkeypatch):
 
 def test_the_stop_sequence_ends_by_its_total_deadline(tmp_path, monkeypatch):
     """Every reply trickles in slowly: the per-reply deadline and the total deadline hold"""
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
-    monkeypatch.setattr(jog, "STOP_TOTAL_S", 3.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "STOP_TOTAL_S", 3.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     real_send = socket.socket.sendall
     slow = {"on": False}
@@ -944,8 +946,8 @@ def test_a_slow_send_cannot_push_a_reply_past_the_total_deadline(tmp_path, monke
     """Total 1.0 s. Reset answered after 0.4 s (ok at 0.4). Disable: 0.6 s left, the send takes
     0.3 s and the fake answers 0.4 s later, at 1.1 s: within the socket timeout set at the send
     (0.6 s), past the total deadline. It must not count as ok"""
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
-    monkeypatch.setattr(jog, "STOP_TOTAL_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "STOP_TOTAL_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     state = {}
 
@@ -1129,7 +1131,7 @@ def test_ctrl_c_before_arming_sends_nothing(tmp_path):
 
 
 def test_sigint_is_ignored_during_the_stop_sequence_and_restored(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     seen = {}
     before = signal.getsignal(signal.SIGINT)
@@ -1148,8 +1150,8 @@ def test_sigint_is_ignored_during_the_stop_sequence_and_restored(tmp_path, monke
 
 
 def test_a_blocked_save_does_not_delay_the_stop(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
-    monkeypatch.setattr(jog, "IO_DRAIN_S", 0.5)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "IO_DRAIN_S", 0.5)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     real_replace = os.replace
     armed = []
@@ -1171,8 +1173,8 @@ def test_a_blocked_save_does_not_delay_the_stop(tmp_path, monkeypatch):
 
 
 def test_a_blocked_stdout_does_not_delay_the_stop(tmp_path, monkeypatch):
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
-    monkeypatch.setattr(jog, "IO_DRAIN_S", 0.5)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "IO_DRAIN_S", 0.5)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
 
     def out(text):
@@ -1354,7 +1356,7 @@ def test_a_phase_change_during_the_write_does_not_rejudge_the_packet(tmp_path):
 
 def test_arrival_criterion(tmp_path, monkeypatch):
     r = make_run(tmp_path)
-    monkeypatch.setattr(jog, "POLL_S", 0.0)
+    monkeypatch.setattr(jog.control, "POLL_S", 0.0)
     target, start = [5.0, 10.0, 16.0, 18.0], [0.0, 10.0, 16.0, 18.0]
     r.check = lambda: None
 
@@ -1371,13 +1373,13 @@ def test_arrival_criterion(tmp_path, monkeypatch):
     # idle at the origin (the move has not started): never an arrival
     r.mode = lambda: 5
     r.angles = lambda: list(start)
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 0.2)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 0.2)
     with pytest.raises(jog.JogFault):
         r.wait_arrival(target, start, time.monotonic())
     # within 0.2 deg of the target but still at the origin is impossible: offsets are >= 1 deg
     assert jog.MIN_OFFSET_DEG > 2 * jog.ARRIVE_TOL_DEG
     # before MIN_LEG_S nothing finishes the leg
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 20.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 20.0)
     r.angles = lambda: list(target)
     t0 = time.monotonic()
     r.wait_arrival(target, start, t0)
@@ -1387,7 +1389,7 @@ def test_arrival_criterion(tmp_path, monkeypatch):
     with pytest.raises(jog.JogFault, match="drifted"):
         r.wait_arrival(target, start, time.monotonic() - 1.0)
     # the deadline is counted from the reply and checked before an arrival is accepted
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 0.2)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 0.2)
     r.mode = lambda: 5
     r.angles = lambda: list(target)
     with pytest.raises(jog.JogFault, match="did not arrive"):
@@ -1534,7 +1536,7 @@ def test_cli_exit_code_after_a_stop_sequence(monkeypatch, tmp_path, capsys):
             super().__init__(*a, **k)
             fakes["f"] = self
     monkeypatch.setattr(fake_module, "FakeMG400", Stuck)
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
     assert jog.main(["--mock", "--out", str(tmp_path)]) == 1
     out = capsys.readouterr().out
     assert "stop sequence: reset_disable" in out and "Check the arm" in out
@@ -1626,8 +1628,8 @@ def test_a_reply_adopted_after_the_stop_deadline_is_not_ok(tmp_path, monkeypatch
     """Total 1.0 s. Reset answered at 0.4 s. The Disable's reply comes back from a query that
     ignored the deadline (a read that let it through), 0.7 s later: the stop sequence itself
     must refuse to count it as ok, and nothing is confirmed"""
-    monkeypatch.setattr(jog, "MOVE_DEADLINE_S", 1.0)
-    monkeypatch.setattr(jog, "STOP_TOTAL_S", 1.0)
+    monkeypatch.setattr(jog.control, "MOVE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(jog.control, "STOP_TOTAL_S", 1.0)
     fake = FakeMG400(move_s=0.2, stuck_running=True)
     state = {}
 
@@ -1825,7 +1827,7 @@ def test_ctrl_c_between_the_armed_point_and_the_thread_leaves_no_save_in_the_sto
             fired.append(1)
             raise KeyboardInterrupt
         return real_utc()
-    monkeypatch.setattr(jog, "_utc", utc)
+    monkeypatch.setattr(jog.control, "_utc", utc)
     fake = FakeMG400()
     out = []
     try:
@@ -2208,7 +2210,7 @@ def test_an_unfinished_drain_is_a_fault_and_late_errors_count(tmp_path, monkeypa
     """The I/O thread is still busy when the drain gives up (0.2 s here): that alone is a
     fault, and an error the thread reports after the drain is read live, not from the copy
     finish() took"""
-    monkeypatch.setattr(jog, "IO_DRAIN_S", 0.2)
+    monkeypatch.setattr(jog.control, "IO_DRAIN_S", 0.2)
     go = threading.Event()
 
     def out(text, *a, **k):
@@ -2383,7 +2385,7 @@ def test_an_error_after_the_background_check_is_not_listed_but_the_drain_fault_s
     """The thread fails after background_errors looked at its list: that error is not in
     io_thread_errors (the list is what the check saw), but the unfinished drain was already a
     fault, so the run still ends with exit 1"""
-    monkeypatch.setattr(jog, "IO_DRAIN_S", 0.2)
+    monkeypatch.setattr(jog.control, "IO_DRAIN_S", 0.2)
     go = threading.Event()
 
     def out(text, *a, **k):

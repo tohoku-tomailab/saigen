@@ -121,6 +121,12 @@ python -m src.devices.mg400.jog --mock [--j1 5 --j4 0 --speed 10]
 python -m src.devices.mg400.jog <arm IP> --controller-version <V> --note "<playback speed, global ratio>" [--j1 5 --j4 0 --speed 10]
 ```
 
+`jog.py` is the command-line tool (arguments, preconditions, the prompt, Ctrl+C). The code
+that opens the connections, enables and disables the arm, runs the stop sequence, keeps the
+record and polls the interrupt before every send is in `control.py`, moved there unchanged on
+2026-10-30 so that a later robot wrapper can share it; the jog tests and the mutation harness
+guard the move.
+
 What it sends, each built from typed numbers and checked against an exact form before it
 is written (no free text, no parameters that are not shown here):
 
