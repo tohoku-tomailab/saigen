@@ -10,7 +10,9 @@ Configuration checked: one MG400, read from a Windows 11 PC on 2026-10-21 and
 2026-10-22 (the address typed on each run is in the operator's notes, not in
 the records). The controller version was not typed into any run
 (`controller_version_typed: null`). The first three runs ended early; the
-fourth (§3.6) is the first complete record.
+fourth (§3.6) is the first complete record. The jog tool's first run on the
+arm (2026-10-30, controller version 2.8.5 typed, §3.7) ended at its first
+check: the arm was in alarm, and nothing was sent to it.
 §4 lists what is still open. Another unit or firmware may differ, so treat
 what follows as expectations to re-check, not as specifications.
 
@@ -24,7 +26,8 @@ written; it reads the feedback port 30004 and never opens the motion port
 30003. After the observation record was complete, a second tool was
 implemented to its own reviewed plan: `jog.py` (`src/devices/mg400/README.md`,
 "Jog tool"), which enables the arm, makes one small joint move and back, and
-disables it. It has not been run on the arm yet (§4). The observation tool
+disables it. Its first run on the arm ended before any command was sent
+(§3.7); none of its control commands has reached the arm yet (§4). The observation tool
 itself stayed read-only; the control commands it shares a module with are
 refused on its connections.
 
@@ -194,19 +197,53 @@ ran to the end (`complete: true`). What it added:
   the guide; a later stage should not read them as motion.
 - The Dashboard `reply_s` were 0 to 47 ms, as before.
 
+### 3.7 Jog tool, first attempt: the arm was in alarm, nothing was sent
+
+On 2026-10-30 the jog tool was started for the first time on the arm
+(controller version `2.8.5` and the controller's playback speed, acceleration
+and global ratio, all 50 %, typed with `--controller-version` and `--note`;
+the record outside the synced tree). It ended 12 ms after opening the
+feedback port, before the Dashboard port was opened: `commands: []`,
+`armed: false`, `complete: false`, note `jog ended: feedback packet 0: mode 9,
+error_status 1`. Nothing was sent to the arm, so none of §4's jog questions
+was answered. What the two feedback packets (8 ms apart) showed:
+
+- `robot_mode` 9 (alarm) and `error_status` 1 in both, `enable_status` 0,
+  `velocity_ratio`, `xyz_velocity_ratio` and `xyz_acceleration_ratio` 50
+  (the setting the operator typed), `speed_scaling` 97.0.
+- `q_actual` about [1.58, -28.70, 17.54, 48.17] against [0.06, 10.28, 16.85,
+  18.56] in all three records of 2026-10-21 and 22: the arm had been moved
+  since then. How, and whether that is related to the alarm, is not in any
+  record.
+- `qd_actual` and `tcp_speed_actual` again not zero (§3.6).
+- The alarm's ID is not in the record: the tool's first check is the feedback
+  packet, and it ends the run on an alarm there before `GetErrorID()` could
+  be sent. The observation tool waits for the first feedback packet the same
+  way before opening the Dashboard port, so it would end there too. The alarm
+  has to be read and cleared in DobotStudio Pro.
+
+The tool's exit code for a run ended before the Enter is 2.
+
 ## 4. Open points
 
 - Whether the first-connection ending repeats beyond these three runs (each
   time after a second connection was opened), and whether it happens with
   the arm enabled: a later control stage cannot assume a second monitoring
   connection on the Dashboard port.
-- The controller version, to be typed into the next run.
+- The controller version, typed into the jog run of 2026-10-30 (`2.8.5`,
+  §3.7); not yet into a complete observation record.
+- The alarm of 2026-10-30 (§3.7): its ID, its cause, and whether the arm's
+  changed joints since 2026-10-22 are related. When the first feedback packet
+  shows an alarm, neither tool records a `GetErrorID()`; whether they should
+  send that read-only query before ending is a change to the tools and needs
+  a reviewed plan like any other.
 - The mapping of the 6-element feedback arrays to the 4-element replies. The
   tool always reports its comparison as "mapping unverified"; checking it, for
   example at a second pose, is a human step still to be planned.
 - The meaning of the non-zero `qd_actual` / `tcp_speed_actual` fields on a
   disabled arm (§3.6).
-- What the jog tool will show on the bench, none of it yet observed: whether
+- What the jog tool will show on the bench, none of it yet observed (its
+  first run, §3.7, ended before any command): whether
   `ResetRobot()` on a disabled arm answers 0 and leaves it disabled; how long
   `EnableRobot()` takes to show mode 5 on the Dashboard and in the feedback;
   whether `JointMovJ` at a 10 % ratio is accepted, how its echo looks (the
