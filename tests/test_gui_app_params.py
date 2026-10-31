@@ -124,3 +124,21 @@ def test_scope_items_can_change_but_never_become_empty():
     ms = [w for w in at.multiselect if (w.key or "").startswith("items_")][0]
     assert step["items"] == ["vpp", "frequency", "vrms"] and list(ms.value) == step["items"]
     assert _errors(at) == []
+
+
+def test_only_the_relative_rotation_offers_a_speed():
+    """Roadmap 0-10: the absolute ``rotate`` has no ``speed`` in the schema, so a
+    speed selector on it turned a valid flow into one the schema rejects."""
+    from src.flow.schema import ExperimentWorkflow
+
+    at = _app_with([{"action": "rotate", "robot_id": 1, "angle": 90.0},
+                    {"action": "rotate_relative", "robot_id": 1, "angle": 30.0}])
+    speed = [w for w in at.selectbox if (w.key or "").startswith("speed_")]
+    assert [w.key.rsplit("_", 1)[1] for w in speed] == ["1"]
+
+    speed[0].select("high").run()
+    flow = at.session_state["workflow_data"]
+    assert flow["steps"][1]["speed"] == "high"
+    assert "speed" not in flow["steps"][0]
+    ExperimentWorkflow.model_validate(flow)
+    assert _errors(at) == []

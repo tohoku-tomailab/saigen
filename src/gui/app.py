@@ -979,9 +979,11 @@ def render_step_params(step, idx):
         label = "角度 (deg)" + (" - 相対" if action == "rotate_relative" else " - 絶対")
         c1, c2 = st.columns(2)
         _num(c1, label, step, idx, "angle", float, 0.0)
-        speed_labels = {"low": "低速", "normal": "普通", "high": "高速"}
-        _select(c2, "速度", step, idx, "speed", ["low", "normal", "high"], "low",
-                format_func=lambda x: speed_labels[x])
+        # 速度は相対回転だけの項目（絶対回転の schema に speed は無く、書くと拒否される）
+        if action == "rotate_relative":
+            speed_labels = {"low": "低速", "normal": "普通", "high": "高速"}
+            _select(c2, "速度", step, idx, "speed", ["low", "normal", "high"], "low",
+                    format_func=lambda x: speed_labels[x])
 
     elif action == "move_slider":
         _num(st, "位置 (mm)", step, idx, "position", float, 500.0,
