@@ -12,34 +12,55 @@ to the designers listed below and to the paper (see repository README).
 Click a picture to open the STL in GitHub's built-in 3D viewer, where the model
 can be rotated and zoomed in the browser.
 
+### Robot-arm pedestal
+
 <table>
 <tr>
 <td align="center" width="33%"><a href="robot-arm-holder/dobot_magician_holder_210mm.stl"><img src="previews/dobot_magician_holder_210mm.png" width="260" alt="Robot-arm pedestal"></a><br><b>Robot-arm pedestal</b><br><sub>150 × 150 × 211 mm · <a href="robot-arm-holder/dobot_magician_holder_210mm.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_short.stl"><img src="previews/picus2_holder_short.png" width="260" alt="Pipette holder, short (Picus 2)"></a><br><b>Pipette holder, short (Picus 2)</b><br><sub>32 × 67 × 85 mm · <a href="pipette-holder/picus2/picus2_holder_short.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_middle.stl"><img src="previews/picus2_holder_middle.png" width="260" alt="Pipette holder, middle (Picus 2)"></a><br><b>Pipette holder, middle (Picus 2)</b><br><sub>32 × 67 × 135 mm · <a href="pipette-holder/picus2/picus2_holder_middle.stl">3D view</a></sub></td>
-</tr>
-<tr>
-<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_tall.stl"><img src="previews/picus2_holder_tall.png" width="260" alt="Pipette holder, tall (Picus 2)"></a><br><b>Pipette holder, tall (Picus 2)</b><br><sub>32 × 67 × 185 mm · <a href="pipette-holder/picus2/picus2_holder_tall.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_3_middle.stl"><img src="previews/picus2_holder_3_middle.png" width="260" alt="Pipette holder, triple middle (Picus 2)"></a><br><b>Pipette holder, triple middle (Picus 2)</b><br><sub>124 × 67 × 135 mm · <a href="pipette-holder/picus2/picus2_holder_3_middle.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="balance-cover/balance_cover_bce822i.stl"><img src="previews/balance_cover_bce822i.png" width="260" alt="Balance cover (BCE822i)"></a><br><b>Balance cover (BCE822i)</b><br><sub>275 × 240 × 109 mm · <a href="balance-cover/balance_cover_bce822i.stl">3D view</a></sub></td>
-</tr>
-<tr>
-<td align="center" width="33%"><a href="balance-cover/adapters/vial_adapter_screw_no4.stl"><img src="previews/vial_adapter_screw_no4.png" width="260" alt="Adapter: No. 4 screw-cap vial"></a><br><b>Adapter: No. 4 screw-cap vial</b><br><sub>92 × 92 × 10 mm · <a href="balance-cover/adapters/vial_adapter_screw_no4.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="balance-cover/adapters/tube_adapter_centrifuge_50ml.stl"><img src="previews/tube_adapter_centrifuge_50ml.png" width="260" alt="Adapter: 50 mL centrifuge tube"></a><br><b>Adapter: 50 mL centrifuge tube</b><br><sub>90 × 92 × 70 mm · <a href="balance-cover/adapters/tube_adapter_centrifuge_50ml.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="imaging-stand/imaging_stand_assembly.stl"><img src="previews/imaging_stand_assembly.png" width="260" alt="Imaging stand"></a><br><b>Imaging stand</b><br><sub>204 × 90 × 100 mm · <a href="imaging-stand/imaging_stand_assembly.stl">3D view</a></sub></td>
-</tr>
-<tr>
-<td align="center" width="33%"><a href="imaging-stand/imaging_stand_light_shield.stl"><img src="previews/imaging_stand_light_shield.png" width="260" alt="Imaging-stand light shield"></a><br><b>Imaging-stand light shield</b><br><sub>250 × 120 × 120 mm · <a href="imaging-stand/imaging_stand_light_shield.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="vessel-holder/vessel_holder_bottom_500ml.stl"><img src="previews/vessel_holder_bottom_500ml.png" width="260" alt="Vessel holder, base (500 mL)"></a><br><b>Vessel holder, base (500 mL)</b><br><sub>140 × 140 × 59 mm · <a href="vessel-holder/vessel_holder_bottom_500ml.stl">3D view</a></sub></td>
-<td align="center" width="33%"><a href="vessel-holder/vessel_holder_top_500ml.stl"><img src="previews/vessel_holder_top_500ml.png" width="260" alt="Vessel holder, upper frame (500 mL)"></a><br><b>Vessel holder, upper frame (500 mL)</b><br><sub>110 × 110 × 160 mm · <a href="vessel-holder/vessel_holder_top_500ml.stl">3D view</a></sub></td>
 </tr>
 </table>
 
-<p align="center">
-<img src="previews/vessel_holder_assembly_500ml.png" width="320" alt="Vessel holder assembled"><br>
-<sub>Vessel holder assembled: the upper frame (shown in a second colour) is turned
-over and its four posts slide down the corner grooves of the base.</sub>
-</p>
+### Pipette holders
+
+<table>
+<tr>
+<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_short.stl"><img src="previews/picus2_holder_short.png" width="260" alt="Pipette holder, short (Picus 2)"></a><br><b>Pipette holder, short (Picus 2)</b><br><sub>32 × 67 × 85 mm · <a href="pipette-holder/picus2/picus2_holder_short.stl">3D view</a></sub></td>
+<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_middle.stl"><img src="previews/picus2_holder_middle.png" width="260" alt="Pipette holder, middle (Picus 2)"></a><br><b>Pipette holder, middle (Picus 2)</b><br><sub>32 × 67 × 135 mm · <a href="pipette-holder/picus2/picus2_holder_middle.stl">3D view</a></sub></td>
+<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_tall.stl"><img src="previews/picus2_holder_tall.png" width="260" alt="Pipette holder, tall (Picus 2)"></a><br><b>Pipette holder, tall (Picus 2)</b><br><sub>32 × 67 × 185 mm · <a href="pipette-holder/picus2/picus2_holder_tall.stl">3D view</a></sub></td>
+</tr>
+<tr>
+<td align="center" width="33%"><a href="pipette-holder/picus2/picus2_holder_3_middle.stl"><img src="previews/picus2_holder_3_middle.png" width="260" alt="Pipette holder, triple middle (Picus 2)"></a><br><b>Pipette holder, triple middle (Picus 2)</b><br><sub>124 × 67 × 135 mm · <a href="pipette-holder/picus2/picus2_holder_3_middle.stl">3D view</a></sub></td>
+</tr>
+</table>
+
+### Balance cover and vessel adapters
+
+<table>
+<tr>
+<td align="center" width="33%"><a href="balance-cover/balance_cover_bce822i.stl"><img src="previews/balance_cover_bce822i.png" width="260" alt="Balance cover (BCE822i)"></a><br><b>Balance cover (BCE822i)</b><br><sub>275 × 240 × 109 mm · <a href="balance-cover/balance_cover_bce822i.stl">3D view</a></sub></td>
+<td align="center" width="33%"><a href="balance-cover/adapters/vial_adapter_screw_no4.stl"><img src="previews/vial_adapter_screw_no4.png" width="260" alt="Adapter: No. 4 screw-cap vial"></a><br><b>Adapter: No. 4 screw-cap vial</b><br><sub>92 × 92 × 10 mm · <a href="balance-cover/adapters/vial_adapter_screw_no4.stl">3D view</a></sub></td>
+<td align="center" width="33%"><a href="balance-cover/adapters/tube_adapter_centrifuge_50ml.stl"><img src="previews/tube_adapter_centrifuge_50ml.png" width="260" alt="Adapter: 50 mL centrifuge tube"></a><br><b>Adapter: 50 mL centrifuge tube</b><br><sub>90 × 92 × 70 mm · <a href="balance-cover/adapters/tube_adapter_centrifuge_50ml.stl">3D view</a></sub></td>
+</tr>
+</table>
+
+### Vessel holder
+
+<table>
+<tr>
+<td align="center" width="33%"><a href="vessel-holder/vessel_holder_bottom_500ml.stl"><img src="previews/vessel_holder_bottom_500ml.png" width="260" alt="Vessel holder, base (500 mL)"></a><br><b>Vessel holder, base (500 mL)</b><br><sub>140 × 140 × 59 mm · <a href="vessel-holder/vessel_holder_bottom_500ml.stl">3D view</a></sub></td>
+<td align="center" width="33%"><a href="vessel-holder/vessel_holder_top_500ml.stl"><img src="previews/vessel_holder_top_500ml.png" width="260" alt="Vessel holder, upper frame (500 mL)"></a><br><b>Vessel holder, upper frame (500 mL)</b><br><sub>110 × 110 × 160 mm · <a href="vessel-holder/vessel_holder_top_500ml.stl">3D view</a></sub></td>
+<td align="center" width="33%"><img src="previews/vessel_holder_assembly_500ml.png" width="260" alt="Vessel holder assembled"><br><b>Vessel holder, assembled</b><br><sub>The upper frame (shown in a second colour) is turned over and its four posts slide down the corner grooves of the base.</sub></td>
+</tr>
+</table>
+
+### Imaging stand
+
+<table>
+<tr>
+<td align="center" width="33%"><a href="imaging-stand/imaging_stand_assembly.stl"><img src="previews/imaging_stand_assembly.png" width="260" alt="Imaging stand"></a><br><b>Imaging stand</b><br><sub>204 × 90 × 100 mm · <a href="imaging-stand/imaging_stand_assembly.stl">3D view</a></sub></td>
+<td align="center" width="33%"><a href="imaging-stand/imaging_stand_light_shield.stl"><img src="previews/imaging_stand_light_shield.png" width="260" alt="Imaging-stand light shield"></a><br><b>Imaging-stand light shield</b><br><sub>250 × 120 × 120 mm · <a href="imaging-stand/imaging_stand_light_shield.stl">3D view</a></sub></td>
+</tr>
+</table>
 
 ## Designers
 
