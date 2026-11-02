@@ -11,13 +11,13 @@ Repository: https://github.com/tohoku-tomailab/saigen
 (QR code for slides and posters: [`docs/images/qr-saigen.png`](docs/images/qr-saigen.png),
 [`docs/images/qr-saigen.svg`](docs/images/qr-saigen.svg))
 
-A manuscript describing the platform and its ZIF-8 demonstration is in preparation
-(working title: *Quantitative control and improved reproducibility of materials
-synthesis processes using an automated experimentation platform*). It is referred to
-as "the paper" throughout this repository; a citation will be added here once it is
-available.
-<!-- TODO: add the citation / DOI when the manuscript is published, and add a
-     preferred-citation block to CITATION.cff. -->
+A paper describing the platform and its ZIF-8 demonstration has been accepted for
+publication in *Science and Technology of Advanced Materials: Methods* (STAM Methods)
+and is in press (working title: *Quantitative control and improved reproducibility of
+materials synthesis processes using an automated experimentation platform*). It is
+referred to as "the paper" throughout this repository; see [Citing](#citing).
+<!-- TODO: on publication, replace the working title with the published one and add
+     the volume and article number, here, under "Citing" and in CITATION.cff. -->
 
 The platform combines commercially available instruments (robot arms, electric
 pipettes, web cameras, an electronic balance) with 3D-printed fixtures, and operates
@@ -178,6 +178,12 @@ damage to equipment, loss of samples or data, or any other loss arising from its
 
 ## Citing
 
-If you use SAIGEN, please cite the software using the metadata in
-[`CITATION.cff`](CITATION.cff) (GitHub's "Cite this repository" button). A paper
-citation will be added once the manuscript above is published.
+If you use SAIGEN, please cite the paper:
+
+> Y. Hashimoto, T. Muramoto, H. Terada, H. Song, Y. Wang, T. Tomai,
+> *Science and Technology of Advanced Materials: Methods*, in press (2026).
+> https://doi.org/10.1080/27660400.2026.2756911
+
+The DOI becomes active when the paper is published. The software itself can be cited
+with the metadata in [`CITATION.cff`](CITATION.cff) (GitHub's "Cite this repository"
+button, which offers the paper as the preferred citation).

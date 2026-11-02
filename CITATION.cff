@@ -38,5 +38,27 @@ keywords:
   - robotics
   - reproducibility
   - metal-organic framework
-# A preferred-citation block pointing at the paper will be added once the
-# manuscript describing the platform is published.
+preferred-citation:
+  type: article
+  # Working title; replace with the published title when the paper appears.
+  title: "Quantitative control and improved reproducibility of materials synthesis processes using an automated experimentation platform"
+  authors:
+    - family-names: Hashimoto
+      given-names: Yusuke
+      orcid: "https://orcid.org/0000-0002-1886-9332"
+    - family-names: Muramoto
+      given-names: Takaya
+    - family-names: Terada
+      given-names: Hikari
+    - family-names: Song
+      given-names: Harim
+    - family-names: Wang
+      given-names: Yuan
+    - family-names: Tomai
+      given-names: Takaaki
+      orcid: "https://orcid.org/0000-0003-0296-6565"
+  journal: "Science and Technology of Advanced Materials: Methods"
+  status: in-press
+  year: 2026
+  doi: "10.1080/27660400.2026.2756911"
+  url: "https://doi.org/10.1080/27660400.2026.2756911"
