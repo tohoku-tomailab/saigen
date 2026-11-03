@@ -67,7 +67,7 @@ can be rotated and zoomed in the browser.
 | Designer | Affiliation | Contact | Components |
 |---|---|---|---|
 | Takaya Muramoto (村元貴哉) | Graduate School of Engineering, Tohoku University | muramoto.takaya.s1@dc.tohoku.ac.jp | `pipette-holder/picus2/picus2_holder_short` |
-| Yusuke Hashimoto (橋本佑介) | Frontier Research Institute for Interdisciplinary Sciences, Tohoku University | yusuke.hashimoto.b8@tohoku.ac.jp | `robot-arm-holder/`, `balance-cover/` (cover and adapters), `imaging-stand/`, `pipette-holder/picus2/` variants `_middle`, `_tall`, `_3_middle` (derived from `_short`) |
+| Yusuke Hashimoto (橋本佑介) | Frontier Research Institute for Interdisciplinary Sciences, Tohoku University | yusuke.hashimoto.b8@tohoku.ac.jp | `robot-arm-holder/`, `balance-cover/` (cover and adapters), `imaging-stand/`, `vessel-holder/`, `pipette-holder/picus2/` variants `_middle`, `_tall`, `_3_middle` (derived from `_short`) |
 
 Questions about a model, or corrections to it, go to its designer.
 
@@ -89,8 +89,8 @@ Bounding boxes are taken from the meshes.
 | `balance-cover/adapters/` | Vessel adapter for the cover opening: sleeve for a 50 mL centrifuge tube, Ø30 mm bore | `tube_adapter_centrifuge_50ml.stl` | `tube_adapter_centrifuge_50ml.f3d` | 90 × 92 × 70 | Y. Hashimoto |
 | `imaging-stand/` | Holding stand for the appearance-imaging system (light, sample, camera) | `imaging_stand_assembly.stl` (one mesh of the whole assembly) | `imaging_stand_assembly.f3z` (Fusion archive: stand, assembly and light fixture designs) | 204 × 90 × 100 | Y. Hashimoto |
 | `imaging-stand/` | Light shield placed over the imaging stand | `imaging_stand_light_shield.stl` | `imaging_stand_light_shield.f3d` | 250 × 120 × 120 | Y. Hashimoto |
-| `vessel-holder/` | Two-part holder for a 500 mL round-bottom vessel, base: block with a spherical seat (Ø105 mm) and a groove at each corner for the posts of the upper frame | `vessel_holder_bottom_500ml.stl` | `vessel_holder_bottom_500ml.f3d` | 140 × 140 × 59 | <!-- TODO: designer --> |
-| `vessel-holder/` | Two-part holder for a 500 mL round-bottom vessel, upper frame: four 10 mm posts joined by a ring (Ø44 mm bore) that surrounds the vessel neck. The frame gives a robot arm or a lift something to hook, so that the holder can be carried with the vessel in it; exported ring-down, used ring-up | `vessel_holder_top_500ml.stl` | `vessel_holder_top_500ml.f3d` | 110 × 110 × 160 | <!-- TODO: designer --> |
+| `vessel-holder/` | Two-part holder for a 500 mL round-bottom vessel, base: block with a spherical seat (Ø105 mm) and a groove at each corner for the posts of the upper frame | `vessel_holder_bottom_500ml.stl` | `vessel_holder_bottom_500ml.f3d` | 140 × 140 × 59 | Y. Hashimoto |
+| `vessel-holder/` | Two-part holder for a 500 mL round-bottom vessel, upper frame: four 10 mm posts joined by a ring (Ø44 mm bore) that surrounds the vessel neck. The frame gives a robot arm or a lift something to hook, so that the holder can be carried with the vessel in it; exported ring-down, used ring-up | `vessel_holder_top_500ml.stl` | `vessel_holder_top_500ml.f3d` | 110 × 110 × 160 | Y. Hashimoto |
 
 Notes:
 
