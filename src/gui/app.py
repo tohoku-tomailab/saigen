@@ -177,6 +177,7 @@ ROBOT_COLORS = {
     2: {"bg": "#e8f5e9", "border": "#388e3c", "label": "🟢", "name": "Robot 2"},
     3: {"bg": "#fff3e0", "border": "#e65100", "label": "🟠", "name": "Robot 3 (Slider)"},
     4: {"bg": "#f3e5f5", "border": "#7b1fa2", "label": "🟣", "name": "Robot 4 (MaxArm)"},
+    5: {"bg": "#e0f7fa", "border": "#00838f", "label": "🔷", "name": "Robot 5 (MG400)"},
 }
 
 SHARED_COLOR = {"bg": "#f5f5f5", "border": "#9e9e9e"}
@@ -502,12 +503,14 @@ def validate_current_workflow():
         st.toast(f"検証OK: {len(steps)} ステップ（ループ展開後）{note}", icon="✅")
 
 
-def start_run(mock: bool = True):
+def start_run(mock: bool = True, confirmed_robots=()):
     """検証・プリフライトしてから FlowRunner を起動する（実行はバックグラウンドスレッド1本）
 
     検証または可動域プリフライトに失敗したフローはここで弾かれ、ロボットには
     一切触れない。``mock=False``（実機）は、実行パネルで「実機で実行する」を
-    チェックし確認ダイアログで承認したときだけ渡される。
+    チェックし確認ダイアログで承認したときだけ渡される。``confirmed_robots`` は
+    そのダイアログが示し人が承認した MG400 の robot_id（flow plan F7）: これ無しの
+    MG400 実機ランは FlowRunner が拒否する。
     """
     if is_running():
         return
@@ -528,6 +531,7 @@ def start_run(mock: bool = True):
             shared_config=shared_config,
             # Mock 実行では録画も安全確認ゲートも使わない（CLI の --mock と同じ）
             pre_step=None if use_mock else flow_runner._safety_gate,
+            confirmed_robots=() if use_mock else tuple(confirmed_robots),
         )
     except ValidationError as e:
         st.session_state.error_message = (
@@ -605,12 +609,30 @@ def confirm_real_run_dialog():
     ports = flow_runner.settings_to_session_args(build_run_settings())[0]
     st.caption("接続ポート: " + ", ".join(
         f"Robot {rid}: " + ((f"MaxArm {cfg.get('maxarm_port') or '-'}")
-                            if cfg.get("type") == "maxarm" else (cfg.get('dobot_port') or '-'))
+                            if cfg.get("type") == "maxarm" else
+                            (f"MG400 {cfg.get('mg400_address') or '-'}")
+                            if cfg.get("type") == "mg400" else (cfg.get('dobot_port') or '-'))
         for rid, cfg in ports.items()))
+    used = {s.get("robot_id", 1) for s in (data.get("steps") or []) if isinstance(s, dict)}
+    mg400_used = [rid for rid, cfg in ports.items() if cfg.get("type") == "mg400" and rid in used]
+    if mg400_used:
+        # the MG400's confirmation (flow plan F7): this dialog is the only way to a real run
+        for rid in mg400_used:
+            cfg = ports[rid]
+            ws = cfg.get("workspace") or {}
+            st.warning(
+                f"🔷 Robot {rid} (MG400) が動きます: アドレス {cfg.get('mg400_address') or '（未設定）'}、"
+                f"箱 x {ws.get('x_min')}..{ws.get('x_max')} / y {ws.get('y_min')}..{ws.get('y_max')} / "
+                f"z {ws.get('z_min')}..{ws.get('z_max')}、速度比 {cfg.get('speed_ratio')} %、"
+                f"ホーム {cfg.get('home_position')}、1 手 {cfg.get('max_move_mm')} mm 以内。"
+                "開始前に: DobotStudio Pro を閉じる、リモート制御モード TCP/IP、アームは無効（アラームなし）、"
+                "フランジに何も付けない、箱の中を空ける、緊急停止ボタンを手元に。"
+                "■ 停止 は緊急停止ではありません（ResetRobot, DisableRobot, 確認, 必要なら EmergencyStop の"
+                "整然停止; 15 s 以内）。緊急停止はコントローラのボタンです。")
     c1, c2 = st.columns(2)
     if c1.button("実機で開始", type="primary", use_container_width=True, key="confirm_real_run"):
         st.session_state["_disarm_real_run"] = True
-        start_run(mock=False)
+        start_run(mock=False, confirmed_robots=mg400_used)    # the approval of the MG400 text above (F7)
         st.rerun()
     if c2.button("キャンセル", use_container_width=True, key="cancel_real_run"):
         st.rerun()
@@ -1421,7 +1443,7 @@ def render_workflow_canvas():
             with col2:
                 render_step_card(step, idx, len(steps), step_error)
         else:
-            # Robot 3 / Robot 4 (MaxArm): 右側
+            # Robot 3 / Robot 4 (MaxArm) / Robot 5 (MG400): 右側
             col1, col2, col3 = st.columns(3)
             with col3:
                 render_step_card(step, idx, len(steps), step_error)
@@ -1460,6 +1482,12 @@ def render_settings_panel():
                     key=f"r{robot_id}_mp", disabled=running,
                     help="Hiwonder MaxArm（CH340）のシリアルポート。"
                          "空のままでは実機ランを開始できません")
+                continue
+            if config.get("type") == "mg400":
+                config["mg400_address"] = st.text_input(
+                    "MG400 Address", value=config.get("mg400_address", ""),
+                    key=f"r{robot_id}_ma", disabled=running,
+                    help="Dobot MG400 の IP アドレス（数値）。空のままでは実機ランを開始できません")
                 continue
             config["dobot_port"] = st.text_input(
                 "Dobot Port", value=config.get("dobot_port", ""),

@@ -82,6 +82,14 @@ jobs:
           python -m src.flow.run_flow examples/li5640/read_lockin.json --mock
           python -m src.flow.run_flow examples/dso1000/read_scope.json --mock
 
+      - name: Validate and dry-run the MG400 example with its example configuration
+        run: |
+          # the MG400 entry has no built-in defaults: the example config is the config.yaml of this step
+          cp examples/mg400/config.mg400.yaml config.yaml
+          python -m src.flow.run_flow examples/mg400/z_hop.json --validate-only
+          python -m src.flow.run_flow examples/mg400/z_hop.json --mock
+          rm config.yaml
+
       - name: LI5640 oscillator example (refused by default, runs with an enabling config)
         run: |
           # writing the oscillator is disabled by default: the preflight refuses (exit 3)

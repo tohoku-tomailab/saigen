@@ -153,8 +153,10 @@ def test_mock_is_the_default_and_real_needs_arming(app_src):
     assert "st.session_state.arm_real_run = False" in app_src
     assert '"実機で実行する"' in app_src
     assert "confirm_real_run_dialog" in app_src
-    # start_run defaults to mock, and only the confirmation passes mock=False
-    assert app_src.count("start_run(mock=False)") == 1
+    # start_run defaults to mock, and only the confirmation passes mock=False (with the
+    # MG400 ids the dialog showed, which the runner requires for a real MG400 run)
+    assert app_src.count("start_run(mock=False") == 1
+    assert app_src.count("start_run(mock=False, confirmed_robots=mg400_used)") == 1
 
 
 def test_start_run_defaults_to_mock(app_tree):
@@ -165,7 +167,7 @@ def test_start_run_defaults_to_mock(app_tree):
 
 def test_real_run_confirmation_disarms(app_tree):
     src = ast.unparse(_func(app_tree, "confirm_real_run_dialog"))
-    assert src.index("_disarm_real_run") < src.index("start_run(mock=False)")
+    assert src.index("_disarm_real_run") < src.index("start_run(mock=False, confirmed_robots=mg400_used)")
 
 
 def test_execution_panel_is_drawn_before_the_canvas(app_tree):

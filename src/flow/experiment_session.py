@@ -54,11 +54,17 @@ logger = logging.getLogger(__name__)
 #: ロボット設定（config.yaml の robots.<id>）のうち、ドライバのオプションではない
 #: キー。それ以外（move_ms, pose_settle_tolerance など）は MaxArm の
 #: device_configs としてそのまま渡す。
-_ROBOT_CONFIG_KEYS = {"type", "dobot_port", "picus2_address", "maxarm_port", "workspace"}
+_ROBOT_CONFIG_KEYS = {"type", "dobot_port", "picus2_address", "maxarm_port", "mg400_address", "workspace"}
 
 #: エラー時の自動ホーム復帰（go_home_all）をしないロボット種別。MaxArm は
 #: 検証済みの安全な復帰経路を持たないため、エラー後に自動では動かさない。
-NO_RECOVERY_HOME_TYPES = frozenset({"maxarm"})
+#: MG400 も同じ（エラー後はその場で DisableRobot; flow plan F8）。
+NO_RECOVERY_HOME_TYPES = frozenset({"maxarm", "mg400"})
+
+#: 停止リストに initialize() の前から載せる種別（flow plan F6）。MG400 の停止は
+#: ラッチ（request_stop）で、接続前に立てても initialize() が最初の段階で見る。
+#: Dobot / MaxArm の登録は従来どおり initialize() の後。
+PRE_REGISTER_TYPES = frozenset({"mg400"})
 
 
 def robot_type(ports: Optional[dict]) -> str:
@@ -90,6 +96,9 @@ def validator_for_robot(robot_id, shared_validator=None, robot_ports: Optional[d
       x/y/z の min/max がすべて必要で、r_min / r_max は任意。欠けている・null の
       値がある場合は ``lab_config.ConfigError``（robot_id を含む）。共通の
       （Dobot の）バリデータに黙って戻ることはない。
+    - MG400（``type: mg400``）: 同じく自分の ``workspace`` だけから作る（箱と半径。
+      到達性はコントローラの InverseSolution で実行時に検査する）。必須キーが
+      欠けていれば ``lab_config.ConfigError``。
     - Dobot で ``robots.<id>.workspace`` を持つもの: 共通の可動域にそのロボットの
       値を上書きしたバリデータ（``lab_config.get_robot_workspace`` と同じマージ）。
     - それ以外（Dobot 1〜3 の通常の設定）: ``shared_validator`` をそのまま返す。
@@ -119,6 +128,13 @@ def validator_for_robot(robot_id, shared_validator=None, robot_ports: Optional[d
         except ValueError as e:
             raise lab_config.ConfigError(
                 f"robots.{robot_id}.workspace（MaxArm）が不正です: {e}") from e
+    if robot_type(ports) == "mg400":
+        own = lab_config.mg400_config(robot_id, ports)["workspace"]
+        try:
+            return workspace_validator_from_config(None, own)
+        except ValueError as e:
+            raise lab_config.ConfigError(
+                f"robots.{robot_id}.workspace（MG400）が不正です: {e}") from e
     override = ports.get("workspace")
     if not override:
         return shared_validator if shared_validator is not None else default_workspace_validator()
@@ -136,8 +152,20 @@ def validator_for_robot(robot_id, shared_validator=None, robot_ports: Optional[d
         raise lab_config.ConfigError(f"robots.{robot_id}.workspace が不正です: {e}") from e
 
 
-def default_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
-    """実機ロボットを生成する既定ファクトリ（種別で LabRobot / MaxArmRobot を切り替え）"""
+def default_robot_factory(robot_id, *, use_picus2, ports, workspace_validator, **extra):
+    """実機ロボットを生成する既定ファクトリ（種別で LabRobot / MaxArmRobot / MG400Robot を切り替え）
+
+    ``extra`` は MG400 にだけ渡る（``record_folder``, ``confirmed``; add_robot 参照）。
+    """
+    if robot_type(ports) == "mg400":
+        from src.devices.safety.mg400_robot import MG400Robot  # 遅延 import
+        return MG400Robot(
+            mg400_address=ports["mg400_address"],
+            workspace_validator=workspace_validator,
+            record_folder=extra.get("record_folder"),
+            confirmed=bool(extra.get("confirmed", False)),
+            **robot_options(ports),
+        )
     if robot_type(ports) == "maxarm":
         from src.devices.safety.maxarm_robot import MaxArmRobot  # 遅延 import
         return MaxArmRobot(
@@ -209,13 +237,50 @@ def maxarm_mock_start_pose(robot_id, shared_config: Optional[dict] = None):
     return parse_maxarm_start_pose(value.get(robot_id, value.get(str(robot_id))))
 
 
-def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
+def mg400_mock_start_pose(robot_id, shared_config: Optional[dict] = None):
+    """MG400 の Mock 開始姿勢 [x, y, z(, r)]。未設定なら None（= fake の既定姿勢）。
+    MaxArm と同じく、Dobot 用の単一値 MOCK_START_POSE は使わない"""
+    if shared_config is None:
+        try:
+            shared_config = lab_config.get_shared_devices()
+        except Exception as e:  # noqa: BLE001 - 設定が読めなければ既定の姿勢
+            logger.warning(f"mock_start_pose の設定を読めませんでした: {e}")
+            return None
+    value = (shared_config or {}).get("mock_start_pose")
+    if not isinstance(value, dict):
+        return None
+    pose = value.get(robot_id, value.get(str(robot_id)))
+    if pose is None:
+        return None
+    from src.devices.safety.mock_maxarm import parse_maxarm_start_pose  # 同じ書式（x,y,z[,r]）
+    if isinstance(pose, str):
+        parts = [float(p) for p in pose.replace(";", ",").split(",")]
+    else:
+        parts = [float(p) for p in list(pose)]
+    parse_maxarm_start_pose(parts)          # 3〜4 個の有限な数値であることの検査
+    return parts
+
+
+def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator, **extra):
     """MockLabRobot を生成するファクトリ（実機なしでの動作確認用）
 
     可動域バリデータは実機と同じものを渡す。Mock でも可動域違反が
     実行前に検出されるため、フロー JSON の安全確認に使える。
     開始姿勢は mock_start_pose()（MOCK_START_POSE / config.yaml）から取る。
+    MG400 の mock は実機と同じ MG400Robot をプロセス内の fake に接続する
+    （``extra`` の ``record_folder`` に記録を書く）。
     """
+    if robot_type(ports) == "mg400":
+        from src.devices.safety.mg400_robot import MockMG400Robot  # 遅延 import
+        start_pose = mg400_mock_start_pose(robot_id)
+        if start_pose is not None:
+            logger.info(f"[MOCK] Robot {robot_id}（MG400）の開始姿勢: {start_pose}")
+        return MockMG400Robot(
+            workspace_validator=workspace_validator,
+            start_pose=start_pose,
+            record_folder=extra.get("record_folder"),
+            **robot_options(ports),
+        )
     if robot_type(ports) == "maxarm":
         from src.devices.safety.mock_maxarm import MockMaxArmRobot  # 遅延 import
         start_pose = maxarm_mock_start_pose(robot_id)
@@ -295,6 +360,11 @@ class OutputRestoreError(RuntimeError):
     """本体は終わったが、機器の出力（LI5640 の内部発振器）を戻せなかった・確かめられなかった"""
 
 
+class RobotStopError(RuntimeError):
+    """本体は終わったが、ロボット（MG400）が自分で停止した、または停止シーケンスが停止を
+    確認できなかった（デバイス報告の failed_reason）"""
+
+
 #: 復元できなかったときにエラー文へ足す注意
 OUTPUT_CHECK_NOTE = "LI5640 の OSC OUT（発振器の周波数・振幅）を前面パネルで確認してください"
 
@@ -331,8 +401,22 @@ class ExperimentSession:
         shared_config: Optional[dict] = None,
         workspace_validator=None,
         robot_validators: Optional[dict] = None,
+        record_root: Optional[str] = None,
     ):
         self.mock = mock
+        #: ロボットの記録（MG400 の report.json など）を置く実行フォルダ（run_flow / GUI が渡す）
+        self.record_root = record_root
+        #: 人の確認（Enter / 確認ダイアログ）を経たロボット（confirm_robot）。MG400 の実機ランに要る
+        self._confirmed_robots = set()
+        #: initialize() 中の MG400（停止リストに先に載せる; flow plan F6）
+        self._initializing: Dict[int, object] = {}
+        #: 登録に至らなかったロボット（初期化・ホーム設定の失敗、停止後）のデバイス報告
+        self._failed_reports: Dict[int, object] = {}
+        #: emergency_stop_all() が一度でも呼ばれたら True（永続）。以後 add_robot は初期化を始めない
+        self._stop_requested = False
+        #: 切断後に集めたロボットのデバイス報告（robot_id → dict; run_report() を持つ種別だけ）
+        self.robot_reports: Dict[int, dict] = {}
+        self._raise_robot_error = False
         self.robot_factory = robot_factory or (
             mock_robot_factory if mock else default_robot_factory
         )
@@ -388,6 +472,11 @@ class ExperimentSession:
             self._shared_config = lab_config.get_shared_devices()
         return self._shared_config
 
+    def confirm_robot(self, robot_id: int) -> None:
+        """人の確認（ターミナルの Enter / GUI の確認ダイアログ）を経たロボットとして記録する。
+        MG400 の実機は、これが無いと initialize() が制御コマンドの前で拒否する（flow plan F7）"""
+        self._confirmed_robots.add(int(robot_id))
+
     # ------------------------------------------------------------------
     # デバイス登録
     # ------------------------------------------------------------------
@@ -409,7 +498,22 @@ class ExperimentSession:
         """
         ports = self.robot_ports().get(robot_id)
         rtype = robot_type(ports)
-        if rtype == "maxarm":
+        extra = {}
+        if rtype == "mg400":
+            if not self.mock and not (ports or {}).get("mg400_address"):
+                raise RuntimeError(
+                    f"Robot {robot_id}（MG400）のアドレス mg400_address が config.yaml の robots "
+                    f"セクションに設定されていません（--robot{robot_id}-mg400 / "
+                    f"ROBOT{robot_id}_MG400_ADDRESS でも指定できます）"
+                )
+            if use_picus2:
+                logger.warning(f"Robot {robot_id} は MG400 のためピペット（Picus2）は使えません。"
+                               "use_picus2 を無視します")
+                use_picus2 = False
+            extra["confirmed"] = self.mock or (robot_id in self._confirmed_robots)
+            if self.record_root:
+                extra["record_folder"] = os.path.join(self.record_root, f"mg400_{robot_id}")
+        elif rtype == "maxarm":
             if not self.mock and not (ports or {}).get("maxarm_port"):
                 raise RuntimeError(
                     f"Robot {robot_id}（MaxArm）の接続ポート maxarm_port が config.yaml の "
@@ -428,34 +532,72 @@ class ExperimentSession:
             )
         # 可動域の設定エラー（ConfigError）はデバイスを開く前に出す
         validator = self.validator_for(robot_id)
+        with self._estop_lock:
+            if self._stop_requested:
+                raise RuntimeError(f"Robot {robot_id}: 停止要求の後のため初期化を始めません")
+        # extra（record_folder, confirmed）は MG400 にだけ渡す: 他の種別のファクトリ（テストの
+        # 差し替えを含む）の呼び出しは従来どおり
         robot = self.robot_factory(
             robot_id,
             use_picus2=use_picus2,
             ports=ports or {},
             workspace_validator=validator,
+            **extra,
         )
-        # initialize() は失敗時に例外を送出する（戻り値の握りつぶし防止）
+        if rtype in PRE_REGISTER_TYPES:
+            # 停止リストに initialize() の前から載せる: 接続前の Stop はラッチとして
+            # initialize() の最初の段階で見える（flow plan F6）
+            with self._estop_lock:
+                if self._stop_requested:
+                    raise RuntimeError(f"Robot {robot_id}: 停止要求の後のため初期化を始めません")
+                self._initializing[robot_id] = robot
+        registered = False
         try:
-            ok = await robot.initialize()
-        except BaseException as e:
-            # 初期化中の中断（Stop / Ctrl+C）: 未登録なので session.cleanup() では
-            # 切断されない。ここで切断してから再送出する。
-            if not isinstance(e, Exception):
+            # initialize() は失敗時に例外を送出する（戻り値の握りつぶし防止）
+            try:
+                ok = await robot.initialize()
+            except BaseException as e:
+                # 初期化中の中断（Stop / Ctrl+C）: 未登録なので session.cleanup() では
+                # 切断されない。ここで切断してから再送出する。
+                if not isinstance(e, Exception):
+                    await self._cleanup_one(f"Robot {robot_id}", robot)
+                raise
+            if not ok:
                 await self._cleanup_one(f"Robot {robot_id}", robot)
-            raise
-        if not ok:
-            await self._cleanup_one(f"Robot {robot_id}", robot)
-            raise RuntimeError(f"Robot {robot_id} の初期化に失敗しました")
-        try:
-            self._set_home(robot_id, robot, rtype, ports or {})
-        except BaseException:
-            # 未登録なので session.cleanup() では切断されない（接続・ハートビートが
-            # 残る）。ここで切断してから再送出する（中断・キャンセルも同じ）
-            await self._cleanup_one(f"Robot {robot_id}", robot)
-            raise
-        self.robots[robot_id] = robot
-        self._robot_types[robot_id] = rtype
-        if rtype == "maxarm":
+                raise RuntimeError(f"Robot {robot_id} の初期化に失敗しました")
+            try:
+                self._set_home(robot_id, robot, rtype, ports or {})
+            except BaseException:
+                # 未登録なので session.cleanup() では切断されない（接続・ハートビートが
+                # 残る）。ここで切断してから再送出する（中断・キャンセルも同じ）
+                await self._cleanup_one(f"Robot {robot_id}", robot)
+                raise
+            # 事前登録の種別（MG400）: 登録は停止ロックの下で、停止要求がなければ。初期化中の
+            # 停止（_initializing 経由で届いている）の後に、動けるロボットが登録されることは
+            # ない（flow plan F6）。拒否するときは停止を（冪等に）もう一度届けてから切断する。
+            # それ以外の種別（Dobot / MaxArm）は従来どおり無条件に登録する: 停止は run() の
+            # 中断処理が emergency_stop_all() で届ける（切断だけにすると MaxArm の吸着が
+            # 通常終了の扱いで切れる）
+            with self._estop_lock:
+                if rtype not in PRE_REGISTER_TYPES or not self._stop_requested:
+                    self.robots[robot_id] = robot
+                    self._robot_types[robot_id] = rtype
+                    registered = True
+            if not registered:
+                try:
+                    robot.emergency_stop()
+                except Exception as e:  # noqa: BLE001 - the latch was already set through _initializing
+                    logger.error(f"Robot {robot_id} の緊急停止に失敗しました: {e}")
+                await self._cleanup_one(f"Robot {robot_id}", robot)
+                raise RuntimeError(f"Robot {robot_id}: 初期化中に停止要求があったため登録しません（切断しました）")
+        finally:
+            with self._estop_lock:
+                self._initializing.pop(robot_id, None)     # after the registration: no gap for a stop (F6)
+            if not registered:
+                self._keep_failed_report(robot_id, robot)
+        if rtype == "mg400":
+            logger.info(f"Robot {robot_id} 初期化完了 (MG400: 記録 {getattr(robot, 'record_folder', '-')})")
+        elif rtype == "maxarm":
             logger.info(
                 f"Robot {robot_id} 初期化完了 "
                 f"(MaxArm={(ports or {}).get('maxarm_port') or '-'})"
@@ -476,16 +618,17 @@ class ExperimentSession:
         上書きしない）、``home_is_within_limits()`` で検査する。それ以外は
         現在位置をホームにする。
         """
-        if rtype == "maxarm" and ports.get("home_position") is not None:
+        if rtype in ("maxarm", "mg400") and ports.get("home_position") is not None:
+            label = "MaxArm" if rtype == "maxarm" else "MG400"
             if getattr(robot, "home_position", None) is None:
                 raise RuntimeError(
-                    f"Robot {robot_id}（MaxArm）: 設定の home_position がロボットに渡っていません")
+                    f"Robot {robot_id}（{label}）: 設定の home_position がロボットに渡っていません")
             if not robot.home_is_within_limits():
                 raise RuntimeError(
-                    f"Robot {robot_id}（MaxArm）: 設定の home_position {list(robot.home_position)} が"
+                    f"Robot {robot_id}（{label}）: 設定の home_position {list(robot.home_position)} が"
                     f"可動域（robots.{robot_id}.workspace）の外です。home_position か可動域を"
                     "確認してください")
-            logger.info(f"Robot {robot_id}（MaxArm）: 設定の home_position "
+            logger.info(f"Robot {robot_id}（{label}）: 設定の home_position "
                         f"{list(robot.home_position)} をホームにします")
             return
         robot.set_current_position_as_home()
@@ -538,6 +681,21 @@ class ExperimentSession:
     # ------------------------------------------------------------------
     # 安全枠
     # ------------------------------------------------------------------
+    def latch_stops_first(self) -> None:
+        """ラッチだけで止まる種別（MG400: ``STOP_NEVER_BLOCKS``）の停止ラッチを、ログも I/O も
+        なしで全台に立てる（例外を送出しない）。run_flow の Ctrl+C 中継が、ログのロックや他の
+        ロボットの同期の停止を待たずに使う。通常の ``emergency_stop_all`` は後で続ける"""
+        with self._estop_lock:
+            self._stop_requested = True
+            targets = list(self.robots.values()) + [r for rid, r in self._initializing.items()
+                                                    if rid not in self.robots]
+        for robot in targets:
+            if getattr(robot, "STOP_NEVER_BLOCKS", False) and callable(getattr(robot, "latch_stop", None)):
+                try:
+                    robot.latch_stop()
+                except Exception:  # noqa: BLE001 - emergency_stop_all() below tries again and logs
+                    pass
+
     def emergency_stop_all(self, *, skip_already_stopped: bool = False):
         """登録済み全ロボットを緊急停止する（例外を送出しない）
 
@@ -549,8 +707,16 @@ class ExperimentSession:
                 再送しない（GUI の Stop で停止済みのロボットに、キャンセル処理で
                 二重に停止コマンドを送らないため）。
         """
-        # 実行スレッドが add_robot で辞書を更新中でも安全にスナップショットを取る
-        for rid, robot in list(self.robots.items()):
+        # 実行スレッドが add_robot で辞書を更新中でも安全にスナップショットを取る。
+        # 初期化中の MG400 も含める（接続前のラッチ; flow plan F6）。以後 add_robot は
+        # 新しい初期化を始めない
+        with self._estop_lock:
+            self._stop_requested = True
+            targets = list(self.robots.items()) + [(rid, r) for rid, r in self._initializing.items()
+                                                   if rid not in self.robots]
+        # 停止がラッチだけの種別（MG400）を先に: 他の種別の同期の停止（シリアル送信）で遅れない
+        targets.sort(key=lambda t: not getattr(t[1], "STOP_NEVER_BLOCKS", False))
+        for rid, robot in targets:
             with self._estop_lock:
                 if skip_already_stopped and rid in self._estopped_ids:
                     continue
@@ -645,12 +811,19 @@ class ExperimentSession:
           :class:`OutputRestoreError` を送出する（進行中の例外・中断は置き換えない）。
           切断中に初めて中断された場合は aborted にする
 
+        - 切断の後にロボットのデバイス報告（MG400 の ``run_report()``: 自分で止まった、
+          停止シーケンスが停止を確認できなかった）を集める（``robot_reports``）。
+          ``failed_reason`` のある報告は、本体が正常に終わっていても状態を failed にし
+          :class:`RobotStopError` を送出する（中断・失敗はそのまま、エラー文に足す）
+
         exp_logger の確定は行わない。呼び出し側が finally で
-        ``exp_logger.record_output_restore(session.output_restore_report())`` と
+        ``exp_logger.record_output_restore(session.output_restore_report())``、
+        ``exp_logger.record_robot_reports(session.robot_reports)`` と
         ``exp_logger.finalize(session.status, session.error)`` を呼ぶこと。
         """
         body_completed = False
         self._raise_output_error = False
+        self._raise_robot_error = False
         try:
             result = await body()
             body_completed = True
@@ -694,9 +867,50 @@ class ExperimentSession:
                 raise
             finally:
                 self._apply_output_report(body_completed, cleanup_interrupt)
+                self._apply_robot_reports(body_completed, cleanup_interrupt)
         if self._raise_output_error:
             raise OutputRestoreError(self.error)
+        if self._raise_robot_error:
+            raise RobotStopError(self.error)
         return result
+
+    def _keep_failed_report(self, robot_id, robot) -> None:
+        """登録に至らなかったロボットを、デバイス報告（停止シーケンスの結果など）のために残す。
+        報告は _apply_robot_reports の時点で読む（切断が続いていれば、その後の結果になる）"""
+        if callable(getattr(robot, "run_report", None)):
+            with self._estop_lock:
+                self._failed_reports[robot_id] = robot
+
+    @staticmethod
+    def _read_report(robot) -> Optional[dict]:
+        try:
+            return robot.run_report()
+        except Exception as e:  # noqa: BLE001 - 報告の失敗で後始末を止めない
+            return {"failed_reason": f"デバイス報告を読めません: {e!r}"}
+
+    def _apply_robot_reports(self, body_completed: bool, cleanup_interrupt):
+        """切断後のロボットのデバイス報告（I/O も await もしない）。登録に至らなかった
+        ロボットの報告（_keep_failed_report）も含める"""
+        with self._estop_lock:
+            pending = list(self._failed_reports.items())
+        self.robot_reports = {}
+        for rid, robot in pending + list(self.robots.items()):
+            if not callable(getattr(robot, "run_report", None)):
+                continue
+            report = self._read_report(robot)
+            if report:
+                self.robot_reports[rid] = report
+        failed = [(rid, r["failed_reason"]) for rid, r in self.robot_reports.items()
+                  if r.get("failed_reason")]
+        if not failed:
+            return
+        note = "; ".join(f"Robot {rid}: {reason}" for rid, reason in failed)
+        logger.error(f"ロボットのデバイス報告: {note}")
+        if self.status == "completed":
+            self.status, self.error = "failed", note
+            self._raise_robot_error = cleanup_interrupt is None and body_completed
+        else:
+            self.error = f"{self.error}。{note}" if self.error else note
 
     def output_restore_report(self):
         """共有デバイスの出力の復元結果（LI5640 の発振器）。無ければ None。I/O はしない"""

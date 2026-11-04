@@ -10,7 +10,7 @@ the observation tool: four read state, two compute forward / inverse kinematics 
 section 2.3); none of them enables, disables, moves or configures the arm. ``CONTROL`` are
 the commands of the jog tool (``jog.py``, plan reviewed 2026-10-22): EnableRobot,
 DisableRobot, ResetRobot, EmergencyStop on the Dashboard port and JointMovJ on the motion
-port. A control command is built here like any other, but :func:`check_command` refuses it
+port, plus MovL on the motion port for the robot wrapper (flow plan, 2026-10-30). A control command is built here like any other, but :func:`check_command` refuses it
 unless the caller passes ``control=True``: the observation tool never does, so its
 connections cannot send one even by mistake. There is no way to send free text: each
 command is built from typed numbers, and :func:`check_command` re-checks the final text
@@ -24,11 +24,12 @@ from typing import List, NamedTuple, Optional, Sequence
 ALLOWED = ("RobotMode", "GetErrorID", "GetPose", "GetAngle",
            "PositiveSolution", "InverseSolution")
 #: commands that change the arm's state; refused unless check_command(..., control=True)
-CONTROL = ("EnableRobot", "DisableRobot", "ResetRobot", "EmergencyStop", "JointMovJ")
+CONTROL = ("EnableRobot", "DisableRobot", "ResetRobot", "EmergencyStop", "JointMovJ", "MovL")
 #: the control commands that stop or de-energise the arm (never a motion)
 STOP = ("ResetRobot", "DisableRobot", "EmergencyStop")
-#: the only motion command, on port 30003; its speed / acceleration ratio is capped here
-MOTION = ("JointMovJ",)
+#: the motion commands, on port 30003; their speed / acceleration ratio is capped here
+#: (JointMovJ: the jog tool; MovL: the robot wrapper of the flow plan, 2026-10-30)
+MOTION = ("JointMovJ", "MovL")
 MAX_SPEED_RATIO = 30                # % of the controller's playback setting x global ratio
 
 #: RobotMode values (guide section 2.3)
@@ -60,6 +61,9 @@ _EXACT = {
     "EmergencyStop": re.compile(r"EmergencyStop\(\)"),
     # absolute joint target with the speed and acceleration ratio always given, equal, 1..30 %
     "JointMovJ": re.compile(rf"JointMovJ\({_J4},SpeedJ=(?P<s>[1-9]|[12]\d|30),AccJ=(?P=s)\)"),
+    # absolute Cartesian target (guide 1607): X, Y, Z, R in the fixed frames User=0, Tool=0, the
+    # speed and acceleration ratio always given, equal, 1..30 %
+    "MovL": re.compile(rf"MovL\({_J4},User=0,Tool=0,SpeedL=(?P<s>[1-9]|[12]\d|30),AccL=(?P=s)\)"),
 }
 _NAME_RE = re.compile(r"([A-Za-z]+)\(")
 
@@ -179,6 +183,22 @@ def joint_mov_j(joints: Sequence, speed_ratio: int) -> Command:
                                         + [f"SpeedJ={speed_ratio}", f"AccJ={speed_ratio}"]))
 
 
+def mov_l(pose: Sequence, speed_ratio: int) -> Command:
+    """``MovL(X,Y,Z,R,User=0,Tool=0,SpeedL=s,AccL=s)``: straight-line move to an absolute pose
+    (mm, deg) in the base frame (User 0 / Tool 0, the frames of PositiveSolution and
+    InverseSolution here), with the speed and acceleration ratio ``s`` in 1..MAX_SPEED_RATIO
+    (guide 1607, 1627). Used by the robot wrapper only; never yet sent to the bench arm"""
+    if isinstance(speed_ratio, bool) or not isinstance(speed_ratio, int):
+        raise ValueError(f"speed ratio must be an integer: {speed_ratio!r}")
+    if not 1 <= speed_ratio <= MAX_SPEED_RATIO:
+        raise ValueError(f"speed ratio must be 1..{MAX_SPEED_RATIO}: {speed_ratio}")
+    pose = list(pose)
+    if len(pose) != 4:
+        raise ValueError(f"MovL needs x, y, z, r, got {len(pose)} values")
+    xyzr = [_number(v, f"MovL {k}") for k, v in zip("xyzr", pose)]
+    return _build("MovL", ",".join(xyzr + ["User=0", "Tool=0", f"SpeedL={speed_ratio}", f"AccL={speed_ratio}"]))
+
+
 def robot_mode() -> Command:
     return _build("RobotMode", "")
 
@@ -237,11 +257,13 @@ def check_echo(reply: Reply, command: Command) -> Optional[str]:
         return None
     if params.strip() == "" and command.name not in MOTION:
         return "echo without parameters"
-    # the guide's Return line for JointMovJ shows the joints only: the optional SpeedJ / AccJ
-    # may be left out of the echo, but the joints must be there (a motion reply must name
-    # its target)
-    if command.name in MOTION and sent.startswith(params.replace(" ", "") + ",SpeedJ="):
-        return "echo without optional parameters"
+    # the guide's Return line for JointMovJ / MovL shows the target only: the optional
+    # SpeedJ / AccJ (SpeedL / AccL, and User / Tool) may be left out of the echo, but the four
+    # target values must be there (a motion reply must name its target)
+    if command.name in MOTION:
+        p = params.replace(" ", "")
+        if sent.startswith(p + ",") and re.fullmatch(rf"{_J4}(,User=0,Tool=0)?", p):
+            return "echo without optional parameters"
     raise MG400ProtocolError(f"reply to {command.text!r} echoes other parameters: {reply.echo!r}")
 
 

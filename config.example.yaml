@@ -57,6 +57,10 @@ robots:
     #   or the session refuses to start. Without it the start pose becomes home,
     #   and the pose the arm rests in after Hiwonder's factory homing (z ~ 222)
     #   is one the arm cannot be commanded back to, so go_home would be refused.
+  # 5:                  # optional Dobot MG400 over TCP/IP (type: mg400). Every key of
+  #   type: mg400       # its entry (mg400_address, workspace, home_position, joint_limits,
+  #   ...               # speed_ratio, max_move_mm) is required and nothing is inherited;
+  #                     # the complete example is examples/mg400/config.mg400.yaml (docs/setup.md §13).
 
 # Devices shared by all robots.
 shared_devices:

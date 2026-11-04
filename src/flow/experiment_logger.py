@@ -131,9 +131,10 @@ class ExperimentLogger:
         self.scope_readings = []    # 成功したオシロ読み取りの設定と応答文字列（metadata.json へ）
         self.lockin_oscillator = []  # LI5640 の内部発振器の設定ステップ（前後・参照信号源）
         self.output_restore = None   # 出力の復元結果（LI5640 の発振器。record_output_restore）
+        self.robot_reports = {}      # robot_id -> ロボットのデバイス報告（MG400 の停止状態など。record_robot_reports）
         self.robots_used = set()
         self.picus2_robots = set()
-        self.robot_types = {}      # robot_id -> "dobot" / "maxarm"
+        self.robot_types = {}      # robot_id -> "dobot" / "maxarm" / "mg400"
         self.status = "running"
         self.error = None
         self.finished_at = None
@@ -360,6 +361,11 @@ class ExperimentLogger:
         if report is not None:
             self.output_restore = report
 
+    def record_robot_reports(self, reports):
+        """切断後のロボットのデバイス報告（MG400: 記録フォルダ、停止シーケンスの結果）を残す"""
+        if reports:
+            self.robot_reports = {str(rid): r for rid, r in dict(reports).items()}
+
     def next_image_path(self, index, tag: str = ""):
         """capture_and_save / capture_microscope 用の保存先パスを払い出す
         （画像をフォルダ内へ束ねる）。``tag`` はファイル名に挟む識別子
@@ -450,6 +456,8 @@ class ExperimentLogger:
             # LI5640 の内部発振器の設定ステップと、切断時の復元結果
             "lockin_oscillator": self.lockin_oscillator,
             "lockin_oscillator_restore": self.output_restore,
+            # ロボットのデバイス報告（MG400 の記録フォルダ・停止状態。他の種別は無し）
+            "robot_reports": self.robot_reports,
             "images_captured": len(images),
             "sensor_recording": self.recording,
             "output_files": {

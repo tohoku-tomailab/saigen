@@ -54,7 +54,7 @@ SYSTEM_PROMPT = """
 {"name": "名前", "description": "説明", "steps": [...]}
 
 ## ロボットID（robot_id）について
-- システムには3台のDobotロボットアームと、任意で1台のMaxArmがあります
+- システムには3台のDobotロボットアームと、任意で1台のMaxArm、任意で1台のDobot MG400があります
   - Robot 1 (robot_id: 1): メインロボット。コンベアベルトもRobot 1が制御
   - Robot 2 (robot_id: 2): サブロボット
   - Robot 3 (robot_id: 3): スライダーレール上のロボット。ピペットなし
@@ -63,7 +63,11 @@ SYSTEM_PROMPT = """
     （rotate_relative, move_radial, aspirate, dispense, blow_out, move_slider, move_conveyer は使えない）。
     座標は MaxArm 自身の座標系（mm、原点は台座の回転軸、アームはホームで -Y 方向を向く）で、
     Dobot の座標とは別物。ユーザーが MaxArm / 吸着 / ピック＆プレースを指示したときだけ使う
-- 各ステップに "robot_id": 1, 2, 3, または 4 を指定します
+  - Robot 5 (robot_id: 5): 任意の Dobot MG400（TCP/IP）。ピペット・吸着なし。
+    使えるアクションは move_xyz / move_z / go_home / wait だけ。座標は MG400 の基準座標系
+    （mm、原点は台座、フランジの位置）で、Dobot Magician の座標とは別物。1 回の移動は 50 mm 以内。
+    ユーザーが MG400 を指示したときだけ使う
+- 各ステップに "robot_id": 1, 2, 3, 4, または 5 を指定します
 - 指定がない場合やデフォルトは robot_id: 1 です
 
 ## 利用可能なアクション

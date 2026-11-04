@@ -65,7 +65,8 @@ __all__ = ["FlowRunner", "PreflightError", "SafetyAbort", "ProgressEvent",
            "_safety_gate"]
 
 #: Robots the sidebar offers. Robot 3 is the slider/conveyer arm; robot 4 is
-#: the optional Hiwonder MaxArm (``type: maxarm`` in config.yaml).
+#: the optional Hiwonder MaxArm (``type: maxarm`` in config.yaml); robot 5 the
+#: optional Dobot MG400 (``type: mg400``).
 ROBOT_IDS = tuple(range(1, MAX_ROBOT_ID + 1))
 
 
@@ -255,6 +256,7 @@ def default_device_settings() -> dict:
             "dobot_port": rp.get("dobot_port", "") or "",
             "picus2_port": picus2,
             "maxarm_port": rp.get("maxarm_port", "") or "",
+            "mg400_address": rp.get("mg400_address", "") or "",
         }
     return {
         "robots": robots,
@@ -300,11 +302,14 @@ def settings_to_session_args(settings: dict):
             logger.warning(f"Robot {rid}: sidebar type {cfg.get('type')!r} and its ports "
                            f"ignored; config.yaml says {rtype!r} (its ports are used)")
         entry = {k: v for k, v in base.items()
-                 if k not in ("dobot_port", "picus2_address", "maxarm_port")}
+                 if k not in ("dobot_port", "picus2_address", "maxarm_port", "mg400_address")}
         entry["type"] = rtype
         if rtype == "maxarm":
             entry["maxarm_port"] = (base.get("maxarm_port", "") if stale
                                     else cfg.get("maxarm_port", base.get("maxarm_port", "")))
+        elif rtype == "mg400":
+            entry["mg400_address"] = (base.get("mg400_address", "") if stale
+                                      else cfg.get("mg400_address", base.get("mg400_address", "")))
         elif stale:
             entry["dobot_port"] = base.get("dobot_port", "")
             entry["picus2_address"] = base.get("picus2_address", "") or ""
@@ -431,6 +436,7 @@ class FlowRunner:
         robot_factory: Optional[Callable] = None,
         shared_factory: Optional[Callable] = None,
         recording: Optional[dict] = None,
+        confirmed_robots=(),
     ):
         # Validation happens here: an invalid flow raises before anything is
         # built, so no ExperimentSession and no run folder are ever created.
@@ -441,6 +447,19 @@ class FlowRunner:
         self.validator = default_workspace_validator()
         self.preflight = require_preflight(self.steps, self.validator, log=logger,
                                            robot_ports=robot_ports, shared_config=shared_config)
+        # The MG400's confirmation (flow plan F7) is evidence handed in by the caller: the
+        # robot ids the GUI's confirmation dialog showed and the human approved. A real run
+        # that uses an MG400 without it is refused here, before a session or run folder exists.
+        self.confirmed_robots = frozenset(int(r) for r in (confirmed_robots or ()))
+        if not mock:
+            used = plan_resources(self.steps).robot_ids
+            unconfirmed = [rid for rid in used
+                           if self.preflight.robot_types.get(rid) == "mg400" and rid not in self.confirmed_robots]
+            if unconfirmed:
+                raise PreflightError(
+                    self.preflight,
+                    f"Robot {unconfirmed}（MG400）の実機ランは確認ダイアログで承認されていません"
+                    f"（confirmed_robots）。実行は行いません")
         self.recording = recording
 
         self.workflow_data = workflow_data
@@ -634,7 +653,12 @@ class FlowRunner:
             shared_config=self.shared_config,
             workspace_validator=self.validator,
             robot_validators=self.preflight.validators_by_robot,
+            record_root=exp_logger.dir,
         )
+        for rid in sorted(self.confirmed_robots):
+            # the confirmation dialog's approval (app.py confirm_real_run_dialog ->
+            # start_run(mock=False, confirmed_robots=...)), never inferred from the mode
+            session.confirm_robot(rid)
         with self._lock:
             self.session = session
 
@@ -728,6 +752,7 @@ class FlowRunner:
             except Exception:  # noqa: BLE001
                 pass
             exp_logger.record_output_restore(session.output_restore_report())
+            exp_logger.record_robot_reports(session.robot_reports)
             exp_logger.finalize(session.status, session.error)
             root_logger.removeHandler(handler)
             root_logger.setLevel(previous_level)

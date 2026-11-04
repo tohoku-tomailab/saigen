@@ -15,10 +15,10 @@ from src.devices.keithley2002.keithley2002 import FUNCTIONS as DMM_FUNCTIONS, NP
 PIPETTE_MIN_VOLUME_ML = 0.5
 #: ピペットの最大容量 (mL)。LabRobot.max_pipette_volume と同じ。
 PIPETTE_MAX_VOLUME_ML = 10.0
-#: robot_id の上限。1〜3 は Dobot Magician、4 は任意の Hiwonder MaxArm
-#: （config.yaml の robots.<id>.type で種別を決める）。ロボットが実際に
+#: robot_id の上限。1〜3 は Dobot Magician、4 は任意の Hiwonder MaxArm、5 は任意の
+#: Dobot MG400（config.yaml の robots.<id>.type で種別を決める）。ロボットが実際に
 #: そのアクションを実行できるかは run_flow.preflight_capabilities が検査する。
-MAX_ROBOT_ID = 4
+MAX_ROBOT_ID = 5
 
 
 class _StrictModel(BaseModel):
@@ -54,7 +54,7 @@ class ActionMoveXYZ(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionMoveZ(_StrictModel):
@@ -74,7 +74,7 @@ class ActionMoveZ(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionRotate(_StrictModel):
@@ -94,7 +94,7 @@ class ActionRotate(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionRotateRelative(_StrictModel):
@@ -118,7 +118,7 @@ class ActionRotateRelative(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionMoveRadial(_StrictModel):
@@ -140,7 +140,7 @@ class ActionMoveRadial(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionGoHome(_StrictModel):
@@ -156,7 +156,7 @@ class ActionGoHome(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 # ==========================================
@@ -182,7 +182,7 @@ class ActionMoveSlider(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionMoveConveyer(_StrictModel):
@@ -216,7 +216,7 @@ class ActionMoveConveyer(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionWait(_StrictModel):
@@ -237,7 +237,7 @@ class ActionWait(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 # ==========================================
@@ -273,7 +273,7 @@ class ActionAspirate(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionDispense(_StrictModel):
@@ -305,7 +305,7 @@ class ActionDispense(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionBlowOut(_StrictModel):
@@ -339,7 +339,7 @@ class ActionBlowOut(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 # ==========================================
@@ -366,7 +366,7 @@ class ActionSuction(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)。MaxArm の robot_id を指定する"
+        description="操作対象のロボットID (1..5)。MaxArm の robot_id を指定する"
     )
 
 # ==========================================

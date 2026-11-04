@@ -169,8 +169,31 @@ def load_config(force_reload: bool = False) -> dict:
             CONFIG_PATH, EXAMPLE_CONFIG_PATH,
         )
 
-    _config_cache = config
-    return config
+    _config_cache = _detach_retyped_robots(config, _file_robots())
+    return _config_cache
+
+
+def _file_robots() -> dict:
+    """The ``robots`` mapping as the file gave it (read again, unmerged); {} without a file"""
+    for path in (CONFIG_PATH, EXAMPLE_CONFIG_PATH):
+        if os.path.exists(path):
+            return dict(_load_yaml_file(path).get("robots") or {})
+    return {}
+
+
+def _detach_retyped_robots(merged: dict, file_robots: dict) -> dict:
+    """A robot whose ``type`` in the file differs from the DEFAULTS entry of the same id
+    inherits nothing from that entry: its merged entry is replaced by the raw one (2026-10-30,
+    flow plan F8). Otherwise a ``type: mg400`` written at id 4 would carry the MaxArm's
+    workspace, and a Dobot at id 4 the MaxArm's box."""
+    defaults = DEFAULTS.get("robots") or {}
+    for rid, raw in file_robots.items():
+        raw = dict(raw or {})
+        default_type = (defaults.get(rid) or {}).get("type", DEFAULT_ROBOT_TYPE)
+        # an entry without a type keeps inheriting (robot 4 without "type" is still the MaxArm)
+        if "type" in raw and raw["type"] != default_type and rid in merged.get("robots", {}):
+            merged["robots"][rid] = copy.deepcopy(raw)
+    return merged
 
 
 def load_monitoring_config(force_reload: bool = False) -> dict:
@@ -194,7 +217,7 @@ def load_monitoring_config(force_reload: bool = False) -> dict:
 #: Robot types a ``robots.<id>.type`` entry may name. Robots without a type are
 #: Dobot Magicians (the only type before the MaxArm was added), so existing
 #: config.yaml files keep working unchanged.
-ROBOT_TYPES = ("dobot", "maxarm")
+ROBOT_TYPES = ("dobot", "maxarm", "mg400")
 DEFAULT_ROBOT_TYPE = "dobot"
 
 
@@ -214,7 +237,7 @@ def get_robot_ports() -> dict:
 
 
 def get_robot_type(robot_id: int) -> str:
-    """``"dobot"`` or ``"maxarm"`` for ``robot_id`` (``"dobot"`` if not configured).
+    """``"dobot"``, ``"maxarm"`` or ``"mg400"`` for ``robot_id`` (``"dobot"`` if not configured).
 
     Raises:
         ConfigError: the configured type is not one of :data:`ROBOT_TYPES`
@@ -235,11 +258,11 @@ MAXARM_REQUIRED_WORKSPACE_KEYS = ("x_min", "x_max", "y_min", "y_max", "z_min", "
 MAXARM_OPTIONAL_WORKSPACE_KEYS = ("r_min", "r_max")
 
 
-def maxarm_workspace(robot_id, entry) -> dict:
-    """The MaxArm workspace block of one ``robots.<id>`` entry, checked.
+def own_workspace(robot_id, entry, label: str, type_name: str) -> dict:
+    """The self-contained workspace block of one ``robots.<id>`` entry, checked.
 
-    The MaxArm works in its own frame, so its limits come only from its own
-    ``workspace`` block, never merged over the global (Dobot) box. The block must
+    A robot in its own frame (the MaxArm, the MG400) takes its limits only from its
+    own ``workspace`` block, never merged over the global (Dobot) box. The block must
     set every key of :data:`MAXARM_REQUIRED_WORKSPACE_KEYS`; ``r_min`` / ``r_max``
     are optional. A key present with no value (YAML ``z_min:``) is an error, never
     "unlimited".
@@ -251,8 +274,8 @@ def maxarm_workspace(robot_id, entry) -> dict:
     where = f"robots.{robot_id}.workspace"
     if override is None or override == {}:
         raise ConfigError(
-            f"Robot {robot_id} is a MaxArm (type: maxarm) but {where} is not set. "
-            f"A MaxArm needs its own complete workspace "
+            f"Robot {robot_id} is a {label} (type: {type_name}) but {where} is not set. "
+            f"A {label} needs its own complete workspace "
             f"({', '.join(MAXARM_REQUIRED_WORKSPACE_KEYS)}; r_min / r_max optional) in its "
             f"own frame; it never uses the global Dobot limits."
         )
@@ -261,16 +284,68 @@ def maxarm_workspace(robot_id, entry) -> dict:
     missing = [k for k in MAXARM_REQUIRED_WORKSPACE_KEYS if k not in override]
     if missing:
         raise ConfigError(
-            f"{where} (MaxArm, robot {robot_id}) is missing {', '.join(missing)}. "
+            f"{where} ({label}, robot {robot_id}) is missing {', '.join(missing)}. "
             f"All of {', '.join(MAXARM_REQUIRED_WORKSPACE_KEYS)} are required."
         )
     nulls = [k for k, v in override.items() if v is None]
     if nulls:
         raise ConfigError(
-            f"{where} (MaxArm, robot {robot_id}): {', '.join(nulls)} has no value (null). "
+            f"{where} ({label}, robot {robot_id}): {', '.join(nulls)} has no value (null). "
             f"Give a number or delete the optional key; a null is never read as unlimited."
         )
     return dict(override)
+
+
+def maxarm_workspace(robot_id, entry) -> dict:
+    """The MaxArm workspace block of one ``robots.<id>`` entry, checked (:func:`own_workspace`)"""
+    return own_workspace(robot_id, entry, "MaxArm", "maxarm")
+
+
+#: Keys a ``type: mg400`` entry must set itself (checked in the entry as the file wrote it:
+#: nothing is inherited from DEFAULTS, which holds no MG400). ``mg400_address`` may be
+#: empty in a tracked file; a real run refuses until it is set. The values themselves are
+#: checked by ``src.devices.safety.mg400_robot`` (speed_ratio 1..10, max_move_mm 1..50,
+#: home_position [x, y, z], joint_limits four [min, max] inside the published ranges).
+MG400_REQUIRED_KEYS = ("mg400_address", "workspace", "home_position", "joint_limits",
+                       "speed_ratio", "max_move_mm")
+
+
+def mg400_config(robot_id, entry) -> dict:
+    """One ``type: mg400`` entry, checked for its required keys and its own workspace.
+
+    Raises:
+        ConfigError: a required key is missing or null, or the workspace block is unusable
+    """
+    entry = dict(entry or {})
+    where = f"robots.{robot_id}"
+    missing = [k for k in MG400_REQUIRED_KEYS if k not in entry]
+    if missing:
+        raise ConfigError(
+            f"{where} is an MG400 (type: mg400) but is missing {', '.join(missing)}. "
+            f"All of {', '.join(MG400_REQUIRED_KEYS)} must be written in that entry "
+            f"(nothing is inherited; see examples/mg400/config.mg400.yaml)."
+        )
+    nulls = [k for k in MG400_REQUIRED_KEYS if entry[k] is None and k != "mg400_address"]
+    if nulls:
+        raise ConfigError(f"{where} (MG400): {', '.join(nulls)} has no value (null).")
+    if entry["mg400_address"] is None:
+        entry["mg400_address"] = ""
+    if not isinstance(entry["mg400_address"], str):
+        raise ConfigError(f"{where}.mg400_address must be a string (the arm's IP address), "
+                          f"got {type(entry['mg400_address']).__name__}")
+    entry["workspace"] = own_workspace(robot_id, entry, "MG400", "mg400")
+    # the numeric options with the wrapper's own validators, so that --validate-only and the
+    # preflight refuse them before any device is opened (not only the robot's constructor)
+    from src.devices.safety.mg400_robot import (parse_home_position, parse_joint_limits,  # noqa: E402 - lazy
+                                                validate_max_move_mm, validate_speed_ratio)
+    try:
+        parse_home_position(entry["home_position"])
+        parse_joint_limits(entry["joint_limits"])
+        validate_speed_ratio(entry["speed_ratio"])
+        validate_max_move_mm(entry["max_move_mm"])
+    except ValueError as e:
+        raise ConfigError(f"{where} (MG400): {e}") from e
+    return entry
 
 
 def get_robot_workspace(robot_id: int) -> dict:
@@ -278,6 +353,7 @@ def get_robot_workspace(robot_id: int) -> dict:
 
     - MaxArm (``type: maxarm``): only its own ``robots.<id>.workspace`` block,
       checked by :func:`maxarm_workspace` (never merged over the global box).
+    - MG400 (``type: mg400``): likewise its own block, through :func:`mg400_config`.
     - Dobot: the global ``workspace`` merged with ``robots.<id>.workspace``
       (the robot's own keys win); without its own section, the global limits.
 
@@ -288,6 +364,8 @@ def get_robot_workspace(robot_id: int) -> dict:
     entry = get_robot_ports().get(int(robot_id), {})
     if entry.get("type") == "maxarm":
         return maxarm_workspace(robot_id, entry)
+    if entry.get("type") == "mg400":
+        return mg400_config(robot_id, entry)["workspace"]
     merged = dict(load_config()["workspace"])
     override = entry.get("workspace") or {}
     if not isinstance(override, dict):

@@ -1,0 +1,81 @@
+# ===================================================================
+# A complete config.yaml with the optional Dobot MG400 as robot 5 (type: mg400).
+#
+# Copy it to config.yaml in the repository root (or merge the robots.5 entry into
+# your own config.yaml) and edit it. The CI and tests/test_mg400_wiring.py use this
+# file as it is for `--validate-only` and `--mock` of examples/mg400/z_hop.json.
+#
+# NONE of the MG400 numbers below is a measurement of a real cell: the box is a
+# small volume around the fake controller's start pose, the home is inside it, the
+# joint limits are the published ranges. Measure your arm's rest pose and the clear
+# volume around it (DobotStudio Pro shows the pose), then tighten every value before
+# the first real run (docs/mg400-commissioning.md, stage C2). An agent never widens
+# them.
+# ===================================================================
+
+robots:
+  1:
+    dobot_port: COM3
+    picus2_address: COM4
+  2:
+    dobot_port: COM5
+    picus2_address: COM6
+  3:
+    dobot_port: COM7
+  5:
+    type: mg400
+    # The arm's IP address (a numeric literal; no host names). Empty here on purpose:
+    # a lab address never goes into a tracked file. Set it in your own config.yaml,
+    # or give --robot5-mg400 <address> / ROBOT5_MG400_ADDRESS. A real run refuses
+    # to start while it is empty.
+    mg400_address: ""
+    # Every key below is required for an MG400 and nothing is inherited from the
+    # built-in defaults (which hold no MG400). The frame is the controller's base
+    # frame (User 0 / Tool 0): the flange position in mm, as PositiveSolution reports it.
+    workspace:            # the box every start pose, target and MovL segment must stay in
+      x_min: 350.0
+      x_max: 450.0
+      y_min: -50.0
+      y_max: 50.0
+      z_min: 170.0
+      z_max: 270.0
+      r_min: 350.0        # horizontal radius hypot(x, y) of the whole segment (optional)
+      r_max: 450.0
+    home_position: [400.0, 0.0, 220.0]   # go_home target; set it to the arm's measured rest pose
+    # Joint ranges every InverseSolution sample along a move must stay in (deg, J1..J4).
+    # These are the ranges Dobot publishes for the MG400 (J4 as +-180, the smaller of
+    # the two figures Dobot's pages give), not measured here; only tighten them.
+    joint_limits: [[-160.0, 160.0], [-25.0, 85.0], [-25.0, 105.0], [-180.0, 180.0]]
+    speed_ratio: 10       # SpeedL = AccL ratio of every MovL (1..10 in v1; the controller's own playback speed and global ratio multiply it)
+    max_move_mm: 50.0     # longest single MovL (1..50)
+    # playback_note: "playback 50 %, global ratio 50 %"   # recorded as typed, not read from the controller
+    # controller_version: "x.y.z"                          # as DobotStudio Pro shows it; recorded as typed
+
+shared_devices:
+  scale_port: COM8
+  camera_index: 0
+  microscope_index: 2
+  microscope_port: ""
+  microscope_resolution: "3840x2160"
+  dmm_resource: ""
+  dmm_timeout_ms: 10000
+  wait_after_dmm: 0.0
+  lockin_resource: ""
+  lockin_timeout_ms: 5000
+  wait_after_lockin: 0.0
+  lockin_osc_max_vrms: 0.0
+  lockin_osc_min_hz: 0.0005
+  lockin_osc_max_hz: 105000.0
+  scope_resource: ""
+  scope_timeout_ms: 5000
+  wait_after_scope: 0.0
+
+workspace:
+  x_min: -300.0
+  x_max: 300.0
+  y_min: -300.0
+  y_max: 300.0
+  z_min: -130.0
+  z_max: 150.0
+  joint1_min: -135.0
+  joint1_max: 135.0

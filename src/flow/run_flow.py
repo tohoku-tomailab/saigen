@@ -22,12 +22,16 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
     # MaxArm（robot 4, config.yaml の type: maxarm）のポートは --robot4-maxarm
     python -m src.flow.run_flow examples/maxarm/pick_and_place.json --mock
 
+    # Dobot MG400（robot 5, config.yaml の type: mg400）のアドレスは --robot5-mg400。
+    # 実機ランは、プリフライトの後・接続の前にターミナルで Enter を求める（空行以外は中止）
+    python -m src.flow.run_flow examples/mg400/z_hop.json --mock
+
 処理の流れ:
     1. JSON を読み込み、Pydantic スキーマ（schema.py）で検証する
     2. loop_start / loop_end を展開してフラットなステップ列にする
     2.5 プリフライト: 絶対目標（move_xyz / rotate）を可動域バリデータで検査する。
        可動域はロボットごと（robots.<id>.workspace があればそれ、無ければ共通の
-       workspace）。各アクションがそのロボットの種別（dobot / maxarm）で
+       workspace）。各アクションがそのロボットの種別（dobot / maxarm / mg400）で
        実行できるかも検査する。違反があればデバイスを開く前に中止する
        （--validate-only でも同じ）。
        相対移動（move_z / rotate_relative / move_radial）は開始姿勢に依存するため
@@ -47,8 +51,11 @@ import asyncio
 import json
 import logging
 import os
+import queue
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -83,6 +90,7 @@ ROBOT_ACTIONS_BY_TYPE = {
                         "go_home", "move_slider", "move_conveyer", "wait",
                         "aspirate", "dispense", "blow_out"}),
     "maxarm": frozenset({"move_xyz", "move_z", "go_home", "suction", "wait"}),
+    "mg400": frozenset({"move_xyz", "move_z", "go_home", "wait"}),
 }
 # 開始姿勢に依存し、実行前には目標位置が決まらない相対移動
 RELATIVE_MOVE_ACTIONS = {"move_z", "rotate_relative", "move_radial"}
@@ -258,6 +266,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(f"--robot{rid}-maxarm", default=None,
                        help=f"Robot {rid} が MaxArm（config.yaml の type: maxarm）の場合のポート"
                             f"（既定: ROBOT{rid}_MAXARM_PORT / config.yaml）")
+        p.add_argument(f"--robot{rid}-mg400", default=None,
+                       help=f"Robot {rid} が Dobot MG400（config.yaml の type: mg400）の場合の IP アドレス"
+                            f"（既定: ROBOT{rid}_MG400_ADDRESS / config.yaml）")
     p.add_argument("--scale-port", default=None,
                    help="電子天秤のポート（既定: SCALE_PORT / config.yaml）")
     p.add_argument("--camera-index", type=int, default=None,
@@ -313,6 +324,12 @@ def resolve_ports(args) -> Tuple[dict, dict]:
                 logger.warning(f"Robot {rid} は type={ports['type']} のため MaxArm ポート "
                                f"{maxarm} は使われません（config.yaml の robots.{rid}.type を確認）")
             ports["maxarm_port"] = maxarm
+        mg400 = getattr(args, f"robot{rid}_mg400", None) or os.getenv(f"ROBOT{rid}_MG400_ADDRESS")
+        if mg400:
+            if ports["type"] != "mg400":
+                logger.warning(f"Robot {rid} は type={ports['type']} のため MG400 アドレスは使われません"
+                               f"（config.yaml の robots.{rid}.type を確認）")
+            ports["mg400_address"] = mg400
         robot_ports[rid] = ports
 
     scale = args.scale_port or os.getenv("SCALE_PORT")
@@ -625,6 +642,7 @@ def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optiona
     report.robot_types = {rid: robot_types.get(rid, lab_config.DEFAULT_ROBOT_TYPE)
                           for rid in robot_ids}
     report.capability_errors = preflight_capabilities(steps, robot_types)
+    report.capability_errors += preflight_mg400(robot_ids, robot_types, validators_by_robot, robot_ports)
     if any(s.get("action") == osc.ACTION for s in steps):
         if shared_config is None:
             shared_config = lab_config.get_shared_devices()
@@ -644,7 +662,41 @@ def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optiona
     checked_note = (f"絶対目標 {report.checked} 件すべて範囲内" if report.checked
                     else "絶対目標（move_xyz / rotate）なし")
     log.info(f"可動域チェック: {checked_note}{_unverified_note(report)}")
+    for rid in robot_ids:
+        if robot_types.get(rid) == "mg400":
+            log.info(MG400_PREFLIGHT_NOTE.format(rid=rid))
     return report
+
+
+#: MG400 のプリフライトで分かること・分からないこと（flow plan F5）
+MG400_PREFLIGHT_NOTE = (
+    "Robot {rid}（MG400）: ここで検査したのは絶対目標と home_position の箱・半径だけ。"
+    "コントローラの到達性（InverseSolution）、各移動の測った開始姿勢からの経路（長さ、線分の半径、"
+    "5 mm ごとの関節サンプル）、相対移動と go_home の区間は実行時に 1 手ごとに検査される。"
+    "--mock の成功は fake の平面モデルの結果で、アームのものではない")
+
+
+def preflight_mg400(robot_ids, robot_types: dict, validators_by_robot: dict,
+                    robot_ports: Optional[dict]) -> List[str]:
+    """MG400 の home_position を自分の箱・半径で検査する（デバイスは開かない）。
+    設定の必須キーは validator_for_robot（lab_config.mg400_config）が先に ConfigError にする"""
+    errors = []
+    for rid in robot_ids:
+        if (robot_types or {}).get(rid) != "mg400":
+            continue
+        ports = (robot_ports or {}).get(rid) or (robot_ports or {}).get(str(rid)) or {}
+        home = ports.get("home_position")
+        v = validators_by_robot.get(rid)
+        if home is None or v is None:
+            continue
+        try:
+            from src.devices.safety.mg400_robot import parse_home_position
+            x, y, z = parse_home_position(home)
+            v.validate_xyz(x, y, z)
+        except (ValueError, WorkspaceViolationError) as e:
+            errors.append(f"Robot {rid}（MG400）の home_position {home} が robots.{rid}.workspace の"
+                          f"外、または不正です: {e}")
+    return errors
 
 
 def require_preflight(steps: list, validator=None, log=None, **kwargs) -> PreflightReport:
@@ -759,6 +811,15 @@ async def run(args) -> int:
     robot_ids, picus2_robots = plan.robot_ids, plan.picus2_robots
     robot_types = report.robot_types
 
+    # MG400 の実機ラン: デバイスを開く前・ログフォルダを作る前に、ターミナルで人の Enter を
+    # 求める（flow plan F7）。空行以外・端末でない stdin は中止（exit 2）
+    mg400_ids = [rid for rid in robot_ids if robot_types.get(rid) == "mg400"]
+    if mg400_ids and not args.mock:
+        from src.devices.mg400.control import confirm_tty
+        if not confirm_tty(mg400_confirmation_text(mg400_ids, robot_ports, steps)):
+            logger.error("MG400 の実機ランは確認されませんでした: 何も開かずに終了します")
+            return 2
+
     # 実機実行では既定で録画する。Mock モードでは常に録画しない。
     record = (not args.mock) and (True if args.record is None else args.record)
 
@@ -813,7 +874,14 @@ async def run(args) -> int:
         shared_config=shared_config,
         workspace_validator=validator,
         robot_validators=report.validators_by_robot,
+        record_root=exp_logger.dir,
     )
+    if not args.mock:
+        for rid in mg400_ids:
+            session.confirm_robot(rid)          # the Enter above, before anything was opened
+    # MG400: Ctrl+C の扱いを段階にする（1 回目: ループに頼らない停止要求と中断、2 回目以降:
+    # 記録の確定まで保留）。--mock も同じ（同じ経路を試すため）。他のロボットだけのランは従来どおり
+    interrupt_guard = MG400InterruptGuard.install(session) if mg400_ids else None
 
     async def body():
         for rid in robot_ids:
@@ -895,11 +963,120 @@ async def run(args) -> int:
             accuracy_logger.finalize(logger)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"分注精度CSVの確定でエラー: {e}")
-        exp_logger.record_output_restore(session.output_restore_report())
-        exp_logger.finalize(session.status, session.error)
-        logger.info(f"実験ログを保存しました: {exp_logger.dir}")
+        try:
+            exp_logger.record_output_restore(session.output_restore_report())
+            exp_logger.record_robot_reports(session.robot_reports)
+            exp_logger.finalize(session.status, session.error)
+            logger.info(f"実験ログを保存しました: {exp_logger.dir}")
+        finally:
+            if interrupt_guard is not None:
+                interrupt_guard.restore()
 
     return exit_code
+
+
+class MG400InterruptGuard:
+    """MG400 を使うランの SIGINT（Ctrl+C）: 停止をイベントループに頼らずに届け、停止
+    シーケンス・切断・記録の確定を、続く Ctrl+C で途切れさせない（flow plan F3）。
+
+    - ハンドラは定数を ``queue.SimpleQueue.put`` するだけ（シグナルハンドラから呼べる;
+      数えない・ロックもログも取らない: 入れ子の SIGINT でも 1 回目は失われない）。数えるのは
+      中継スレッド
+    - 1 回目: 中継スレッドが、まず MG400 全台の停止ラッチをログなしで立て
+      （``latch_stops_first``; ループが同期処理で詰まっていても、ログのロックが取られていても
+      届く）、実行タスクのキャンセルをループに頼み、それから全ロボットへの通常の停止要求
+      （``emergency_stop_all``: ログを出す、他の種別はシリアル送信）とログ
+    - 2 回目以降: 保留（停止シーケンス・切断・記録の確定を待つ。その旨を出す）。
+      KeyboardInterrupt は送出しない: 中断で切断と記録が途切れることはない
+
+    主スレッドでだけ入れる（GUI のランナーは別スレッドのループなので入れない）。
+    記録の確定の後に元のハンドラへ戻す"""
+
+    def __init__(self, loop, task, session):
+        self.loop, self.task, self.session = loop, task, session
+        self.count = 0
+        self.previous = None
+        self._q: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._relay = threading.Thread(target=self._relay_main, name="mg400-sigint-relay", daemon=True)
+
+    @classmethod
+    def install(cls, session) -> "Optional[MG400InterruptGuard]":
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        guard = cls(asyncio.get_running_loop(), asyncio.current_task(), session)
+        guard._relay.start()
+        guard.previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, guard.handler)
+        return guard
+
+    def restore(self) -> None:
+        if signal.getsignal(signal.SIGINT) == self.handler:
+            signal.signal(signal.SIGINT, self.previous if self.previous is not None else signal.default_int_handler)
+        self._q.put(None)
+
+    _SIGINT = "sigint"
+
+    def handler(self, signum, frame):
+        self._q.put(self._SIGINT)
+
+    def _relay_main(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            self.count += 1
+            if self.count == 1:
+                error = None
+                try:
+                    self.session.latch_stops_first()          # no logging, no I/O
+                except Exception as e:  # noqa: BLE001 - emergency_stop_all below tries again
+                    error = e
+                try:
+                    self.loop.call_soon_threadsafe(self._cancel)
+                except RuntimeError:
+                    pass                        # the loop has already closed
+                try:
+                    self.session.emergency_stop_all(skip_already_stopped=True)
+                except Exception as e:  # noqa: BLE001
+                    error = e
+                logger.warning("Ctrl+C: MG400 の停止シーケンスを始めました（緊急停止ではありません。"
+                               "緊急停止はコントローラのボタンです）")
+                if error is not None:
+                    logger.error(f"停止要求に失敗しました: {error!r}")
+            else:
+                logger.warning("Ctrl+C: 停止シーケンス・切断・記録の確定を待っています（MG400 の切断待ちは "
+                               "25 s ほどまで; 他のステップが止まっているときは docs/setup.md §13 の手順）。"
+                               "この間の Ctrl+C は保留します。緊急停止はコントローラのボタンです")
+
+    def _cancel(self):
+        if self.task is not None:
+            self.task.cancel()
+
+
+def mg400_confirmation_text(mg400_ids, robot_ports: dict, steps: list) -> str:
+    """実機ランの前にターミナルへ出す確認文（flow plan F7）: ロボット、入力されたアドレス、箱、
+    速度比、ホーム、フローの最初の MG400 の手、停止の意味、緊急停止ボタン"""
+    lines = ["MG400 real run: the arm WILL move (flows: MovL in a straight line, one move at a time)."]
+    for rid in mg400_ids:
+        ports = robot_ports.get(rid) or {}
+        ws = ports.get("workspace") or {}
+        first = next((s for s in steps if s.get("robot_id", 1) == rid
+                      and s.get("action") not in SHARED_DEVICE_ACTIONS), None)
+        lines.append(f"  Robot {rid}: address {ports.get('mg400_address') or '(not set)'}; "
+                     f"box x {ws.get('x_min')}..{ws.get('x_max')}, y {ws.get('y_min')}..{ws.get('y_max')}, "
+                     f"z {ws.get('z_min')}..{ws.get('z_max')}" +
+                     (f", r {ws.get('r_min')}..{ws.get('r_max')}" if 'r_min' in ws or 'r_max' in ws else "") +
+                     f"; SpeedL = AccL = {ports.get('speed_ratio')} % of the controller's playback setting x global "
+                     f"ratio (not read); home {ports.get('home_position')}; max move {ports.get('max_move_mm')} mm")
+        if first is not None:
+            lines.append(f"      first MG400 step: {first.get('action')} {_fmt_params(first)}")
+    lines.append("  Before the Enter: DobotStudio Pro closed, remote-control mode TCP/IP, the arm disabled with no "
+                 "alarm, nothing on the flange, the volume of the box clear, the emergency-stop button within reach.")
+    lines.append("  After the Enter: ResetRobot, EnableRobot, then the flow's moves. Ctrl+C (or the GUI Stop) is NOT "
+                 "an emergency stop: it starts an orderly stop (ResetRobot, DisableRobot, confirmation polls, then "
+                 "EmergencyStop unless the arm showed itself disabled or in alarm and still and the Enable's outcome "
+                 "is known), bounded by 15 s; the emergency stop is the button on the controller.")
+    return "\n".join(lines)
 
 
 def main(argv=None) -> int:

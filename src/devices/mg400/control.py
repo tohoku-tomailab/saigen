@@ -2,11 +2,15 @@
 wrapper: connections, the feedback gate, enable / disable with their polls, the stop sequence,
 the background I/O thread, the record and the clean-up step list.
 
+Stage two (the same day) adds ``Controller``, the one worker thread that owns all I/O for the
+robot wrapper ``src/devices/safety/mg400_robot.py`` (flow plan F2, F3); see its docstring.
+
 Extracted from ``jog.py`` on 2026-10-30 with the behaviour unchanged (flow plan F9, stage one):
 the jog tests and the mutation harness are the regression. Nothing here installs a signal
 handler: the owner of the run (the jog CLI, later the session) hands in the interrupt object
 whose ``poll()`` is called before every send; by default a ``_NoInterrupts`` that never raises.
 """
+import concurrent.futures
 import ipaddress
 import os
 import queue
@@ -832,3 +836,517 @@ class _Cleanup:
         if self.error is not None:                  # the report travels with the exception
             self._attach(self.error)
         self.on_done()                              # the caller's last word (a deferred Ctrl+C, J7)
+
+
+# ======================================================================================
+# Stage two of the flow plan (2026-10-30): the control worker that owns all I/O for the
+# robot wrapper (src/devices/safety/mg400_robot.py). Everything above is the jog tool's
+# core, unchanged; everything below is new and uses it.
+# ======================================================================================
+
+LOG_ROOT_FLOW = os.path.join("logs", "mg400_flow")
+WORKER_TICK_S = 0.1             # the worker's bounded queue wait: the latch and the feed are checked on every wake-up
+ARRIVE_TOL_MM = 0.5             # MovL arrival: x, y, z each within this of the target ...
+ARRIVE_TOL_R_DEG = 0.2          # ... and R within this
+MOVE_SPEED_FLOOR_MM_S = 10.0    # the arrival deadline is MOVE_DEADLINE_S + distance / this
+
+
+class StopRequested(MG400Error):
+    """The stop latch was set: the request was not served, or was interrupted at a guard"""
+
+
+def _reject(fut: "concurrent.futures.Future", exc: BaseException) -> None:
+    """Answer a future with ``exc`` unless its owner cancelled it meanwhile (never raises)"""
+    if fut.set_running_or_notify_cancel():
+        fut.set_exception(exc)
+
+
+def _resolve(fut: "Optional[concurrent.futures.Future]", value) -> None:
+    """Answer a future with ``value`` unless it is gone, cancelled or already answered (never
+    raises): the shutdown / close obligation is carried out whatever happened to its future"""
+    if fut is None:
+        return
+    try:
+        if not fut.done():
+            fut.set_result(value)
+    except concurrent.futures.InvalidStateError:
+        pass
+
+
+class _LatchInterrupts:
+    """The worker's interrupt object: ``poll()`` raises StopRequested once the latch is set,
+    at the same places the jog tool takes a Ctrl+C (guard() before every send, the checks
+    between polls). The phases mean what they mean in the jog tool: nothing is raised before
+    ``run`` (the armed point) and nothing after the stop sequence took over (``stop``)"""
+
+    def __init__(self, latch: threading.Event):
+        self.latch = latch
+        self.phase = "prompt"
+        self.count = 0
+
+    @property
+    def requested(self) -> bool:
+        return self.latch.is_set()
+
+    def poll(self):
+        if self.phase == "run" and self.latch.is_set():
+            self.phase = "stop"
+            raise StopRequested("stop requested")
+
+
+class Controller:
+    """One non-daemon worker thread owns the command connections (Dashboard, motion) and is
+    the only code that writes to them or reads their replies; the feedback port has its own
+    reader thread (as in the jog tool), and the worker only reads what that thread parsed
+    (flow plan F2). Other threads
+    talk to it through a FIFO of requests with futures (``submit``) and one stop latch
+    (``request_stop``, idempotent, never cleared):
+
+    - the worker takes one request at a time; a request's I/O is finished (reply, deadline
+      or connection fault) before the next is looked at;
+    - the latch is checked in ``guard()`` before every send, when a reply or deadline
+      returns, and on every wake-up of the bounded queue wait (``WORKER_TICK_S``), so an idle
+      worker starts the stop sequence within about 0.1 s; a feedback fault seen on a wake-up
+      sets the latch itself (an autonomous stop);
+    - once the latch is seen, the worker runs the jog tool's stop sequence itself when
+      control was taken and the arm has not reported disabled again (F3), with the sequence's
+      own 15 s deadline counted inside the worker; every pending and later request is
+      answered with StopRequested, and only ``close`` is served afterwards;
+    - any other exception inside a request after control was taken is a fault: the stop
+      sequence runs the same way (as in the jog tool).
+
+    The record (``report.json``, ``feedback.*``) is the jog tool's Recorder in ``folder``.
+    """
+
+    def __init__(self, host: str, folder: str, connect=_connect_fixed, dashboard_port: int = DASHBOARD_PORT,
+                 feedback_port: int = FEEDBACK_PORT, motion_port: int = MOTION_PORT, out=None,
+                 hooks: Optional[dict] = None):
+        self.host, self.folder, self.connect = host, folder, connect
+        self.dashboard_port, self.feedback_port, self.motion_port = dashboard_port, feedback_port, motion_port
+        self._out = out or (lambda text: None)
+        self.hooks = hooks or {}
+        self._q: "queue.Queue" = queue.Queue()
+        self.latch = threading.Event()
+        self.ints = _LatchInterrupts(self.latch)
+        self.lock = threading.Lock()
+        self.stop_reason: Optional[str] = None
+        self.autonomous = False         # the stop was the worker's own (a feedback or connection fault), not requested
+        self.stopped = False            # the latch was taken: the stop sequence ran, or there was nothing to stop
+        self.stop_report: Optional[dict] = None
+        self.rec: Optional[Recorder] = None
+        self.fb: Optional[FeedbackRecorder] = None
+        self.run: Optional[JogRun] = None
+        self._notes: dict = {}
+        self.first_packet: Optional[dict] = None
+        self.close_errors: List[str] = []
+        #: the final save of the device record failed (the arm's state is reported separately)
+        self.record_error: Optional[str] = None
+        self.loop_error: Optional[str] = None
+        self._closed = threading.Event()
+        self._thread = threading.Thread(target=self._main, name="mg400-control", daemon=False)
+
+    # -- the thread-safe surface ------------------------------------------------------
+    def start(self):
+        self._thread.start()
+
+    def note(self, fields: dict):
+        """Fields written into the record at open (the configuration the wrapper runs with)"""
+        with self.lock:
+            self._notes.update(fields)
+
+    def request_stop(self, reason: str):
+        """Set the latch (idempotent; the first reason is kept). Never blocks, never raises"""
+        with self.lock:
+            if self.stop_reason is None:
+                self.stop_reason = str(reason)
+        self.latch.set()
+
+    def submit(self, name: str, fn: Callable[[], object], soft: tuple = ()) -> "concurrent.futures.Future":
+        """Queue ``fn`` for the worker. Exceptions of the ``soft`` classes are returned on the
+        future without a stop (a refused compute-only query); any other exception after control
+        was taken runs the stop sequence"""
+        fut: "concurrent.futures.Future" = concurrent.futures.Future()
+        with self.lock:                      # closure and submission under one lock: no request is lost between them
+            if self._closed.is_set():
+                _reject(fut, StopRequested("the controller is closed"))
+                return fut
+            self._q.put((name, fn, fut, soft))
+        return fut
+
+    def open(self):
+        return self.submit("open", self._open)
+
+    def pose(self):
+        return self.submit("pose", self._pose)
+
+    def inverse(self, pose: List[float]):
+        return self.submit("inverse", lambda: self._inverse(pose), soft=(MG400CommandError,))
+
+    def take_control(self):
+        return self.submit("take_control", self._take_control)
+
+    def enable(self):
+        return self.submit("enable", self._enable)
+
+    def move_l(self, pose: List[float], speed: int, distance_mm: float):
+        return self.submit("move_l", lambda: self._move_l(pose, speed, distance_mm))
+
+    def disable(self):
+        return self.submit("disable", self._disable)
+
+    def shutdown(self, timeout: float) -> dict:
+        """The normal end from another thread, as one request behind every earlier one: on the
+        worker, DisableRobot (confirmed) when control was taken, no stop happened and the arm has
+        not reported disabled; a disable that fails or is not confirmed is a fault (the stop
+        sequence runs); then close. Waits for the worker up to ``timeout``. Returns
+        :meth:`summary`. Idempotent: a second call after the close is answered at once"""
+        fut = self.submit("shutdown", lambda: None)
+        try:
+            fut.result(timeout)
+        except BaseException as e:  # noqa: BLE001 - reported in the summary
+            self.close_errors.append(f"shutdown did not finish within {timeout:g} s: {e!r}")
+        self._thread.join(timeout)
+        return self.summary()
+
+    def wait_closed(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for the worker thread to end; True when it has"""
+        self._thread.join(max(0.0, timeout))
+        return not self._thread.is_alive()
+
+    def summary(self) -> dict:
+        """What the session's device report carries (no I/O)"""
+        rec = self.rec
+        report = rec.report if rec is not None else {}
+        stop = report.get("stop") or self.stop_report or {}
+        state = stop.get("stop_state")
+        failed = None
+        if self.autonomous:
+            failed = f"the arm's controller stopped the run on its own: {self.stop_reason}"
+        elif state in ("emergency_stop", "unconfirmed"):
+            failed = f"stop sequence ended in {state}: {stop.get('guidance', '')}"
+        if self.loop_error and failed is None:
+            failed = f"the control worker failed: {self.loop_error}"
+        if self.record_error and failed is None:
+            failed = f"the device record could not be written: {self.record_error}"
+        return {"record_folder": self.folder, "armed": bool(report.get("armed")),
+                "disabled_confirmed": bool(report.get("disabled_confirmed")),
+                "complete": bool(report.get("complete")), "stopped": self.stopped,
+                "stop_reason": self.stop_reason, "autonomous": self.autonomous,
+                "stop": dict(stop) if stop else None, "stop_state": state,
+                "worker_alive": self._thread.is_alive(), "close_errors": list(self.close_errors),
+                "record_saved": rec is not None and self.record_error is None,
+                "failed_reason": failed}
+
+    # -- the worker --------------------------------------------------------------------
+    def _main(self):
+        try:
+            while True:
+                try:
+                    item = self._q.get(timeout=WORKER_TICK_S)
+                except queue.Empty:
+                    item = None
+                self._tick()
+                if item is None:
+                    continue
+                name, fn, fut, soft = item
+                if name == "shutdown":
+                    self._shutdown_on_worker(fut)
+                    return
+                if name == "close":
+                    self._close(fut)
+                    return
+                if self.stopped:
+                    _reject(fut, StopRequested(f"stopped: {self.stop_reason}"))
+                    continue
+                if not fut.set_running_or_notify_cancel():
+                    continue
+                try:
+                    result = fn()
+                except BaseException as e:  # noqa: BLE001 - handed to the caller after the stop decision
+                    if not isinstance(e, soft):
+                        self._fault(e)
+                    fut.set_exception(e)
+                else:
+                    fut.set_result(result)
+        except BaseException as e:  # noqa: BLE001 - the loop itself failed: stop what can be stopped, end
+            self.loop_error = repr(e)
+            try:
+                self.request_stop(f"worker error: {e!r}")
+                self._tick()
+            finally:
+                self._close(None)
+
+    def _shutdown_on_worker(self, fut):
+        """The normal end, decided here after every earlier request (not from the caller's
+        stale view): DisableRobot when control was taken, no stop happened and the arm has not
+        reported disabled; any failure there is a fault (the stop sequence runs); then close"""
+        run = self.run
+        if (not self.stopped and not self.latch.is_set() and run is not None and run.armed
+                and not run.disabled_confirmed):
+            try:
+                self._disable()
+            except BaseException as e:  # noqa: BLE001 - a stop or a fault: the stop sequence
+                self._fault(e)
+        self._close(fut)
+
+    def _tick(self):
+        """Every wake-up: a feedback fault sets the latch; a set latch is taken here"""
+        hook = self.hooks.get("tick")
+        if hook is not None:
+            hook(self)
+        if self.stopped:
+            return
+        if not self.latch.is_set() and self.fb is not None:
+            with self.fb.lock:
+                fault = self.fb.fault
+            if fault:
+                self.autonomous = True
+                self.request_stop(f"feedback fault: {fault}")
+        if self.latch.is_set():
+            self._stop_now()
+
+    def _fault(self, e: BaseException):
+        if not self.latch.is_set():
+            self.autonomous = True
+            self.request_stop(f"{type(e).__name__}: {e}")
+        self._stop_now()
+
+    def _stop_now(self):
+        """The latch is set: the stop sequence when control was taken and the arm has not
+        reported disabled again; otherwise nothing to stop. Once"""
+        if self.stopped:
+            return
+        self.stopped = True
+        run = self.run
+        if run is not None and run.armed and not run.disabled_confirmed:
+            self.stop_report = run.stop_sequence(self.stop_reason or "stop")
+            run.say("stop sequence: %s (last RobotMode %s). %s" % (
+                self.stop_report["stop_state"], self.stop_report["last_mode"], self.stop_report["guidance"]))
+        elif self.rec is not None:
+            self.rec.note(f"stop requested ({self.stop_reason}): no control command outstanding, nothing to stop")
+            try:
+                self.rec.save()
+            except MG400RecordError:
+                pass
+
+    # -- requests (worker thread only) ------------------------------------------------------
+    def _open(self) -> dict:
+        """Feedback and Dashboard; the gate: first packet mode 4 without alarm, RobotMode() 4,
+        GetErrorID() empty (an ErrorID -1 is named: the remote-control mode is not TCP/IP)"""
+        try:
+            held = os.path.isdir(self.folder) and bool(os.listdir(self.folder))
+        except OSError as e:
+            raise MG400RecordError(f"the record folder {self.folder} cannot be checked: {e}")
+        if held:
+            raise MG400RecordError(f"the record folder {self.folder} already holds files (a run never overwrites a record)")
+        self.rec = Recorder(self.folder)
+        with self.lock:
+            notes = dict(self._notes)
+        self.rec.report.update(tool="src.devices.safety.mg400_robot", armed=False, flow=notes)
+        self.fb = FeedbackRecorder(_open(self.connect, self.host, self.feedback_port), self.folder)
+        fb_conn = {"label": "feedback", "port": self.feedback_port, "opened_utc": _utc(),
+                   "opened_monotonic": round(time.monotonic(), 6)}
+        self.rec.report.setdefault("connections", []).append(fb_conn)
+        self.fb.start()
+        self.fb.wait_first()
+        with self.fb.lock:
+            self.first_packet = dict(self.fb.latest or {})
+        self.rec.report["first_packet"] = {k: self.first_packet.get(k) for k in
+                                           ("robot_mode", "user_index", "tool_index", "load", "speed_scaling",
+                                            "velocity_ratio", "robot_type")}
+        run = JogRun(self.rec, self.fb, self.host, self.connect, self.dashboard_port, self.motion_port,
+                     self._out, self.hooks, self.ints)
+        self.rec.report["control"] = self.rec.report.pop("jog")      # the same structure, under the wrapper's name
+        run.report.update(poses=[], moves=[])
+        self.run = run
+        run.dash = Dashboard(_open(self.connect, self.host, self.dashboard_port), self.rec, "dashboard-1",
+                             run.guard, port=self.dashboard_port)
+        run.dash.names = DASHBOARD_NAMES
+        run.conns.append(run.dash)
+        self.fb.check()
+        try:
+            run.dash.query(protocol.robot_mode())            # default judge: ends unless 4
+        except MG400CommandError as e:
+            raise JogFault(f"{e}: the controller's remote-control mode is not TCP/IP (set it in DobotStudio Pro)")
+        run.dash.query(protocol.get_error_id())              # ends on any alarm
+        self.fb.check()
+        return {"mode": 4, "first_packet": dict(self.rec.report["first_packet"])}
+
+    def _fk(self, angles: List[float]) -> List[float]:
+        return protocol.parse_numbers(self.run.dash.query(protocol.positive_solution(angles)).values, 4)
+
+    def _pose(self) -> List[float]:
+        """``PositiveSolution(GetAngle(), 0, 0)``; ``GetPose()`` is recorded, never used (F4)"""
+        run = self.run
+        run.check()
+        angles = run.angles()
+        pose = self._fk(angles)
+        get_pose = protocol.parse_numbers(run.dash.query(protocol.get_pose()).values, 4)
+        run.report["poses"].append({"utc": _utc(), "angles": angles, "pose": pose, "get_pose": get_pose})
+        return pose
+
+    def _inverse(self, pose: List[float]) -> List[float]:
+        self.run.check()
+        return protocol.parse_numbers(self.run.dash.query(protocol.inverse_solution(pose)).values, 4)
+
+    def _take_control(self) -> dict:
+        """The armed point and the jog tool's step 5: ResetRobot (clears another client's
+        queue), RobotMode must be 4, GetErrorID, the joints unchanged since the start pose"""
+        run = self.run
+        start = run.report["poses"][-1]["angles"] if run.report["poses"] else None
+        run.arm()                                            # ints.phase = "run", armed = True, the motion port
+        run.set_phase("disabled")
+        run.check()
+        run.dash.query(protocol.reset_robot())
+        if run.mode() != 4:
+            raise JogFault("not disabled after ResetRobot")
+        run.dash.query(protocol.get_error_id())
+        after_reset = run.angles()
+        run.report["angles_after_reset"] = after_reset
+        if start is not None and _max_diff(after_reset, start) > ARRIVE_TOL_DEG:
+            raise JogFault(f"the start joints changed since the start pose was read: {after_reset} vs {start}")
+        run.report["start_joints"] = after_reset
+        return {"angles": after_reset}
+
+    def _enable(self) -> dict:
+        """The jog tool's step 6: EnableRobot, RobotMode 5 within ENABLE_DEADLINE_S, settle,
+        the joints within ARRIVE_TOL_DEG of the start; then the pose"""
+        run = self.run
+        start = run.report["start_joints"]
+        run.set_phase("enabling")
+        run.check()
+        cmd = protocol.enable_robot()
+        entry = run.dash.write(cmd)
+        try:
+            run.dash.read(cmd, entry)
+        except MG400CommandError:
+            run.enable_result = "refused"
+            raise
+        run.enable_result = "acked"
+        run.report["enable_s"] = run.wait_mode(5, ENABLE_DEADLINE_S, "enabling")
+        run.enable_completed = True
+        run.set_phase("enabled")
+        run.say("enabled (RobotMode 5 after %.2f s)" % run.report["enable_s"])
+        run.dwell(SETTLE_S, start)
+        after_enable = run.angles()
+        run.report["angles_after_enable"] = after_enable
+        if _max_diff(after_enable, start) > ARRIVE_TOL_DEG:
+            raise JogFault(f"enabling moved the arm: {after_enable} vs start {start}")
+        pose = self._fk(after_enable)
+        run.report["poses"].append({"utc": _utc(), "angles": after_enable, "pose": pose, "after": "enable"})
+        return {"enable_s": run.report["enable_s"], "pose": pose}
+
+    def _move_l(self, pose: List[float], speed: int, distance_mm: float) -> dict:
+        """One ``MovL`` on the motion port, then the arrival polls (each: the pose from
+        GetAngle / PositiveSolution, then RobotMode; arrival when that RobotMode is 5 after a
+        pose within ARRIVE_TOL_MM / ARRIVE_TOL_R_DEG, at least MIN_LEG_S after the reply), then
+        GetErrorID"""
+        run = self.run
+        deadline_s = MOVE_DEADLINE_S + float(distance_mm) / MOVE_SPEED_FLOOR_MM_S
+        run.set_phase("moving")
+        run.check()
+        cmd = protocol.mov_l(pose, speed)
+        entry = run.motion.write(cmd)
+        run.motion.read(cmd, entry)                          # ErrorID != 0 raises MG400CommandError
+        t_reply = entry["sent_monotonic"] + entry["reply_s"]
+        result = self._wait_arrival_pose(pose, t_reply, deadline_s)
+        run.set_phase("enabled")
+        run.dash.query(protocol.get_error_id())              # ends on any alarm
+        result.update(command_id=entry["id"], target=list(pose), reply_s=entry["reply_s"],
+                      speed_ratio=speed, distance_mm=round(float(distance_mm), 4), deadline_s=round(deadline_s, 3))
+        run.report["moves"].append(result)
+        run.say("MovL: arrived after %.2f s, pose %s" % (result["arrived_s"], [round(v, 3) for v in result["pose"]]))
+        return result
+
+    def _wait_arrival_pose(self, target: List[float], t_reply: float, deadline_s: float) -> dict:
+        """Each poll: GetAngle / PositiveSolution, then RobotMode. Arrival is a pose within
+        ARRIVE_TOL_MM / ARRIVE_TOL_R_DEG of the target followed by a RobotMode 5 read after it
+        (an idle reading taken before the pose proves nothing about it), at least MIN_LEG_S
+        after the reply; every RobotMode read is judged by the phase (7 allowed, 9 a fault)"""
+        run = self.run
+        polls = 0
+        while True:
+            run.check()
+            if time.monotonic() - t_reply > deadline_s:
+                raise JogFault(f"the arm did not arrive within {deadline_s:g} s")
+            angles = run.angles()
+            pose = self._fk(angles)
+            dxyz = max(abs(a - b) for a, b in zip(pose[:3], target[:3]))
+            dr = abs(pose[3] - target[3])
+            idle = run.mode() == 5                       # after the pose, never before it
+            now = time.monotonic()
+            polls += 1
+            if now - t_reply > deadline_s:
+                raise JogFault(f"the arm did not arrive within {deadline_s:g} s")
+            if idle and now - t_reply >= MIN_LEG_S and dxyz <= ARRIVE_TOL_MM and dr <= ARRIVE_TOL_R_DEG:
+                run.report["poses"].append({"utc": _utc(), "angles": angles, "pose": pose, "after": "move"})
+                return {"arrived_s": round(now - t_reply, 4), "pose": pose, "angles": angles, "polls": polls}
+            time.sleep(POLL_S)
+
+    def _disable(self) -> dict:
+        """The jog tool's steps 8 and 9: DisableRobot, RobotMode 4 within DISABLE_DEADLINE_S,
+        the final read-only queries"""
+        run = self.run
+        run.set_phase("disabling")
+        run.check()
+        run.dash.query(protocol.disable_robot())
+        run.report["disable_s"] = run.wait_mode(4, DISABLE_DEADLINE_S, "disabling")
+        run.disabled_confirmed = True
+        self.rec.report["disabled_confirmed"] = True
+        run.set_phase("disabled")
+        run.say("disabled (RobotMode 4 after %.2f s)" % run.report["disable_s"])
+        run.dash.query(protocol.robot_mode())
+        run.dash.query(protocol.get_error_id())
+        final = run.angles()
+        run.report["final_joints"] = final
+        run.report["final_pose"] = protocol.parse_numbers(run.dash.query(protocol.get_pose()).values, 4)
+        return {"disable_s": run.report["disable_s"], "angles": final}
+
+    def _close(self, fut):
+        """The end: back to synchronous saves, the connections closed, the feed stopped and
+        summarised, the record written. Each step under its own guard; errors are kept.
+        A latch set before this point is taken first (the stop sequence, or nothing to stop)"""
+        with self.lock:
+            self._closed.set()
+        if self.latch.is_set() and not self.stopped:
+            self._stop_now()
+        run, rec, fb = self.run, self.rec, self.fb
+        steps: List[Callable[[], None]] = []
+        if run is not None:
+            steps.append(run.finish)
+            steps.extend(d.close for d in run.conns)
+            rec.report["disabled_confirmed"] = run.disabled_confirmed
+        if fb is not None:
+            def feedback_summary():
+                fb.stop()
+                fb.join(timeout=2.0)
+                rec.report["feedback"] = fb.summary()
+            steps.append(feedback_summary)
+        if rec is not None:
+            def final_save():
+                if run is not None:
+                    rec.save = run._sync_save        # type: ignore[assignment]
+                if self.stop_reason is not None:
+                    rec.report["stop_reason"] = self.stop_reason
+                    rec.report["stop_autonomous"] = self.autonomous
+                rec.report["complete"] = bool(run is not None and run.disabled_confirmed and not self.stopped)
+                rec.report["ended_utc"] = _utc()
+                try:
+                    rec.save()
+                except BaseException as e:  # noqa: BLE001 - reported as a failure of the run
+                    self.record_error = repr(e)
+                    raise
+            steps.append(final_save)
+        for step in steps:
+            try:
+                step()
+            except BaseException as e:  # noqa: BLE001 - the remaining steps still run
+                self.close_errors.append(f"{getattr(step, '__name__', 'step')}: {e!r}")
+        _resolve(fut, self.summary())
+        # requests queued after the close are answered, not left hanging
+        while True:
+            try:
+                name, fn, pending, soft = self._q.get_nowait()
+            except queue.Empty:
+                break
+            _reject(pending, StopRequested("the controller is closed"))

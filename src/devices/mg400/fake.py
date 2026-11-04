@@ -6,6 +6,10 @@ the angles are interpolated over ``move_s`` with mode 7, then mode 5), and a fee
 streaming 1440-byte packets every ``period_s``. Every received command is recorded, so
 tests can assert what was sent, and on which port.
 
+Knobs for the robot wrapper's mock and tests (flow plan stage two): ``ik_model`` (InverseSolution
+and MovL work from the planar model of ``fk``, consistent with itself only), ``ack_no_motion``
+(a motion command is acknowledged and nothing moves).
+
 Knobs for the jog tool's tests: ``enable_s`` (how long EnableRobot takes to show mode 5;
 None = never), ``stuck_running`` (a move never ends: mode stays 7), ``refuse_motion``
 (JointMovJ answers ErrorID -1), ``disable_fails`` (DisableRobot is answered but the mode
@@ -30,7 +34,8 @@ class FakeMG400:
                  enable_s: Optional[float] = 0.2, move_s: float = 0.6, stuck_running: bool = False,
                  refuse_motion: bool = False, disable_fails: bool = False,
                  alarm_on_move: bool = False, reset_fails: bool = False,
-                 alarm_keeps_moving: bool = False):
+                 alarm_keeps_moving: bool = False, ik_model: bool = False,
+                 ack_no_motion: bool = False):
         self.mode = mode
         self.pose = list(pose)
         self.angles = list(angles)
@@ -46,6 +51,12 @@ class FakeMG400:
         self.disable_fails, self.alarm_on_move = disable_fails, alarm_on_move
         self.reset_fails, self.alarm_keeps_moving = reset_fails, alarm_keeps_moving
         self.ack_lost: set = set()                # command names: executed, then the connection closes instead of replying (once each)
+        # the robot wrapper's fake (flow plan stage two): InverseSolution answers from the same
+        # planar model as fk() (consistent with itself, not with the arm) and refuses what the
+        # model cannot reach; MovL is accepted and the pose moves in a straight line over move_s
+        self.ik_model = ik_model
+        self.ack_no_motion = ack_no_motion        # MovL / JointMovJ answered 0, then nothing moves (mode stays 5)
+        self.movl_received: List[str] = []
         self._move_gen = 0                        # a Reset / Disable ends the current move
         self.moves: List[list] = []               # targets the fake started moving to
         self.on_command = None                    # hook(cmd) called before a Dashboard reply
@@ -200,6 +211,12 @@ class FakeMG400:
             # joint angles standing in for the nearest solution
             if "{" in cmd or cmd.count(",") != 5:
                 return f"-20000,{{}},{cmd};"
+            if self.ik_model:
+                x, y, z, r = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
+                joints = self.ik(x, y, z, r)
+                if joints is None:
+                    return f"-1,{{}},{cmd};"           # unreachable in this fake's model (not a guide value)
+                return f"0,{{{fmt(joints)}}},{name + '()' if name in self.echo_bare else cmd};"
             return f"0,{{{fmt(self.angles[:4])}}},{name + '()' if name in self.echo_bare else cmd};"
         if name == "EnableRobot":
             self._end_move()
@@ -263,11 +280,15 @@ class FakeMG400:
 
     def motion_reply(self, cmd: str) -> str:
         name = cmd.split("(", 1)[0]
+        if name == "MovL":
+            return self._movl_reply(cmd)
         if name != "JointMovJ":
             return f"-10000,{{}},{cmd};"
         if self.refuse_motion or self.mode != 5:
             return f"-1,{{}},{cmd};"
         target = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
+        if self.ack_no_motion:
+            return f"0,{{}},{cmd};"               # acknowledged; the arm stays where it is
         with self._lock:
             self._move_gen += 1
             gen = self._move_gen
@@ -308,6 +329,70 @@ class FakeMG400:
         with self._lock:
             if gen == self._move_gen and not self.stuck_running:
                 self.mode = 5
+
+    def _movl_reply(self, cmd: str) -> str:
+        """``MovL(X,Y,Z,R,User=0,Tool=0,SpeedL=s,AccL=s)``: the pose moves in a straight line
+        over move_s (mode 7, then 5); the joints follow the planar model. Needs ik_model"""
+        with self._lock:
+            self.movl_received.append(cmd)
+        if self.refuse_motion or self.mode != 5 or not self.ik_model:
+            return f"-1,{{}},{cmd};"
+        pose = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
+        if self.ik(*pose) is None:
+            return f"-1,{{}},{cmd};"
+        if self.ack_no_motion:
+            return f"0,{{}},{cmd};"
+        with self._lock:
+            self._move_gen += 1
+            gen = self._move_gen
+            self.moves.append(list(pose))
+        threading.Thread(target=self._move_pose, args=(pose, gen), daemon=True).start()
+        return f"0,{{}},{cmd};"          # the echo keeps every optional parameter (this fake's assumption)
+
+    def _move_pose(self, target, gen):
+        start = self.fk(self.angles[:4])
+        with self._lock:
+            if gen != self._move_gen:
+                return
+            self.mode = 7
+        if self.alarm_on_move:
+            time.sleep(0.1)
+            with self._lock:
+                if gen == self._move_gen:
+                    self.mode, self.errors = 9, [[], [23], [], [], [], []]
+            return
+        steps = max(1, int(self.move_s / 0.02))
+        for i in range(1, steps + 1):
+            time.sleep(self.move_s / steps)
+            pose = [a + (b - a) * i / steps for a, b in zip(start, target)]
+            joints = self.ik(*pose)
+            with self._lock:
+                if gen != self._move_gen:
+                    return
+                if joints is not None:
+                    self.angles[:4] = joints
+                self.pose = self.fk(self.angles[:4])
+        with self._lock:
+            if gen == self._move_gen and not self.stuck_running:
+                self.mode = 5
+
+    def ik(self, x, y, z, r=None):
+        """The inverse of fk(): J1 = atan2(y, x); J2 / J3 from the two-link planar model
+        (both links 175, the datasheet-like stand-in of fk); J4 = R - J1 (None keeps J4).
+        None when the model cannot reach the point or J2 / J3 leave the datasheet range"""
+        j1 = math.degrees(math.atan2(y, x))
+        a, b = math.hypot(x, y) - 200.0, z - 100.0
+        d = math.hypot(a, b)
+        if d == 0.0 or d > 350.0:
+            return None
+        phi = math.degrees(math.atan2(a, b))
+        h = math.degrees(math.acos(d / 350.0))
+        j2 = phi - h
+        j3 = (phi + h) - 90.0
+        if not (-25.0 <= j2 <= 85.0 and -25.0 <= j3 <= 105.0):
+            return None
+        j4 = (r - j1) if r is not None else self.angles[3]
+        return [j1, j2, j3, j4]
 
     @staticmethod
     def fk(j):

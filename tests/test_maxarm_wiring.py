@@ -101,7 +101,7 @@ def test_unknown_robot_type_is_a_config_error(tmp_path, restore_config):
 # schema
 # ----------------------------------------------------------------------
 def test_schema_suction_and_robot_id_range():
-    assert MAX_ROBOT_ID == 4
+    assert MAX_ROBOT_ID == 5          # 5 is the optional Dobot MG400 (tests/test_mg400_wiring.py)
     wf = ExperimentWorkflow(name="t", steps=[
         {"action": "suction", "robot_id": 4},
         {"action": "suction", "robot_id": 4, "on": False},
@@ -109,12 +109,12 @@ def test_schema_suction_and_robot_id_range():
     ])
     assert wf.steps[0].on is True and wf.steps[1].on is False
     with pytest.raises(ValidationError):
-        ExperimentWorkflow(name="t", steps=[{"action": "move_z", "robot_id": 5, "distance": 1}])
+        ExperimentWorkflow(name="t", steps=[{"action": "move_z", "robot_id": 6, "distance": 1}])
     with pytest.raises(ValidationError):
         ExperimentWorkflow(name="t", steps=[{"action": "suction", "robot_id": 4, "power": 1}])
 
 
-def test_every_robot_id_field_accepts_4():
+def test_every_robot_id_field_accepts_max_robot_id():
     schema = ExperimentWorkflow.model_json_schema()
     for name, model in schema["$defs"].items():
         rid = model.get("properties", {}).get("robot_id")

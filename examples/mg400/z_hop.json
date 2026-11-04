@@ -1,0 +1,11 @@
+{
+  "name": "MG400 z hop",
+  "description": "Robot 5 (Dobot MG400, type: mg400) goes to its configured home_position, lifts the flange by 5 mm, waits one second, lowers it by 5 mm and returns home. Every move is a straight MovL inside the robot's own workspace box of examples/mg400/config.mg400.yaml; the real run is the human's (docs/mg400-commissioning.md stage C2).",
+  "steps": [
+    {"action": "go_home", "robot_id": 5},
+    {"action": "move_z", "robot_id": 5, "distance": 5.0},
+    {"action": "wait", "robot_id": 5, "seconds": 1.0},
+    {"action": "move_z", "robot_id": 5, "distance": -5.0},
+    {"action": "go_home", "robot_id": 5}
+  ]
+}
