@@ -713,6 +713,26 @@ stands, and the device report says whether the arm confirmed that. The arrival i
 the controller's word (RobotMode back to 5, and the measured pose within 0.5 mm
 and 0.2° of the target) within a deadline derived from the distance.
 
+**Joint tracking at rest.** `GetAngle()` answers the controller's target angles,
+not the measured ones (stage C1 saw J2 2° below its target with no alarm,
+`docs/mg400-commissioning.md` §3.13). So the robot type also reads the feedback
+port's measured angles (`q_actual`) and compares them, joint by joint, with the
+target (`q_target`). After the Enable, at every pose read while enabled, before
+every `MovL` and at arrival it also compares them with the `GetAngle()` value it
+is about to use; only a packet with RobotMode 5, received after the check began,
+counts. Between steps it compares with the target only, using the latest packet
+once the step's phase grace (0.3 s) has passed. More than 0.2° on any joint stops
+the run (the stop sequence; the run is failed and the report names the joint).
+At arrival a difference is not yet a fault: the arm may still settle until the
+move's deadline, and the deadline fault names the last difference. What is
+guaranteed is that the feedback values each successful check accepted were
+within 0.2°. The check is sampled: a fault while moving, a brief excursion
+between checks, or a packet the network delivered late can go unseen, and it
+adds no Cartesian accuracy beyond the arrival check. The record
+(`control.tracking`) holds every check inside a step, every failing check, and
+a passing check between steps at most once a second; `tracking_max` holds each
+joint's largest difference over all of them.
+
 **Running.** `--validate-only` checks the absolute targets and `home_position`
 against the box; `--mock` runs the same wrapper against a fake controller in
 this process (no address needed, every validation step and the stop path run

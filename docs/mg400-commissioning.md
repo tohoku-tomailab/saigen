@@ -97,8 +97,13 @@ the stages of the flow plan, each only on the human's request in the session
    `examples/mg400/z_hop.json` (the human presses Enter at the runner's
    prompt). The first `MovL`, the first `InverseSolution` sampling on the
    arm, the first `go_home` (expected "already at home"), arrival timing and
-   tolerance. Progression: `complete`, every arrival within tolerance, no
-   alarm, the operator saw the hop and nothing else.
+   tolerance, and the first joint-tracking checks on the arm (`control.tracking`,
+   `tracking_max`: the measured joints against the target at rest, at most
+   0.2 deg). Progression: `complete`, every arrival within tolerance, no
+   tracking failure, no alarm, the operator saw the hop and nothing else. An
+   arrival `mismatch` record followed by an `ok` at the same arrival (the arm
+   settled) is accepted by the software. For C2 it is written up and looked at
+   before C3; it is not a failure by itself.
 11. C3: the same flow with Ctrl+C during the first `move_z`: the stop sequence
    from a flow through the executor and the session. Record the distance
    moved after the Ctrl+C and the hold after the disable. Progression to D:
@@ -563,10 +568,18 @@ EnableRobot reply in the same run took 1.23 s.
   (§3.13). The flow robot type measures every pose as
   `PositiveSolution(GetAngle(), 0, 0)` and judges arrival on it, so a joint
   that is off its target, as J2 was, is invisible to its validation and its
-  arrival check. Stage C2 does not start before this is settled: a revised
-  plan that also reads `q_actual` from the feedback (and refuses to move, or
-  stops, when it differs from the target by more than a bound) goes through
-  review first.
+  arrival check. Addressed by the tracking plan (reviewed): the robot type
+  now compares the feedback's `q_actual` with `q_target` and with the
+  `GetAngle()` value used, at rest, at the Enable, every enabled pose read,
+  before every `MovL` and at arrival, and with `q_target` only between
+  requests. More than 0.2 deg on a
+  joint stops the run, except at arrival, where the arm may settle until the
+  move's deadline (`docs/setup.md` §13). The check is sampled and in
+  receive-time order. A fault while moving, a brief excursion between checks,
+  and a packet delivered late can go unseen. The bound comes from the jog
+  records at rest (at most 0.011 deg healthy, 2.07 deg in `jog_07`); C2
+  records it on the arm for the first time. The jog tool does not use the
+  check.
 - Whether the first-connection ending repeats beyond these three runs (each
   time after a second connection was opened), and whether it happens with
   the arm enabled: a later control stage cannot assume a second monitoring

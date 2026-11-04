@@ -271,8 +271,23 @@ configuration keys and the bench order are in `docs/setup.md` §13; the flow for
   a latch set meanwhile, and only then closes. The arrival of a `MovL` is a pose within
   0.5 mm / 0.2 deg of the target followed by a RobotMode 5 read after that pose (an idle
   reading taken before the pose proves nothing). The record (`report.json`, `feedback.*`) is
-  the jog tool's recorder; the run's report is under the key `control` with `poses` and
-  `moves`.
+  the jog tool's recorder; the run's report is under the key `control` with `poses`,
+  `moves`, `tracking` and `tracking_max`.
+- Joint tracking at rest (the tracking plan, after stage C1's J2 sag): the worker copies the
+  feedback reader's latest packet under its lock and judges the copy outside it. A latched
+  fault, no packet, an age over `FEEDBACK_MAX_AGE_S` at the judgement, error_status,
+  non-finite or out-of-range fields, fewer than four values or a non-finite joint value is a
+  fault at once (`TrackingFault`). A copy counts when its RobotMode is 5 and it was received
+  strictly after the check's boundary (the PC's monotonic clock ticks about every 16 ms on Windows: a packet stamped in the boundary's tick never counts); the wait for one is at most `TRACK_WAIT_S` (0.5 s), takes
+  a stop on every poll and sends nothing. `TRACK_TOL_DEG` (0.2) bounds `q_actual - q_target`
+  and `q_actual - GetAngle value`. Checks: after the Enable (behind the existing 0.5 s settle),
+  at every enabled pose read (`_pose`, so every consumer of a pose in the wrapper), before
+  every `MovL` (still in phase "enabled"), at arrival (a mismatch is a retry until the move's
+  absolute deadline; the deadline fault carries the last mismatch), and in `_tick` between
+  requests (target only, after the phase grace; a fault there becomes the latch inside
+  `_tick`). The guarantee is sampled and in receive-time order: a packet measured earlier and
+  delivered late can pass. The jog tool does not use these checks; it records `q_actual` and
+  `q_target` in its feedback CSV.
 - `MG400Robot.cleanup` (in `src/devices/safety/mg400_robot.py`) starts `shutdown` in its own
   non-daemon thread and waits for it and for the worker's end, at most 24 s (the stop
   sequence's 15 s, one reply timeout, 1 s, and 5 s of margin). A cancel of that wait (the
