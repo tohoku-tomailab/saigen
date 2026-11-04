@@ -89,8 +89,8 @@ the stages of the flow plan, each only on the human's request in the session
    (for example `--j1 10 --speed 3`, its duration not yet measured) leaves
    time for the press. Second attempt (§3.14, `--j1 10 --speed 3`, leg about
    2 s): the stop ran during the leg back, `reset_disable` with `disabled:
-   true`. The operator saw slight sinking at the stop, and whether it counts as
-   "motion after the stop" is the human's decision.
+   true`. The operator saw slight sinking at the moment the arm stopped and
+   accepted C1 as passed (2026-11-04).
 10. C2: with the real `config.yaml` (robot 5, a box measured in DobotStudio
    Pro around the rest pose, `home_position` = the rest pose, `speed_ratio`
    10): `--validate-only`, `--mock`, then the real run of
@@ -520,10 +520,15 @@ The tool's result: `stop_state: reset_disable`, `disabled: true`, no deadline
 hit, 2.28 s in all. J1 moved about 0.8 deg after the trigger (6.3 to 5.54,
 roughly 3 mm at the flange at the 208 mm radius), all of it within 0.12 s.
 
-The operator reported that the arm "sank slightly" when it stopped. The
-feedback shows the 0.03 mm drop in z about 0.27 s after RobotMode 4, while the
-arm was disabled. It does not show when the operator saw the sinking.
-Nothing larger appears in `q_actual` between the trigger and the end.
+The operator reported that the arm "sank slightly" at the moment it stopped
+(asked: at the stop itself, not about a second later), and accepted C1 as
+passed. In the feedback the arm stopped 0.12 s after the trigger. J2 and J3
+`q_actual` stayed within 0.001 deg and `tool_vector_actual` z within 0.003 mm
+from the trigger until the disable. The only drop in z, 0.03 mm, came about
+0.27 s after RobotMode 4, with the arm disabled. So the sinking seen at the
+stop does not appear in the joint feedback. What the eye saw (J1's
+deceleration, a flex of the arm, or a movement the encoders do not show) is
+not known.
 
 **J2 tracking.** At this start J2 did not sink. Enabled at rest, the largest
 |`q_actual` - `q_target`| was 0.0013 deg on J1 to J3 and 0.011 deg on J4.
@@ -549,9 +554,11 @@ EnableRobot reply in the same run took 1.23 s.
   covered it both times. Whether the controller's reply to DisableRobot (like
   EnableRobot's 1.23 s) simply takes longer than 1 s is open. A longer timeout
   in the stop sequence would change the jog tool and needs a reviewed plan.
-- The slight sinking the operator saw at the C1 stop (§3.14): in the feedback
-  only a 0.03 mm drop in z with the arm already disabled. Whether the operator
-  saw that or something the feedback does not show is open.
+- The slight sinking the operator saw at the moment of the C1 stop (§3.14)
+  does not appear in the joint feedback, which shows at that moment J2 and J3
+  within 0.001 deg and z within 0.003 mm; the only drop, 0.03 mm, came with
+  the arm already disabled. What was seen is open. C3 records the stop of a
+  `MovL` the same way.
 - `GetAngle()` reported the target, not the measured joints, while enabled
   (§3.13). The flow robot type measures every pose as
   `PositiveSolution(GetAngle(), 0, 0)` and judges arrival on it, so a joint
