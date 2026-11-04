@@ -378,3 +378,18 @@ def test_a_fault_after_the_stop_adds_no_second_stop_sequence(tmp_path):
         assert box["before"] == box["after"] == 2              # take_control's ResetRobot and the stop's
         summary = ctl.shutdown(20)
         assert summary["stop_state"] == "reset_disable" and summary["stop_reason"] == "first"
+
+
+def test_a_feedback_fault_before_control_is_still_an_autonomous_stop(tmp_path):
+    """Before the arm is armed the joint-tracking watch does not run: the feedback fault itself
+    must set the latch (an autonomous stop with nothing to stop)"""
+    with FakeMG400(ik_model=True) as fake:
+        ctl = make(fake, tmp_path / "a")
+        ctl.open().result(5)
+        ctl.pose().result(5)
+        fake.drop_feedback()
+        assert wait_for(lambda: ctl.stopped, 2.0)
+        assert ctl.autonomous and "feedback" in ctl.stop_reason
+        summary = ctl.shutdown(10)
+        assert "feedback" in summary["failed_reason"]
+        assert "EnableRobot" not in dash_names(fake)

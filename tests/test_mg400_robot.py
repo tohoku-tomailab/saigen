@@ -361,6 +361,17 @@ def test_validation_uses_the_measured_start_pose_not_the_last_target(tmp_path):
         await r.move_z(5.0)
         with r.fake._lock:
             r.fake.angles[:4] = r.fake.ik(460.0, 0.0, 225.0)        # x outside the box
+            moved = list(r.fake.angles[:4])
+        # the fake jumps at once (a real arm cannot): wait for a packet that shows the new
+        # joints, or the joint-tracking check would compare GetAngle with an older packet
+        fb = r._ctl.fb
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            with fb.lock:
+                latest = (fb.latest or {}).get("q_actual") or []
+            if latest[:4] and max(abs(a - b) for a, b in zip(latest[:4], moved)) < 1e-6:
+                break
+            time.sleep(0.01)
         # move_xyz measures nothing before _move_to: the start must come from the measurement
         # there, not from the pose remembered after the last move (which is inside the box)
         with pytest.raises(WorkspaceViolationError) as info:

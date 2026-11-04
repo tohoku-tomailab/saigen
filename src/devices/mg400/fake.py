@@ -10,6 +10,15 @@ Knobs for the robot wrapper's mock and tests (flow plan stage two): ``ik_model``
 and MovL work from the planar model of ``fk``, consistent with itself only), ``ack_no_motion``
 (a motion command is acknowledged and nothing moves).
 
+Knobs for the joint-tracking tests (tracking plan): feedback packets carry ``q_target`` (the
+angles GetAngle answers) and ``q_actual``; ``sag={joint: deg}`` offsets ``q_actual`` only while
+enabled (modes 5 and 7), as J2 was in stage C1's jog_07; ``settle=(joint, deg, seconds)`` offsets
+``q_actual`` after each move's end, decaying linearly to 0 (a healthy arm settling);
+``getangle_offset={joint: deg}`` offsets the GetAngle answer only; ``feedback_mode`` replaces the
+RobotMode in the packets (None: the fake's own mode); ``feedback_error_status`` replaces their
+error_status. All may be set at any time. (``settle`` is linear, not the first-order lag the
+tracking plan named: it exercises the same settle-and-retry path.)
+
 Knobs for the jog tool's tests: ``enable_s`` (how long EnableRobot takes to show mode 5;
 None = never), ``stuck_running`` (a move never ends: mode stays 7), ``refuse_motion``
 (JointMovJ answers ErrorID -1), ``disable_fails`` (DisableRobot is answered but the mode
@@ -56,6 +65,12 @@ class FakeMG400:
         # model cannot reach; MovL is accepted and the pose moves in a straight line over move_s
         self.ik_model = ik_model
         self.ack_no_motion = ack_no_motion        # MovL / JointMovJ answered 0, then nothing moves (mode stays 5)
+        self.sag: dict = {}                       # tracking knobs (see the module docstring)
+        self.settle: Optional[tuple] = None
+        self.getangle_offset: dict = {}
+        self.feedback_mode: Optional[int] = None
+        self.feedback_error_status: Optional[int] = None
+        self._move_end_t: Optional[float] = None
         self.movl_received: List[str] = []
         self._move_gen = 0                        # a Reset / Disable ends the current move
         self.moves: List[list] = []               # targets the fake started moving to
@@ -201,7 +216,10 @@ class FakeMG400:
         if name == "GetPose":
             return f"0,{{{fmt(self.pose)}}},GetPose();"
         if name == "GetAngle":
-            return f"0,{{{fmt(self.angles)}}},GetAngle();"
+            angles = list(self.angles)
+            for j, d in dict(self.getangle_offset).items():
+                angles[j - 1] += d
+            return f"0,{{{fmt(angles)}}},GetAngle();"
         if name == "PositiveSolution":
             j = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
             return f"0,{{{fmt(self.fk(j))}}},{cmd};"
@@ -329,6 +347,7 @@ class FakeMG400:
         with self._lock:
             if gen == self._move_gen and not self.stuck_running:
                 self.mode = 5
+                self._move_end_t = time.monotonic()
 
     def _movl_reply(self, cmd: str) -> str:
         """``MovL(X,Y,Z,R,User=0,Tool=0,SpeedL=s,AccL=s)``: the pose moves in a straight line
@@ -375,6 +394,7 @@ class FakeMG400:
         with self._lock:
             if gen == self._move_gen and not self.stuck_running:
                 self.mode = 5
+                self._move_end_t = time.monotonic()
 
     def ik(self, x, y, z, r=None):
         """The inverse of fk(): J1 = atan2(y, x); J2 / J3 from the two-link planar model
@@ -404,9 +424,24 @@ class FakeMG400:
 
     # -- feedback ---------------------------------------------------------
     def packet(self) -> bytes:
-        return feedback.build(robot_mode=self.mode, timestamp_ms=int(time.time() * 1000),
-                              q_actual=self.angles, tool_vector_actual=self.pose + [0.0, 0.0],
-                              robot_type=1, error_status=0 if self.mode != 9 else 1)
+        with self._lock:                         # one snapshot: target, actual and mode agree
+            mode, target, pose = self.mode, list(self.angles), list(self.pose)
+            sag, settle, end_t = dict(self.sag), self.settle, self._move_end_t
+            fb_mode, fb_error = self.feedback_mode, self.feedback_error_status
+        actual = list(target)
+        if mode in (5, 7):
+            for j, d in sag.items():
+                actual[j - 1] += d
+            if settle is not None and end_t is not None and mode == 5:
+                j, d, seconds = settle
+                left = 1.0 - (time.monotonic() - end_t) / seconds
+                if left > 0:
+                    actual[j - 1] += d * left
+        return feedback.build(robot_mode=mode if fb_mode is None else fb_mode,
+                              timestamp_ms=int(time.time() * 1000),
+                              q_target=target, q_actual=actual, tool_vector_actual=pose + [0.0, 0.0],
+                              robot_type=1,
+                              error_status=(0 if mode != 9 else 1) if fb_error is None else fb_error)
 
     def _serve_feedback(self, conn):
         self._feedback_conns.append(conn)

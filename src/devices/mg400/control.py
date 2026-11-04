@@ -12,6 +12,7 @@ whose ``poll()`` is called before every send; by default a ``_NoInterrupts`` tha
 """
 import concurrent.futures
 import ipaddress
+import math
 import os
 import queue
 import socket
@@ -21,7 +22,7 @@ import time
 from typing import Callable, List, Optional
 
 from . import protocol
-from .observe import (DASHBOARD_PORT, FEEDBACK_PORT, TIMEOUT_S, Dashboard, FeedbackRecorder,
+from .observe import (DASHBOARD_PORT, FEEDBACK_MAX_AGE_S, FEEDBACK_PORT, TIMEOUT_S, Dashboard, FeedbackRecorder,
                       MG400RecordError, ObservationEnded, Recorder, _kind, _utc)
 from .protocol import Command, MG400CommandError, MG400ConnectionError, MG400Error, MG400ProtocolError
 
@@ -849,6 +850,26 @@ WORKER_TICK_S = 0.1             # the worker's bounded queue wait: the latch and
 ARRIVE_TOL_MM = 0.5             # MovL arrival: x, y, z each within this of the target ...
 ARRIVE_TOL_R_DEG = 0.2          # ... and R within this
 MOVE_SPEED_FLOOR_MM_S = 10.0    # the arrival deadline is MOVE_DEADLINE_S + distance / this
+# joint tracking at rest (tracking plan, after stage C1's jog_07: J2's measured angle 2.06 deg
+# below its target while GetAngle() answered the target). Healthy records at rest: <= 0.011 deg
+TRACK_TOL_DEG = 0.2             # |q_actual - q_target| and |q_actual - GetAngle value used|, each joint
+TRACK_WAIT_S = 0.5              # at most this for a resting packet (RobotMode 5, received after the boundary)
+TRACK_POLL_S = 0.01
+TRACK_IDLE_RECORD_S = 1.0       # the idle watch appends a passing record at most this often
+
+
+class TrackingFault(JogFault):
+    """A tracking check failed: the feedback copy was invalid, none was eligible in time, or a
+    joint's measured angle was off its target (or the GetAngle value used) by more than the bound"""
+
+
+def _describe_tracking(rec: dict) -> str:
+    j = rec["worst_joint"]
+    text = (f"{rec['what']}: J{j} measured {rec['q_actual'][j - 1]:.4f} deg, target "
+            f"{rec['q_target'][j - 1]:.4f} deg")
+    if rec.get("ref_angles") is not None:
+        text += f", GetAngle {rec['ref_angles'][j - 1]:.4f} deg"
+    return text + f" (difference {rec['worst_deg']:.4f} deg, bound {TRACK_TOL_DEG:g})"
 
 
 class StopRequested(MG400Error):
@@ -1102,6 +1123,12 @@ class Controller:
             if fault:
                 self.autonomous = True
                 self.request_stop(f"feedback fault: {fault}")
+        if not self.latch.is_set() and not self.stopped:
+            try:
+                self._idle_track()
+            except Exception as e:  # noqa: BLE001 - an idle tracking fault is a stop, decided here
+                self.autonomous = True
+                self.request_stop(f"{type(e).__name__}: {e}")
         if self.latch.is_set():
             self._stop_now()
 
@@ -1157,7 +1184,7 @@ class Controller:
         run = JogRun(self.rec, self.fb, self.host, self.connect, self.dashboard_port, self.motion_port,
                      self._out, self.hooks, self.ints)
         self.rec.report["control"] = self.rec.report.pop("jog")      # the same structure, under the wrapper's name
-        run.report.update(poses=[], moves=[])
+        run.report.update(poses=[], moves=[], tracking=[], tracking_max={})
         self.run = run
         run.dash = Dashboard(_open(self.connect, self.host, self.dashboard_port), self.rec, "dashboard-1",
                              run.guard, port=self.dashboard_port)
@@ -1180,6 +1207,8 @@ class Controller:
         run = self.run
         run.check()
         angles = run.angles()
+        if run.armed and run.enable_completed and not run.disabled_confirmed:
+            self._track_fault_on_mismatch(self._track_wait(time.monotonic(), angles, "pose"))
         pose = self._fk(angles)
         get_pose = protocol.parse_numbers(run.dash.query(protocol.get_pose()).values, 4)
         run.report["poses"].append({"utc": _utc(), "angles": angles, "pose": pose, "get_pose": get_pose})
@@ -1232,6 +1261,7 @@ class Controller:
         run.report["angles_after_enable"] = after_enable
         if _max_diff(after_enable, start) > ARRIVE_TOL_DEG:
             raise JogFault(f"enabling moved the arm: {after_enable} vs start {start}")
+        self._track_fault_on_mismatch(self._track_wait(time.monotonic(), after_enable, "enable"))
         pose = self._fk(after_enable)
         run.report["poses"].append({"utc": _utc(), "angles": after_enable, "pose": pose, "after": "enable"})
         return {"enable_s": run.report["enable_s"], "pose": pose}
@@ -1243,6 +1273,12 @@ class Controller:
         GetErrorID"""
         run = self.run
         deadline_s = MOVE_DEADLINE_S + float(distance_mm) / MOVE_SPEED_FLOOR_MM_S
+        hook = self.hooks.get("before_track")
+        if hook is not None:
+            hook(self)
+        ref = run.report["poses"][-1]["angles"] if run.report["poses"] else None
+        # the pre-send gate, while the phase is still "enabled" (mode 7 is not yet allowed)
+        self._track_fault_on_mismatch(self._track_wait(time.monotonic(), ref, "before MovL"))
         run.set_phase("moving")
         run.check()
         cmd = protocol.mov_l(pose, speed)
@@ -1265,10 +1301,19 @@ class Controller:
         after the reply; every RobotMode read is judged by the phase (7 allowed, 9 a fault)"""
         run = self.run
         polls = 0
+        deadline = t_reply + deadline_s                  # absolute (monotonic), for the tracking wait too
+        last_mismatch: List[dict] = []
+
+        def late() -> JogFault:
+            text = f"the arm did not arrive within {deadline_s:g} s"
+            if last_mismatch:
+                text += "; last tracking mismatch: " + _describe_tracking(last_mismatch[-1])
+            return JogFault(text)
+
         while True:
             run.check()
-            if time.monotonic() - t_reply > deadline_s:
-                raise JogFault(f"the arm did not arrive within {deadline_s:g} s")
+            if time.monotonic() > deadline:
+                raise late()
             angles = run.angles()
             pose = self._fk(angles)
             dxyz = max(abs(a - b) for a, b in zip(pose[:3], target[:3]))
@@ -1276,12 +1321,192 @@ class Controller:
             idle = run.mode() == 5                       # after the pose, never before it
             now = time.monotonic()
             polls += 1
-            if now - t_reply > deadline_s:
-                raise JogFault(f"the arm did not arrive within {deadline_s:g} s")
+            if now > deadline:
+                raise late()
             if idle and now - t_reply >= MIN_LEG_S and dxyz <= ARRIVE_TOL_MM and dr <= ARRIVE_TOL_R_DEG:
+                # the joints at rest: a resting packet received after that RobotMode 5 reply
+                rec = self._track_wait(now, angles, "arrival", deadline=deadline, on_deadline=late)
+                if rec["mismatch"]:
+                    last_mismatch.append(rec)            # may still settle: poll on, until the deadline
+                    del last_mismatch[:-1]
+                    time.sleep(POLL_S)
+                    continue
+                hook = self.hooks.get("before_accept")
+                if hook is not None:
+                    hook(self)
+                now = time.monotonic()
+                if now > deadline:                       # never a success after the deadline
+                    raise late()
                 run.report["poses"].append({"utc": _utc(), "angles": angles, "pose": pose, "after": "move"})
-                return {"arrived_s": round(now - t_reply, 4), "pose": pose, "angles": angles, "polls": polls}
+                return {"arrived_s": round(now - t_reply, 4), "pose": pose, "angles": angles, "polls": polls,
+                        "tracking_deg": rec["worst_deg"]}
             time.sleep(POLL_S)
+
+    # -- joint tracking (worker thread; the tracking plan) -----------------------------
+    def _track_copy(self) -> dict:
+        """Copy what one check needs from the reader's latest packet, under ``fb.lock`` and
+        nothing else there (the lock is not re-entrant: judging, ``fb.check()``, recording and
+        the stop path all run after it is released)"""
+        fb = self.fb
+        with fb.lock:
+            pkt, t, fault = fb.latest, fb.last_valid_t, fb.fault
+            copy = None
+            if pkt is not None:
+                copy = {"q_actual": list(pkt.get("q_actual") or [])[:4],
+                        "q_target": list(pkt.get("q_target") or [])[:4],
+                        "mode": pkt.get("robot_mode"), "error_status": pkt.get("error_status"),
+                        "nonfinite": list(pkt.get("nonfinite") or []),
+                        "out_of_range": list(pkt.get("out_of_range") or [])}
+        snap = {"packet": copy, "t": t, "fault": fault}
+        hook = self.hooks.get("track_copied")
+        if hook is not None:
+            hook(self, snap)
+        return snap
+
+    def _track_judge(self, snap: dict, ref: Optional[List[float]], what: str) -> dict:
+        """Judge one copy on its own (fail closed): a latched fault, no packet, a stale packet
+        (its own receive time, judged now), error_status, non-finite or out-of-range fields, fewer
+        than 4 values or a non-finite joint value raise TrackingFault. Otherwise the record, with
+        ``mismatch`` set when a difference exceeds TRACK_TOL_DEG (exactly the bound passes)"""
+        if snap["fault"]:
+            raise TrackingFault(f"{what}: feedback fault: {snap['fault']}")
+        p, t = snap["packet"], snap["t"]
+        if p is None or t is None:
+            raise TrackingFault(f"{what}: no feedback packet")
+        now = time.monotonic()
+        age = now - t
+        if age > FEEDBACK_MAX_AGE_S:
+            raise TrackingFault(f"{what}: feedback stale: last valid packet {age:.2f} s old")
+        if p["error_status"]:
+            raise TrackingFault(f"{what}: feedback packet with error_status {p['error_status']}")
+        if p["nonfinite"] or p["out_of_range"]:
+            raise TrackingFault(f"{what}: feedback packet with non-finite {p['nonfinite']}, "
+                                f"out of range {p['out_of_range']}")
+        qa, qt = p["q_actual"], p["q_target"]
+        if len(qa) < 4 or len(qt) < 4 or (ref is not None and len(ref) < 4):
+            raise TrackingFault(f"{what}: fewer than 4 joint values (q_actual {qa}, q_target {qt}, GetAngle {ref})")
+        values = list(qa) + list(qt) + (list(ref[:4]) if ref is not None else [])
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
+            raise TrackingFault(f"{what}: a joint value is not finite (q_actual {qa}, q_target {qt}, GetAngle {ref})")
+        d_t = [a - b for a, b in zip(qa, qt)]
+        d_r = [a - b for a, b in zip(qa, ref[:4])] if ref is not None else None
+        worst_joint, worst = 1, -1.0
+        for diffs in (d_t, d_r) if d_r is not None else (d_t,):
+            for j, d in enumerate(diffs, 1):
+                if abs(d) > worst:
+                    worst_joint, worst = j, abs(d)
+        run = self.run
+        return {"what": what, "utc": _utc(), "phase": run.phase if run else None,
+                "phase_t": round(run.phase_t, 6) if run and getattr(run, "phase_t", None) is not None else None,
+                "received_monotonic": round(t, 6), "age_s": round(age, 4), "mode": p["mode"],
+                "q_actual": list(qa), "q_target": list(qt),
+                "ref_angles": list(ref[:4]) if ref is not None else None,
+                "d_t": [round(d, 6) for d in d_t], "d_r": [round(d, 6) for d in d_r] if d_r is not None else None,
+                "worst_joint": worst_joint, "worst_deg": round(worst, 6), "mismatch": worst > TRACK_TOL_DEG}
+
+    def _track_max(self, rec: dict):
+        maxima = self.run.report.setdefault("tracking_max", {})
+        for j, d in enumerate(rec["d_t"], 1):
+            key = f"J{j}"
+            if key not in maxima or abs(d) > maxima[key]["deg"]:
+                maxima[key] = {"deg": round(abs(d), 6), "what": rec["what"], "utc": rec["utc"]}
+
+    def _track_record(self, rec: dict, t_b: float):
+        rec["t_b"] = round(t_b, 6)
+        rec["outcome"] = "mismatch" if rec["mismatch"] else "ok"
+        self.run.report.setdefault("tracking", []).append(rec)
+        self._track_max(rec)
+
+    def _track_wait(self, t_b: float, ref: Optional[List[float]], what: str,
+                    deadline: Optional[float] = None, on_deadline=None) -> dict:
+        """Wait (sending nothing) for a resting copy: RobotMode 5 and received strictly after
+        ``t_b`` (receive-time order only), at most TRACK_WAIT_S and never past ``deadline``
+        (then ``on_deadline()`` is raised). Every poll takes a stop first (``ints.poll()``,
+        ``run.check()``); every copy is judged, eligible or not (an invalid one raises). Returns
+        the eligible copy's record; the caller decides what a mismatch means"""
+        run = self.run
+        end = time.monotonic() + TRACK_WAIT_S
+        last_mode = None
+        outcome = "stopped"                              # every exit without a copy is recorded
+        try:
+            while True:
+                outcome = "stopped"                      # a stop or a fault taken by run.check()
+                self.ints.poll()
+                run.check()
+                if deadline is not None and time.monotonic() > deadline:
+                    outcome = "deadline"
+                    raise on_deadline()
+                snap = self._track_copy()
+                outcome = "invalid"
+                rec = self._track_judge(snap, ref, what)
+                last_mode = rec["mode"]
+                # both limits before a copy is accepted: evidence first seen after them never counts
+                now = time.monotonic()
+                if deadline is not None and now > deadline:
+                    outcome = "deadline"
+                    raise on_deadline()
+                if now > end:
+                    outcome = "timeout"
+                    raise TrackingFault(f"{what}: no resting feedback packet (RobotMode 5, received after "
+                                        f"the check began) within {TRACK_WAIT_S:g} s; last RobotMode {last_mode}")
+                if rec["mode"] == 5 and snap["t"] > t_b:  # strictly later: the clock ticks ~16 ms on Windows
+                    break
+                outcome = "stopped"
+                time.sleep(TRACK_POLL_S)
+        except BaseException as e:
+            self._track_failed(what, t_b, outcome, e)
+            raise
+        self._track_record(rec, t_b)
+        return rec
+
+    def _track_failed(self, what: str, t_b: Optional[float], outcome: str, e: BaseException):
+        """A check that ended without an accepted copy (invalid copy, no resting packet in time,
+        the caller's deadline, a stop or fault taken during the wait) is recorded too, so the
+        record names every failing check. Never raises: the original exception goes on"""
+        run = self.run
+        if run is None:
+            return
+        try:
+            run.report.setdefault("tracking", []).append(
+                {"what": what, "utc": _utc(), "phase": run.phase,
+                 "phase_t": round(run.phase_t, 6) if getattr(run, "phase_t", None) is not None else None,
+                 "t_b": round(t_b, 6) if t_b is not None else None,
+                 "outcome": outcome, "error": f"{type(e).__name__}: {e}"})
+        except Exception:  # noqa: BLE001 - recording must not replace the fault being raised
+            pass
+
+    def _track_fault_on_mismatch(self, rec: dict):
+        if rec["mismatch"]:
+            raise TrackingFault(_describe_tracking(rec))
+
+    def _idle_track(self):
+        """The watch between requests (from ``_tick``): armed, enabled, not disabled again,
+        phase "enabled". No wait; an invalid copy (stale included) or a mismatch raises; a fresh
+        copy that is not resting (not mode 5, or within the phase grace) is not judged further"""
+        run = self.run
+        if (run is None or self.fb is None or not run.armed or not run.enable_completed
+                or run.disabled_confirmed or run.phase != "enabled"):
+            return
+        hook = self.hooks.get("idle_track")
+        if hook is not None:
+            hook(self)
+        snap = self._track_copy()
+        t_b = run.phase_t + PHASE_GRACE_S
+        try:
+            rec = self._track_judge(snap, None, "idle")
+        except TrackingFault as e:
+            self._track_failed("idle", t_b, "invalid", e)
+            raise
+        if rec["mode"] != 5 or snap["t"] <= t_b:
+            return
+        last = getattr(self, "_idle_recorded_t", None)
+        now = time.monotonic()
+        if rec["mismatch"] or last is None or now - last >= TRACK_IDLE_RECORD_S:
+            self._idle_recorded_t = now
+            self._track_record(rec, t_b)
+        else:
+            self._track_max(rec)                         # maxima from every evaluated sample
+        self._track_fault_on_mismatch(rec)
 
     def _disable(self) -> dict:
         """The jog tool's steps 8 and 9: DisableRobot, RobotMode 4 within DISABLE_DEADLINE_S,
