@@ -33,7 +33,7 @@ configuration and flow files, not in the driver code.
 | `src/devices/keithley2002/` | Keithley 2002 digital multimeter over GPIB (PyVISA, optional, `measure_dmm`). Its self-check `python -m src.devices.keithley2002.keithley2002 <resource>` talks to the instrument: the human's step. |
 | `src/devices/li5640/` | NF LI5640 lock-in amplifier over GPIB (PyVISA, optional, read-only, `measure_lockin`). Its front-panel settings are never changed; the only setting written is the read-out selection `OTYP`, restored on close. Exception, off by default: `set_lockin_oscillator` writes the internal oscillator (OSC OUT) only when `lockin_osc_max_vrms` in `config.yaml` is above 0; it never switches the amplitude range and restores the starting values on close (a restore that fails or cannot be checked marks the run failed). Never raise those limits on your own: they protect what is wired to OSC OUT (rule 2 applies to them as to workspace limits). Its self-check `python -m src.devices.li5640.li5640 <resource>` talks to the instrument: the human's step. |
 | `src/devices/dso1000/` | Agilent 1000 series oscilloscope (DSO1014A etc.) over USB (PyVISA, optional, read-only, `measure_scope`). Sends queries only (plus a device clear on open and close, and `*CLS` on open); the set-up stays on the front panel. Its self-check `python -m src.devices.dso1000.dso1000 <resource>` talks to the instrument: the human's step. |
-| `src/devices/mg400/` | Dobot MG400 over TCP/IP, two human-run tools (not a robot type; no flow can use it). `python -m src.devices.mg400.observe <address>` is **read-only**: six commands (RobotMode, GetErrorID, GetPose, GetAngle, PositiveSolution, InverseSolution; built, never free text), the feedback port read, the motion port never opened. `python -m src.devices.mg400.jog <IP> --controller-version V` **moves the arm**: after the human's Enter on a terminal it sends ResetRobot, EnableRobot, two `JointMovJ` (J1 / J4 only, 1..10 deg, SpeedJ = AccJ at most 30 % of the controller's own setting) and DisableRobot; its stop sequence sends ResetRobot, DisableRobot and then EmergencyStop unless the arm showed itself disabled (or in alarm with its joints still) and the Enable's outcome is known; once the arm has reported disabled again after its DisableRobot, a later fault or Ctrl+C adds no stop sequence (only the final read-only queries follow). Both tools are the arm, so the real run is the human's (only `--mock` and `--dry-run` are the agent's). Do not add other commands that enable, move or stop the arm, widen the jog limits, or arm a connection in `observe.py`, without a reviewed plan. |
+| `src/devices/mg400/` | Dobot MG400 over TCP/IP: robot type `mg400` (optional robot 5; `move_xyz`, `move_z`, `go_home`, `wait` only, every move one `MovL` checked against the robot's own box, the segment's radius and the controller's `InverseSolution` within `joint_limits`; wrapped by `MG400Robot` / `MockMG400Robot` in `src/devices/safety/mg400_robot.py`, which runs on `control.Controller`, the one-thread worker of `control.py`; a real run asks the human for Enter before any device is opened, and the GUI's runner refuses a real MG400 run without the ids its confirmation dialog approved) and two human-run tools. `python -m src.devices.mg400.observe <address>` is **read-only**: six commands (RobotMode, GetErrorID, GetPose, GetAngle, PositiveSolution, InverseSolution; built, never free text), the feedback port read, the motion port never opened. `python -m src.devices.mg400.jog <IP> --controller-version V` **moves the arm**: after the human's Enter on a terminal it sends ResetRobot, EnableRobot, two `JointMovJ` (J1 / J4 only, 1..10 deg, SpeedJ = AccJ at most 30 % of the controller's own setting) and DisableRobot; its stop sequence sends ResetRobot, DisableRobot and then EmergencyStop unless the arm showed itself disabled (or in alarm with its joints still) and the Enable's outcome is known; once the arm has reported disabled again after its DisableRobot, a later fault or Ctrl+C adds no stop sequence (only the final read-only queries follow). Both tools and every flow on the arm are the arm, so the real run is the human's (only `--mock`, `--dry-run` and `--validate-only` are the agent's). Do not add other commands that enable, move or stop the arm, widen the jog limits, raise `speed_ratio` above 10 or `max_move_mm` above 50, or arm a connection in `observe.py`, without a reviewed plan. |
 | `src/devices/maxarm/` | Hiwonder MaxArm (optional robot 4, `type: maxarm`): serial client, protocol and the MicroPython firmware with its human-run installer `deploy_firmware.py`. Wrapped by `MaxArmRobot` / `MockMaxArmRobot` in `src/devices/safety/`. |
 | `src/agent/` | LLM-based generation of flows from natural language, plus preset flows. |
 | `src/gui/` | Streamlit GUI. `src/voice/` voice input. |
@@ -43,10 +43,11 @@ configuration and flow files, not in the driver code.
 | `examples/zif8/` | Example flows of the paper's ZIF-8 demonstration. |
 | `examples/microscope/` | Example flow using the USB digital microscope (`capture_microscope`). |
 | `examples/maxarm/` | Suction pick-and-place flow for the MaxArm (robot 4). |
+| `examples/mg400/` | `z_hop.json` for the MG400 (robot 5) and `config.mg400.yaml`, a complete `config.yaml` with the MG400 entry (no address; its numbers are not measurements). The CI runs the flow against it. |
 | `examples/keithley2002/` | DMM-only flow for the Keithley 2002 (`measure_dmm`). |
 | `examples/li5640/` | Lock-in-only flow for the NF LI5640 (`measure_lockin`); `oscillator/` holds an oscillator sweep read on the oscilloscope (`set_lockin_oscillator`, refused unless `config.yaml` enables it). |
 | `examples/dso1000/` | Oscilloscope-only flow for the Agilent 1000 series (`measure_scope`). |
-| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument, MaxArm commissioning notes (`maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery), Keithley 2002 commissioning notes (`keithley2002-commissioning.md`: order of work, what the firmware accepted, open observations, interruption rules), NF LI5640 commissioning notes (`li5640-commissioning.md`: read-only scope, what the firmware answered, defects found by review, open points, the internal-oscillator bench test), Agilent DSO1014A commissioning notes (`dso1000-commissioning.md`: reply forms, GTL hang over USB, defects found by review, open points), Dobot MG400 notes (`mg400-commissioning.md`: replies seen, the refused GetPose form, the record under OneDrive, the dropped first Dashboard connection, the order of work for the jog tool, open points, what Ctrl+C does in each tool). |
+| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument, MaxArm commissioning notes (`maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery), Keithley 2002 commissioning notes (`keithley2002-commissioning.md`: order of work, what the firmware accepted, open observations, interruption rules), NF LI5640 commissioning notes (`li5640-commissioning.md`: read-only scope, what the firmware answered, defects found by review, open points, the internal-oscillator bench test), Agilent DSO1014A commissioning notes (`dso1000-commissioning.md`: reply forms, GTL hang over USB, defects found by review, open points), Dobot MG400 notes (`mg400-commissioning.md`: replies seen, the refused GetPose form, the record under OneDrive, the dropped first Dashboard connection, the order of work for the jog tool and the flow bench stages C1 to D, open points, what Ctrl+C does in each tool and in a flow). |
 | `tests/`, `src/monitoring/tests/`, `src/imaging/tests/` | Unit tests; none need hardware. |
 
 ## How to verify a change (no hardware needed)
@@ -92,8 +93,16 @@ never a silent fallback to the built-in defaults. The CI workflow in
    known) that takes up to 15 s, unless the arm has already reported disabled
    again after its DisableRobot, in which case no stop sequence is added; the
    record is then written (normally a few seconds; one more Ctrl+C is deferred
-   to its end, a second one ends it at once); the
-   MG400's emergency stop is the button on its controller, which the human
+   to its end, a second one ends it at once). In a flow on an MG400 robot
+   (`type: mg400`), Ctrl+C and the GUI Stop reach the control worker as the
+   same latch (taken at its next send, within about 0.1 s when idle) and start
+   the same orderly stop; the session never sends an MG400 home after an error,
+   and a stop that ends in EmergencyStop or unconfirmed marks the run failed. In
+   the terminal the first Ctrl+C reaches the worker through a separate thread
+   (also while the run is busy in another step), and every later Ctrl+C is
+   deferred until the run has finished its stop, disconnect and record (the
+   MG400's own disconnect wait is bounded by about 25 s; a step stuck in another
+   device is not, and then the human ends the process, `docs/setup.md` §13). The MG400's emergency stop is the button on its controller, which the human
    must have within reach.
 2. **Do not weaken the safety layer.** Do not edit `src/devices/safety/`, the
    workspace validators, or the `workspace` limits in `config.yaml` in order to
@@ -148,6 +157,19 @@ never a silent fallback to the built-in defaults. The CI workflow in
   highest reachable z at that (x, y). Do not loosen that check; lower the
   target. Set `home_position` to a reachable pose. Firmware backup and
   installation (`docs/setup.md` §9) are the human's job.
+- *"Use the MG400"*: copy `examples/mg400/config.mg400.yaml` to `config.yaml`
+  (robot 5, `type: mg400`): every key of the entry is required, nothing is
+  inherited, and its numbers are not measurements. Ask the user for the
+  address (chat only, never a tracked file) and for the rest pose and clear
+  volume measured in DobotStudio Pro; tighten `workspace` and set
+  `home_position` to the rest pose. Start from `examples/mg400/z_hop.json`;
+  `--validate-only`, then `--mock`, and stop there: the real run asks the
+  human for Enter on the terminal (`docs/setup.md` §13), and the bench stages
+  C1 to D (`docs/mg400-commissioning.md` §2) run only when the human asks.
+  The MG400 accepts only `move_xyz`, `move_z`, `go_home` and `wait`; a move
+  refused by its six validation steps is reported with the step and the
+  value, never worked around (rule 2: `joint_limits` only tighten,
+  `speed_ratio` stays at most 10, `max_move_mm` at most 50).
 - *"Add a new instrument"*: follow `docs/adding-an-instrument.md` step by
   step: a driver package under `src/devices/`, a mock counterpart, registration
   with `SharedDevices` / `MockSharedDevices`, the flow schema and executor, the

@@ -1,11 +1,13 @@
-# Dobot MG400 (TCP/IP): observation tool and jog tool
+# Dobot MG400 (TCP/IP): observation tool, jog tool and the control core of robot type `mg400`
 
-The MG400 is **not** a SAIGEN robot type: no flow, GUI block or `config.yaml` entry can
-use it. This package holds two human-run tools. `observe.py` observes the arm without
-changing its state. `jog.py` (section "Jog tool" below) enables the arm, rotates J1 and /
-or J4 by a small angle and back, and disables it; it is the first tool here that changes
-the arm's state, built to a reviewed plan, and its real run is the human's. The sections
-up to "Records" describe the observation tool.
+This package holds two human-run tools and the control core a flow uses. `observe.py`
+observes the arm without changing its state. `jog.py` (section "Jog tool" below) enables
+the arm, rotates J1 and / or J4 by a small angle and back, and disables it; it was the
+first tool here that changes the arm's state, built to a reviewed plan, and its real run
+is the human's. `control.py` holds what both the jog tool and the flow robot type run on
+(connections, the interrupt model, the stop sequence, the recorder) and the `Controller`
+worker of the flow wrapper (section "Robot type `mg400`" at the end). The sections up to
+"Records" describe the observation tool.
 
 What the first bench runs showed, and what is still open, is in
 [`docs/mg400-commissioning.md`](../../../docs/mg400-commissioning.md).
@@ -243,3 +245,56 @@ mode TCP/IP (set in DobotStudio Pro; otherwise the first `RobotMode()` is answer
 other PC or program sending to the arm; nothing on the flange; the arc clear for the whole
 arm and its cables; the speed settings noted; the controller version typed; the e-stop
 button within reach. The agent never runs it (CLAUDE.md rule 1).
+
+## Robot type `mg400` (flows)
+
+Since the flow plan's stage two, a `config.yaml` entry with `type: mg400` makes the arm a
+SAIGEN robot: a flow may use `move_xyz`, `move_z`, `go_home` and `wait` on it, through the
+wrapper `src/devices/safety/mg400_robot.py` (`MG400Robot`; `MockMG400Robot` is the same
+class connected to `fake.py` in this process). The user-facing description, the
+configuration keys and the bench order are in `docs/setup.md` §13; the flow format in
+`docs/experimental-flow.md`. What this package contributes:
+
+- `control.Controller`: one non-daemon worker thread owns the command connections (Dashboard,
+  motion) and is the only code that writes to them or reads their replies; the feedback port
+  has its own reader thread, as in the jog tool, and the worker only reads what that thread
+  parsed. Other threads
+  submit requests (open, pose, inverse, take_control, enable, move_l, disable, close) and get
+  futures; one stop latch (`request_stop`, idempotent, never cleared) is checked before
+  every send, when a reply returns and on every wake-up of the bounded queue wait (0.1 s),
+  so an idle worker starts the stop within about 0.1 s. Once the latch is seen, the worker
+  runs the jog tool's stop sequence itself when control was taken and the arm has not
+  reported disabled again, with the sequence's own 15 s deadline counted in the worker; a
+  feedback fault or any other exception after control was taken is an autonomous stop. The
+  normal end (`shutdown`) is itself one request behind every earlier one: the worker decides
+  there, from its own state, whether a DisableRobot is due (a failure of it is a fault), takes
+  a latch set meanwhile, and only then closes. The arrival of a `MovL` is a pose within
+  0.5 mm / 0.2 deg of the target followed by a RobotMode 5 read after that pose (an idle
+  reading taken before the pose proves nothing). The record (`report.json`, `feedback.*`) is
+  the jog tool's recorder; the run's report is under the key `control` with `poses` and
+  `moves`.
+- `MG400Robot.cleanup` (in `src/devices/safety/mg400_robot.py`) starts `shutdown` in its own
+  non-daemon thread and waits for it and for the worker's end, at most 24 s (the stop
+  sequence's 15 s, one reply timeout, 1 s, and 5 s of margin). A cancel of that wait (the
+  GUI Stop) becomes a stop and the wait goes on; any other interruption sets the latch and
+  ends it. `cleanup_incomplete` and a `failed_reason` are in the report from the start of
+  the cleanup until its end is confirmed, so an interrupted or overrun end keeps them (and
+  the controller, which a stop still reaches). A device record that could not be written
+  gives `record_saved: false` and a `failed_reason`. In a run that uses an MG400,
+  `run_flow`'s SIGINT handler only queues a constant for a relay thread, which counts, sets
+  every MG400's latch through `latch_stop()` (no logging, no I/O), asks the loop to cancel the
+  run, and only then sends the ordinary stops (which log); later Ctrl+C are deferred. The
+  disconnect wait is bounded, a step stuck in another device is not: `docs/setup.md` §13
+  says how to end the process then.
+- `protocol.mov_l`: `MovL(X,Y,Z,R,User=0,Tool=0,SpeedL=s,AccL=s)` with `s` 1..30 on the
+  motion port, exact form checked before it is written; the robot type sends it at 1..10.
+  Its echo rule accepts the controller's echo without the optional parameters.
+- `fake.ik` / `FakeMG400(ik_model=True)`: the fake answers `InverseSolution` from a planar
+  two-link model of its own `fk` (a stand-in with the arm's link lengths, not the
+  controller's kinematics) and moves linearly on `MovL`, so the validation steps and the
+  arrival wait run end to end in `--mock` and the tests.
+
+The real run of a flow is the human's, exactly as the jog tool's: the runner asks for Enter
+on a terminal (the GUI for its confirmation) before any device is opened; the agent runs
+`--validate-only` and `--mock` and stops there. The MG400's emergency stop is the button on
+its controller.

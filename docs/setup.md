@@ -69,7 +69,7 @@ Edit `config.yaml`:
 
 | Section | Purpose |
 |---|---|
-| `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); a robot without `type` is a Dobot |
+| `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); robot 5 is an optional Dobot MG400 (`type: mg400`, `mg400_address`, its own `workspace`, `home_position`, `joint_limits`, `speed_ratio`, `max_move_mm`, see §13); a robot without `type` is a Dobot |
 | `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10); `lockin_resource` and `lockin_timeout_ms` of the optional NF LI5640 lock-in amplifier (§11); `scope_resource` and `scope_timeout_ms` of the optional Agilent 1000 series oscilloscope (§12) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
@@ -84,7 +84,7 @@ Edit `.env`:
 | `LLM_MODE` | `gemini` (default) or `openai_compatible` |
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
-| `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT` | optional per-run override of the `config.yaml` robot ports |
+| `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT`, `ROBOT5_MG400_ADDRESS` | optional per-run override of the `config.yaml` robot ports / addresses |
 | `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE`, `LOCKIN_RESOURCE`, `SCOPE_RESOURCE` | optional per-run override of the shared devices |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
@@ -642,6 +642,152 @@ both forms are accepted); accuracy against a known reference was not checked.
 What commissioning the first unit taught (what firmware 00.04.04 answered, the
 defects found on the bench and by review, open points, things not to do) is in
 [`dso1000-commissioning.md`](dso1000-commissioning.md).
+
+## 13. Dobot MG400 robot (optional)
+
+Robot 5 can be a Dobot MG400 reached over TCP/IP (`type: mg400`). A flow may
+use `move_xyz`, `move_z`, `go_home` and `wait` on it; there is no pipette and
+no suction, and the preflight rejects every other action. Every move is one
+straight-line `MovL` in the controller's base frame (User 0 / Tool 0: the
+flange position in mm as the controller's `PositiveSolution` reports it), and
+the wrapper `src/devices/safety/mg400_robot.py` is the only code that sends
+control commands to the arm from a flow. The two human-run tools of
+`src/devices/mg400/` (observation and jog) are unchanged; what the bench
+taught before the first flow is in
+[`mg400-commissioning.md`](mg400-commissioning.md).
+
+**Configuration.** A complete file is
+[`examples/mg400/config.mg400.yaml`](../examples/mg400/config.mg400.yaml);
+copy it to `config.yaml` or merge its `robots.5` entry into yours:
+
+```yaml
+robots:
+  5:
+    type: mg400
+    mg400_address: ""           # the arm's IP address, a numeric literal (no host name);
+                                # or --robot5-mg400 <address> / ROBOT5_MG400_ADDRESS
+    workspace:                  # the box every start pose, target and MovL segment must stay in
+      x_min: 350.0
+      x_max: 450.0
+      y_min: -50.0
+      y_max: 50.0
+      z_min: 170.0
+      z_max: 270.0
+      r_min: 350.0              # horizontal radius hypot(x, y) of the whole segment (optional)
+      r_max: 450.0
+    home_position: [400.0, 0.0, 220.0]   # the go_home target: set it to the arm's measured rest pose
+    joint_limits: [[-160.0, 160.0], [-25.0, 85.0], [-25.0, 105.0], [-180.0, 180.0]]
+    speed_ratio: 10             # SpeedL = AccL of every MovL, 1..10 (% of the controller's playback setting)
+    max_move_mm: 50.0           # longest single move, 1..50
+```
+
+Every key is required and nothing is inherited: an MG400 has no built-in
+defaults, and a `type: mg400` written at robot 4's id does not take the MaxArm's
+box or options either. A missing key, a key without a value, a workspace
+missing `x_min` ... `z_max`, or a value outside its range (`speed_ratio` not
+1..10, `max_move_mm` not 1..50, a `joint_limits` pair outside the published
+envelope, a `home_position` that is not `[x, y, z]`) refuses `--validate-only`,
+`--mock` and real runs with a configuration error naming the robot, before any
+device is opened. The
+numbers in the example are **not** measurements: the box is a small volume
+around the fake controller's start pose. Measure your arm's rest pose and the
+clear volume around it in DobotStudio Pro and tighten every value before the
+first real run. `joint_limits` can only tighten the ranges Dobot publishes for
+the MG400 (J1 ±160°, J2 -25..85°, J3 -25..105°, J4 ±180°); `speed_ratio`
+multiplies the controller's own playback speed and global ratio, which SAIGEN
+does not read; `max_move_mm` bounds one move. An agent never widens any of them
+(CLAUDE.md rule 2).
+
+**What a move is checked against.** The start pose is always measured
+(`PositiveSolution` of `GetAngle()`), never assumed. Before a `MovL` is written,
+in this order: the start pose is inside the box; the target is inside the box;
+the move is at least 1 mm and at most `max_move_mm`; the whole segment's
+horizontal radius stays within `r_min` .. `r_max` (computed analytically, not
+sampled); and the controller's `InverseSolution` of the target and of a sample
+every 5 mm along the segment lies within `joint_limits`, with every joint's change
+between consecutive samples below 5°. A refusal names the step and the value, and
+nothing is sent. `go_home` moves to `home_position` (sends nothing when the
+flange is already within 1 mm of it) and the session never sends an MG400 home
+by itself after an error: the stop sequence tries to disable the arm where it
+stands, and the device report says whether the arm confirmed that. The arrival is
+the controller's word (RobotMode back to 5, and the measured pose within 0.5 mm
+and 0.2° of the target) within a deadline derived from the distance.
+
+**Running.** `--validate-only` checks the absolute targets and `home_position`
+against the box; `--mock` runs the same wrapper against a fake controller in
+this process (no address needed, every validation step and the stop path run
+for real):
+
+```bash
+python -m src.flow.run_flow examples/mg400/z_hop.json --validate-only
+python -m src.flow.run_flow examples/mg400/z_hop.json --mock
+```
+
+A real run (`python -m src.flow.run_flow examples/mg400/z_hop.json`, the
+address in `config.yaml` or `--robot5-mg400 <address>`) prints what will happen
+(robot, address, box, speed ratio, home, the first MG400 step, what a stop
+means) and waits for Enter on a terminal **before** any device is opened or a
+log folder is created; anything but an empty line on a terminal ends the run
+with exit code 2. In the GUI the confirmation dialog of a real run is that step:
+it shows the same facts, and only its "start" button hands the approved MG400
+ids to the runner, which refuses a real MG400 run without them.
+Before pressing Enter: DobotStudio Pro closed, the controller's remote-control
+mode set to TCP/IP (otherwise the first `RobotMode()` is answered ErrorID -1 and
+the run ends before any control command), the arm disabled with no alarm,
+nothing on the flange, the volume of the box clear, the emergency-stop button
+within reach. After the Enter: ResetRobot, EnableRobot, the flow's moves, then
+DisableRobot confirmed by RobotMode 4 at the end. Pressing Enter is the human's
+step; an agent runs `--validate-only` and `--mock` and stops there
+(CLAUDE.md rule 1).
+
+**Stopping.** Ctrl+C and the GUI Stop are **not** an emergency stop. The control
+worker takes the stop at its next send, or within about 0.1 s when it is idle,
+and starts the orderly stop sequence of the jog tool: ResetRobot, DisableRobot,
+confirmation polls, then EmergencyStop unless the arm showed itself disabled
+(or in alarm with its joints still) and the Enable's outcome is known, bounded
+by 15 s; once the arm has reported disabled again after its DisableRobot, no
+stop sequence is added. A fault seen by the worker itself (the feedback stream
+stopping, a non-zero ErrorID, an unexpected RobotMode) starts the same sequence
+on its own. A stop that ends in EmergencyStop or without confirmation marks the
+run failed even when every step had finished (`RobotStopError`, exit code 1),
+with the controller's guidance in the log. The emergency stop is the button on
+the controller, which the human must have within reach. A stop before the
+connection (Stop pressed while another robot was still initializing) is kept as
+a latch: the MG400 is not connected at all; a stop while the MG400 is between
+its initialization and its registration still reaches it, and the robot is then
+not registered. In the terminal, for a run that uses an MG400 (`--mock`
+included), the first Ctrl+C is handed to a separate thread that sets the
+latch, also while the run is busy in another step (a camera capture, say),
+before anything is logged, and then cancels the run; every later Ctrl+C is
+deferred, with a message, until the run has finished its stop sequence,
+disconnect and record. The MG400's own disconnect wait is bounded (about 25 s);
+a step stuck in another device is not, and the runner then stays where it is.
+If that happens: check in DobotStudio Pro (or at the arm) that the MG400 shows
+itself disabled, press the emergency-stop button if it does not, and only then
+end the Python process (close the terminal, or end it in Task Manager). The run's
+`metadata.json` and the MG400's `report.json` may then be incomplete. A GUI Stop (or any cancel) while the disconnect is being
+waited for becomes a stop and the wait goes on to the end. A disconnect whose
+end could not be confirmed (the worker still running after the bound, or the
+wait interrupted in another way) is written into the report (`failed_reason`,
+`cleanup_incomplete`): a run whose steps had all finished is marked failed, an
+interrupted one stays aborted with that note. Check the arm in DobotStudio Pro
+then. A device record that could not be written
+marks the run failed too, with the arm's own state reported separately.
+
+**Records.** Each run writes `mg400_<robot id>/report.json` and `feedback.*`
+into its log folder (`logs/<date>/<flow>_<time>/`): every command and reply,
+every measured pose, every move with its validation and arrival, and the `stop`
+section when a stop ran. `metadata.json` carries the summary under
+`robot_reports`. The record is saved with the jog tool's retrying writer; a
+folder synced by OneDrive can still refuse the final rename
+(`mg400-commissioning.md` §3.3), so keep `logs/` outside synced folders when
+you can.
+
+**Bench order** (each stage only when the human asks, in the session;
+`mg400-commissioning.md` §2): the jog tool's stop sequence on the arm once (C1),
+`z_hop.json` with the measured `config.yaml` (C2), the same flow with a Ctrl+C
+during a move (C3), then the user's own flows at ratio 10 (D). A payload, a
+tool on the flange, R changes and ratios above 10 are later plans.
 
 ## Troubleshooting
 

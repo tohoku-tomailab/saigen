@@ -26,7 +26,7 @@ and executed by [`src/flow/executor.py`](../src/flow/executor.py). Run
 | `description` | string | no | default `""` |
 | `steps` | array | yes | executed in order; each element is one of the actions below |
 
-Every step has an `action` field. Robot actions take `robot_id` (1–4, default 1);
+Every step has an `action` field. Robot actions take `robot_id` (1–5, default 1);
 shared-device actions (balance, camera) do not. Unknown fields (e.g. a misspelled
 `robotid`), out-of-range values and non-finite numbers (`NaN`, `Infinity`) are
 rejected at validation time.
@@ -36,13 +36,15 @@ rejected at validation time.
 Each robot in `config.yaml` has a `type`. Robots 1–3 are Dobot Magicians
 (`type: dobot`, the default when the entry has no `type`, so existing
 `config.yaml` files keep working). Robot 4 is an optional Hiwonder MaxArm
-(`type: maxarm`) with a suction nozzle and no pipette. The type decides which
+(`type: maxarm`) with a suction nozzle and no pipette. Robot 5 is an optional
+Dobot MG400 (`type: mg400`) over TCP/IP, with neither. The type decides which
 robot actions a robot accepts:
 
 | Type | Accepted robot actions |
 |---|---|
 | `dobot` | `move_xyz`, `move_z`, `move_radial`, `rotate`, `rotate_relative`, `go_home`, `move_slider`, `move_conveyer`, `wait`, `aspirate`, `dispense`, `blow_out` |
 | `maxarm` | `move_xyz`, `move_z`, `go_home`, `suction`, `wait` |
+| `mg400` | `move_xyz`, `move_z`, `go_home`, `wait` |
 
 The preflight rejects an action the robot's type does not accept (for example
 `aspirate` on the MaxArm, or `suction` on a Dobot) before any device is opened,
@@ -51,8 +53,9 @@ executor refuses the same actions at run time as a second line of defence.
 
 A robot can have its own `workspace` block under `robots.<id>` in
 `config.yaml`. For a Dobot it is merged over the global `workspace` for that
-robot only. A MaxArm (`type: maxarm`, at any robot id) **must** have one, and it
-is used on its own, never merged over the global Dobot box (the frames differ):
+robot only. A MaxArm (`type: maxarm`, at any robot id) or an MG400 (`type:
+mg400`) **must** have one, and it is used on its own, never merged over the
+global Dobot box (the frames differ):
 `x_min` … `z_max` are all required, `r_min` / `r_max` (bounds on the horizontal
 radius `hypot(x, y)`) are optional. A missing or incomplete MaxArm block, or any
 workspace key left without a value (null), stops `--validate-only`, `--mock` and
@@ -62,7 +65,11 @@ kinematics on the PC (`src/devices/maxarm/kinematics.py`): a `move_xyz` target
 inside the box can still be unreachable (the wrist joint would leave 0..240°,
 which happens near the top of the workspace), and such a step is rejected at
 `--validate-only` with the highest reachable z at that (x, y). See
-`docs/setup.md` §9.
+`docs/setup.md` §9. An MG400 entry must also set `home_position`,
+`joint_limits`, `speed_ratio` and `max_move_mm` (nothing is inherited); its
+`home_position` is checked against its box at `--validate-only`, and each move
+is checked at run time against the box, the segment's radius and the
+controller's inverse kinematics (`docs/setup.md` §13).
 
 ## Actions
 
@@ -105,6 +112,23 @@ where it is and does **not** send it home (it has no verified safe return path);
 the Dobots are still sent home as before. See
 [`examples/maxarm/pick_and_place.json`](../examples/maxarm/pick_and_place.json).
 
+### Dobot MG400 — `robot_id` of an `mg400` robot
+
+An MG400 (`type: mg400`, robot 5 in the examples) accepts `move_xyz`, `move_z`,
+`go_home` and `wait` only. Coordinates are the controller's base frame (mm, the
+flange position as `PositiveSolution` reports it, User 0 / Tool 0); every move
+keeps the R measured when the arm was connected. Every move is one straight `MovL` of at least
+1 mm and at most `max_move_mm` (≤ 50 mm), checked before it is sent against
+the robot's own box, the horizontal radius of the whole segment and the
+controller's `InverseSolution` sampled every 5 mm within `joint_limits`
+(`docs/setup.md` §13 lists the six steps). `go_home` goes to the configured
+`home_position` and sends nothing when the arm is already within 1 mm of it.
+After an error the session does not send an MG400 home; the stop sequence tries to
+disable it where it stands, and the device report (`robot_reports`) says whether the
+arm confirmed that. A real run asks the human for Enter on the terminal (or the GUI's
+confirmation dialog) before any device is opened. The example is
+[`examples/mg400/z_hop.json`](../examples/mg400/z_hop.json).
+
 ### Shared devices — no `robot_id`
 
 | `action` | Parameters | Description |
@@ -143,8 +167,9 @@ Applied before any device moves:
    run, no device opened) — every absolute target (`move_xyz`, `rotate`) is
    checked against the robot's workspace (for a Dobot, `robots.<id>.workspace`
    merged over the global `workspace` section of `config.yaml`, or the global
-   section alone when the robot has none; for a MaxArm, its own required
-   `robots.<id>.workspace` alone), and every robot action is checked against the
+   section alone when the robot has none; for a MaxArm or an MG400, its own
+   required `robots.<id>.workspace` alone, and for an MG400 also its
+   `home_position`), and every robot action is checked against the
    robot's type (see *Robot types*). Relative moves (`move_z`,
    `rotate_relative`, `move_radial`) depend on the start pose and are listed as
    "unverified until run"; rule 5 checks them. The same preflight
@@ -180,7 +205,10 @@ Running a flow leaves a record of the run in
 per step, with the weights read, the nominal pipette duration of each aspirate/dispense
 step from the Picus 2 timing table, and the photographs taken), `summary.md`,
 `metadata.json`, `images/` and a copy of the flow JSON. `metadata.json` also
-records the type of every robot used (`robot_types`, e.g. `{"4": "maxarm"}`).
+records the type of every robot used (`robot_types`, e.g. `{"4": "maxarm"}`)
+and, for an MG400, its device report after the disconnect (`robot_reports`:
+record folder, whether the run completed and the arm reported disabled, the
+`stop` section when a stop sequence ran).
 The execution mode
 (`mock` / `real`) is recorded in `metadata.json` (`mode`), in a `mode` column of
 `measurements.csv` and in `summary.md`. Runs started within the same second get

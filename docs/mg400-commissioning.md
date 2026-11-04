@@ -3,8 +3,9 @@
 Field notes from the first observation runs of a Dobot MG400 in the SAIGEN lab
 (October 2026). They complement the reference material in
 [`src/devices/mg400/README.md`](../src/devices/mg400/README.md) (what the tool
-sends, when it stops, what it records). The MG400 is **not** a SAIGEN robot
-type: nothing here lets a flow move it.
+sends, when it stops, what it records). Since the flow plan's stage two the
+MG400 is a SAIGEN robot type (`type: mg400`, `docs/setup.md` §13); no flow has
+yet run on the arm, and §2 gives the order in which that is to happen.
 
 Configuration checked: one MG400, read from a Windows 11 PC on 2026-10-21 and
 2026-10-22 (the address typed on each run is in the operator's notes, not in
@@ -73,6 +74,36 @@ human's request in the session:
    EmergencyStop unless the arm showed itself disabled, or in alarm with its
    joints still, and the Enable's outcome is known); it is not the emergency
    stop, the button is.
+
+The flow robot type (`type: mg400`) comes after the complete jog records, in
+the stages of the flow plan, each only on the human's request in the session
+(none has run on the arm yet):
+
+9. C1: the jog tool's stop sequence on the arm, once: Ctrl+C pressed by the
+   human during the leg out of a J1 +5 deg run. Record the decision, the
+   ResetRobot and DisableRobot reply times, the joints after the stop, the
+   alarm state. Progression: `stop.stop_state == "reset_disable"` and
+   `stop.disabled == true` in the jog record, and no motion seen after the
+   stop; anything else is written up and the plan revisited before C2.
+10. C2: with the real `config.yaml` (robot 5, a box measured in DobotStudio
+   Pro around the rest pose, `home_position` = the rest pose, `speed_ratio`
+   10): `--validate-only`, `--mock`, then the real run of
+   `examples/mg400/z_hop.json` (the human presses Enter at the runner's
+   prompt). The first `MovL`, the first `InverseSolution` sampling on the
+   arm, the first `go_home` (expected "already at home"), arrival timing and
+   tolerance. Progression: `complete`, every arrival within tolerance, no
+   alarm, the operator saw the hop and nothing else.
+11. C3: the same flow with Ctrl+C during the first `move_z`: the stop sequence
+   from a flow through the executor and the session. Record the distance
+   moved after the Ctrl+C and the hold after the disable. Progression to D:
+   `stop_state == "reset_disable"` and `stop.disabled == true` in the
+   wrapper's report (`metadata.json` → `robot_reports`), no motion seen after
+   the stop, a stop distance the human accepts for their cell at ratio 10. C3 is
+   also the first time the runner's Ctrl+C handling (§5: the first through a
+   separate thread, later ones deferred) meets the arm; none of it has been seen outside `--mock` and the tests.
+12. D: the user's own flows inside the measured box at ratio 10. A payload, a
+   tool on the flange, R changes and ratios above 10 are later plans with
+   their own C-stages.
 
 ## 3. What the bench showed
 
@@ -462,6 +493,24 @@ four minutes), and after the disable the final `GetAngle()` read -26.83,
   a folder that holds files. The observation tool still does not.
 
 ## 5. Interrupting a run
+
+In a flow (`type: mg400`), Ctrl+C in the terminal or the GUI's Stop reaches the
+wrapper as an emergency-stop request and sets the control worker's latch; the
+worker takes it at its next send, or within about 0.1 s when it is idle, and
+runs the jog tool's stop sequence below (bounded by 15 s) when control was
+taken and the arm has not reported disabled again. The session never sends an
+MG400 home after an error. A stop that ends in EmergencyStop or unconfirmed
+marks the run failed; the record's `stop` section is carried into
+`metadata.json` → `robot_reports`. A Stop before the connection (another robot
+still initializing) is kept as a latch and the MG400 is not connected. In the
+terminal the first Ctrl+C reaches the latch through a separate thread, also
+while the run is busy in another step, and every later Ctrl+C is deferred
+until the run has finished its stop, disconnect and record (the MG400's
+disconnect wait is bounded by about 25 s; a step stuck in another device is
+not: `docs/setup.md` §13 says how to end the process then).
+A disconnect whose end could not be confirmed is written into the report
+(`cleanup_incomplete`, `failed_reason`). A GUI Stop during the disconnect becomes a stop and the wait goes on.
+None of this is an emergency stop: that is the button on the controller.
 
 Ctrl+C ends the observation only: the tool sends nothing to the arm and it is
 not an emergency stop. Use the arm's own emergency stop for that. A run that

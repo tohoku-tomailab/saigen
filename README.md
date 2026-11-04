@@ -42,10 +42,11 @@ https://youtu.be/5X2-4LuQfns
 | `src/imaging/` | Appearance-imaging system: NEEWER RGB62 light + Logitech C920n camera control, white/red/green/blue capture sequence, cropped-image comparison and depth-direction transmitted-light profiles (paper Figure 6) |
 | `detection/` | Object detection based on YOLOv8 — **kept separate for licensing reasons, see below** |
 | `cad/` | CAD design bank of 3D-printable experimental components (STL + editable Fusion 360 sources) |
-| `docs/` | Bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument, MaxArm commissioning notes |
+| `docs/` | Bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument, MaxArm and MG400 commissioning notes |
 | `examples/zif8/` | Sample experimental flows of the ZIF-8 demonstration (JSON equivalents of the spreadsheet sequence) and monitoring CSV templates |
 | `examples/microscope/` | Example flow that photographs the product with the USB digital microscope (`capture_microscope`) |
 | `examples/maxarm/` | Example suction pick-and-place flow for the optional Hiwonder MaxArm (robot 4) |
+| `examples/mg400/` | Example flow and complete `config.yaml` for the optional Dobot MG400 (robot 5, TCP/IP) |
 | `examples/dispensing_stability/` | Measured data of the 100-shot dispensing-repeatability test and the script that recorded it |
 
 ## Getting started
@@ -74,7 +75,10 @@ https://youtu.be/5X2-4LuQfns
 
    Every move is checked against the `workspace` limits in `config.yaml` before the
    robot is commanded — in `--mock` mode too. Ctrl+C is an emergency stop: the arm
-   halts where it is rather than driving home. Each run leaves
+   halts where it is rather than driving home (an MG400 is the exception: its Ctrl+C
+   starts an orderly stop, a second Ctrl+C waits for it to finish, and its emergency
+   stop is the button on its controller,
+   `docs/setup.md` §13). Each run leaves
    `logs/<date>/<flow>_<time>/` with `run.log`, `measurements.csv`, `summary.md`,
    `metadata.json` and a copy of the flow; add `--no-record` to skip the sensor-CSV
    and video recording that real runs start by default.
