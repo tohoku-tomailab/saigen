@@ -87,7 +87,10 @@ the stages of the flow plan, each only on the human's request in the session
    stop; anything else is written up and the plan revisited before C2. At
    the defaults a 5 deg leg lasts about 0.9 s (§3.13): a slower, larger leg
    (for example `--j1 10 --speed 3`, its duration not yet measured) leaves
-   time for the press.
+   time for the press. Second attempt (§3.14, `--j1 10 --speed 3`, leg about
+   2 s): the stop ran during the leg back, `reset_disable` with `disabled:
+   true`. The operator saw slight sinking at the stop, and whether it counts as
+   "motion after the stop" is the human's decision.
 10. C2: with the real `config.yaml` (robot 5, a box measured in DobotStudio
    Pro around the rest pose, `home_position` = the rest pose, `speed_ratio`
    10): `--validate-only`, `--mock`, then the real run of
@@ -485,12 +488,70 @@ about 2 mm lower than the reading said. The same start (J2 -19.78) in
 J2; `jog_03` 0.03 deg. What made the difference this time (a load or a cable
 on the arm, the J2 brake, the controller) is not known.
 
+### 3.14 Stage C1, second attempt (2026-11-04): a stop during motion
+
+The same code as §3.13, `--j1 10 --speed 3`, the controller at playback speed
+50 %, acceleration 50 %, global ratio 50 % (typed in `--note`), record in the
+`jog_08` folder (started 05:57:28 UTC; 1566 feedback packets over 12.8 s, none
+rejected). A first invocation with `--out` naming the existing `jog_07`
+folder was refused before anything was sent ("already holds files").
+
+**The legs.** The start was J2 -21.84 deg, where §3.13's stop had left it. The
+Enable's reply took 1.23 s. At speed 3 the 10 deg leg out arrived after 1.97 s
+(from the JointMovJ reply); the dwell followed, then the leg back started.
+
+**The Ctrl+C came during the leg back**, 0.87 s after its JointMovJ was sent,
+with J1 at about 6.3 deg in the feedback and moving toward its start. The
+operator meant to press it during the leg out. Feedback receive times
+(PC monotonic clock):
+
+| time after the trigger | event |
+|---|---|
+| 0 s | Ctrl+C taken at the tool's check (`ctrl_c.count` 1); ResetRobot sent on the first Dashboard connection |
+| 0.12 s | feedback RobotMode 5, J1 `q_actual` 5.552 deg; `q_actual` and `q_target` J1 agree within 0.01 deg from here on (5.536 held) |
+| 0.17 s | ResetRobot answered |
+| 0.17 s | DisableRobot sent on the first Dashboard connection |
+| 0.73 s | feedback RobotMode 4 |
+| 1.0 s | in the joint readings, J1 +0.04 deg (5.535 to 5.584, settling at 5.575), J2 -0.005, J3 +0.009 deg; `tool_vector_actual` z 47.873 to 47.843 mm (-0.03 mm). The arm was already disabled. |
+| 1.17 s | no reply within 1 s to the DisableRobot; a stop connection was opened |
+| 1.16 to 1.23 s | DisableRobot answered on the stop connection in 0.07 s; RobotMode 4 read and held for 1.0 s |
+
+The tool's result: `stop_state: reset_disable`, `disabled: true`, no deadline
+hit, 2.28 s in all. J1 moved about 0.8 deg after the trigger (6.3 to 5.54,
+roughly 3 mm at the flange at the 208 mm radius), all of it within 0.12 s.
+
+The operator reported that the arm "sank slightly" when it stopped. The
+feedback shows the 0.03 mm drop in z about 0.27 s after RobotMode 4, while the
+arm was disabled. It does not show when the operator saw the sinking.
+Nothing larger appears in `q_actual` between the trigger and the end.
+
+**J2 tracking.** At this start J2 did not sink. Enabled at rest, the largest
+|`q_actual` - `q_target`| was 0.0013 deg on J1 to J3 and 0.011 deg on J4.
+While enabling it reached 0.107 deg (J2) and 0.117 deg (J3). While moving,
+J1 lagged by up to 0.32 deg.
+
+**DisableRobot without a reply within 1 s, again.** §3.13 showed this at rest,
+and this run with the arm enabled after a ResetRobot. Here the feedback showed
+the arm disabled 0.56 s after the DisableRobot was sent, so the command took
+effect, but its reply did not arrive within the stop sequence's 1 s. The
+EnableRobot reply in the same run took 1.23 s.
+
 ## 4. Open points
 
 - J2 2 deg below its target while enabled (§3.13), seen once in three
-  enabled jog records at that start. Whether it repeats, and its cause, are
-  open; check the arm (anything hanging on it, the J2 brake) and the
-  controller's log before the next enabled run.
+  enabled jog records at that start (J2 -19.78). It did not repeat in
+  `jog_08` (§3.14), which started at J2 -21.84, where §3.13 had left it.
+  Whether it repeats at -19.78, and its cause, are open; check the arm (anything
+  hanging on it, the J2 brake) and the controller's log.
+- DisableRobot on the first Dashboard connection got no reply within the stop
+  sequence's 1 s twice in two stops (§3.13 at rest, §3.14 after motion). In
+  §3.14 the arm was disabled 0.56 s after the send. The stop connection
+  covered it both times. Whether the controller's reply to DisableRobot (like
+  EnableRobot's 1.23 s) simply takes longer than 1 s is open. A longer timeout
+  in the stop sequence would change the jog tool and needs a reviewed plan.
+- The slight sinking the operator saw at the C1 stop (§3.14): in the feedback
+  only a 0.03 mm drop in z with the arm already disabled. Whether the operator
+  saw that or something the feedback does not show is open.
 - `GetAngle()` reported the target, not the measured joints, while enabled
   (§3.13). The flow robot type measures every pose as
   `PositiveSolution(GetAngle(), 0, 0)` and judges arrival on it, so a joint
