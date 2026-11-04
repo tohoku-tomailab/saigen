@@ -84,7 +84,10 @@ the stages of the flow plan, each only on the human's request in the session
    ResetRobot and DisableRobot reply times, the joints after the stop, the
    alarm state. Progression: `stop.stop_state == "reset_disable"` and
    `stop.disabled == true` in the jog record, and no motion seen after the
-   stop; anything else is written up and the plan revisited before C2.
+   stop; anything else is written up and the plan revisited before C2. At
+   the defaults a 5 deg leg lasts about 0.9 s (§3.13): a slower, larger leg
+   (for example `--j1 10 --speed 3`, its duration not yet measured) leaves
+   time for the press.
 10. C2: with the real `config.yaml` (robot 5, a box measured in DobotStudio
    Pro around the rest pose, `home_position` = the rest pose, `speed_ratio`
    10): `--validate-only`, `--mock`, then the real run of
@@ -448,8 +451,54 @@ four minutes), and after the disable the final `GetAngle()` read -26.83,
 1.11 deg above the start (1.31 in §3.10). Final minus start:
 [+0.003, -0.003, +0.009, +1.112].
 
+### 3.13 Stage C1, first attempt (2026-11-04): the Ctrl+C came after the legs, and J2 sank 2 deg at the Enable
+
+The jog tool of the stage-two code (`f550a42`, with `control.py` run as a
+worker by the flow robot type, the jog tool itself unchanged), `--j1 5` at the
+defaults, record in the `jog_07` folder (started 05:43:24 UTC; 1644
+feedback packets over 13.4 s, none rejected). The operator was to press Ctrl+C
+during the leg out. The operator's own observation of the arm was not
+reported.
+
+**The Ctrl+C missed the motion.** Both legs ran to the end (arrival after 0.94
+and 0.92 s, J1 from -0.33 to +4.67 deg and back); the Ctrl+C was taken 0.41 s
+after the leg back's arrival, before the final DisableRobot (`ctrl_c.phase:
+cleanup`, one press). The stop sequence therefore ran on an arm at rest:
+ResetRobot answered at once on the first Dashboard connection; DisableRobot
+on that connection got no reply within 1 s; the tool opened a stop
+connection, where DisableRobot was answered and RobotMode 4 was read 1.25 s
+after the trigger and held for 1.0 s (`stop_state: reset_disable`,
+`disabled: true`, no deadline hit, 2.28 s in all). After the disable J1's
+reading moved by +0.13 deg over 1.7 s (-0.324 to -0.194). C1's purpose, a
+stop during motion, is not met: at the defaults a 5 deg leg lasts about
+0.9 s, too short for a press timed by eye.
+
+**J2 sank at the Enable and the controller's angle reading did not show it.**
+In the feedback, `q_actual` J2 went from -19.78 to -21.84 deg within about
+60 ms of the Enable (to -22.07 at the lowest), while `q_target` J2 stayed at
+-19.78. The 2.06 deg difference lasted while the arm was enabled (about 5 s),
+without an alarm and through both legs. `GetAngle()` answered -19.78 for J2
+during all that time, the target, and -21.84 only after the ResetRobot of
+the stop, when `q_target` took the actual value. At the tool flange this is
+about 2 mm lower than the reading said. The same start (J2 -19.78) in
+`jog_06` (§3.12) showed at most 0.07 deg between `q_actual` and `q_target` on
+J2; `jog_03` 0.03 deg. What made the difference this time (a load or a cable
+on the arm, the J2 brake, the controller) is not known.
+
 ## 4. Open points
 
+- J2 2 deg below its target while enabled (§3.13), seen once in three
+  enabled jog records at that start. Whether it repeats, and its cause, are
+  open; check the arm (anything hanging on it, the J2 brake) and the
+  controller's log before the next enabled run.
+- `GetAngle()` reported the target, not the measured joints, while enabled
+  (§3.13). The flow robot type measures every pose as
+  `PositiveSolution(GetAngle(), 0, 0)` and judges arrival on it, so a joint
+  that is off its target, as J2 was, is invisible to its validation and its
+  arrival check. Stage C2 does not start before this is settled: a revised
+  plan that also reads `q_actual` from the feedback (and refuses to move, or
+  stops, when it differs from the target by more than a bound) goes through
+  review first.
 - Whether the first-connection ending repeats beyond these three runs (each
   time after a second connection was opened), and whether it happens with
   the arm enabled: a later control stage cannot assume a second monitoring
