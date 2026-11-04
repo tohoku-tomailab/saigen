@@ -53,6 +53,26 @@ def validators_for(ports):
     return {5: es.validator_for_robot(5, WorkspaceValidator(), ports)}
 
 
+def mock_main(args, logs_dir, expected):
+    """run_flow.main for an MG400 mock run; when the exit code is not the expected one, the
+    assertion carries what the MG400 record says (phases, stop, feedback, notes), so a failure on
+    a CI runner leaves evidence (the runner's temporary folder is gone afterwards)"""
+    rc = run_flow.main(args)
+    if rc != expected:
+        found = []
+        for dp, _, fs in os.walk(logs_dir):
+            if "report.json" in fs and os.path.basename(dp).startswith("mg400_"):
+                try:
+                    rep = json.load(open(os.path.join(dp, "report.json"), encoding="utf-8"))
+                except Exception as e:  # noqa: BLE001
+                    found.append(f"{dp}: unreadable report.json: {e!r}")
+                    continue
+                found.append(json.dumps({k: rep.get(k) for k in ("phases", "stop", "stop_reason", "feedback", "notes")},
+                                        ensure_ascii=False, default=str)[:6000])
+        raise AssertionError(f"run_flow.main returned {rc}, expected {expected}; MG400 record: " + " | ".join(found))
+    return rc
+
+
 @pytest.fixture
 def restore_config():
     original = (lab_config.CONFIG_PATH, lab_config.EXAMPLE_CONFIG_PATH)
@@ -304,7 +324,7 @@ def test_an_accepted_confirmation_is_handed_to_the_session_with_the_run_folder(m
 def test_a_mock_run_asks_nothing_and_writes_the_record_under_the_run_folder(monkeypatch, example_config, tmp_path):
     monkeypatch.setattr(control, "confirm_tty", lambda *a, **k: pytest.fail("the mock run asked for Enter"))
     monkeypatch.setattr(run_flow, "LOGS_DIR", str(tmp_path / "logs"))
-    assert run_flow.main([EXAMPLE_FLOW, "--mock"]) == 0
+    mock_main([EXAMPLE_FLOW, "--mock"], str(tmp_path / "logs"), 0)
     runs = [os.path.join(dp, d) for dp, dn, _ in os.walk(tmp_path / "logs") for d in dn if d.startswith("mg400_5")]
     assert len(runs) == 1
     report = json.load(open(os.path.join(runs[0], "report.json"), encoding="utf-8"))
@@ -837,7 +857,7 @@ def test_an_interruption_during_a_move_stops_the_arm_and_the_run_records_it(monk
             raise asyncio.CancelledError()
         return await real(step, robots, shared, log)
     monkeypatch.setattr(run_flow, "execute_step", interrupting)
-    assert run_flow.main([EXAMPLE_FLOW, "--mock"]) == 130
+    mock_main([EXAMPLE_FLOW, "--mock"], str(tmp_path / "logs"), 130)
     run_dir = next(os.path.join(dp, d) for dp, dn, _ in os.walk(tmp_path / "logs") for d in dn if d.startswith("mg400_5"))
     meta = json.load(open(os.path.join(os.path.dirname(run_dir), "metadata.json"), encoding="utf-8"))
     assert meta["status"] == "aborted"
@@ -916,7 +936,7 @@ def test_a_sigint_reaches_the_mg400_while_the_event_loop_is_blocked(monkeypatch,
             return await move
         return await real(step, robots, shared, log)
     monkeypatch.setattr(run_flow, "execute_step", blocking)
-    assert run_flow.main([EXAMPLE_FLOW, "--mock"]) == 130
+    mock_main([EXAMPLE_FLOW, "--mock"], str(tmp_path / "logs"), 130)
     assert seen == {"latch_during_block": True}
     run_dir = next(os.path.join(dp, d) for dp, dn, _ in os.walk(tmp_path / "logs") for d in dn if d.startswith("mg400_5"))
     meta = json.load(open(os.path.join(os.path.dirname(run_dir), "metadata.json"), encoding="utf-8"))
@@ -962,7 +982,7 @@ def test_a_sigint_reaches_the_mg400_while_the_logging_handlers_are_held(monkeypa
             return await move
         return await real(step, robots, shared, log)
     monkeypatch.setattr(run_flow, "execute_step", holding)
-    assert run_flow.main([EXAMPLE_FLOW, "--mock"]) == 130
+    mock_main([EXAMPLE_FLOW, "--mock"], str(tmp_path / "logs"), 130)
     assert seen == {"latch_while_logging_is_held": True}
 
 
@@ -1080,7 +1100,7 @@ def test_three_real_sigints_during_a_move_still_end_in_a_confirmed_stop_and_a_fi
     monkeypatch.setattr(run_flow, "execute_step", interrupting)
     before = _signal.getsignal(_signal.SIGINT)
     with caplog.at_level("WARNING"):
-        assert run_flow.main([EXAMPLE_FLOW, "--mock"]) == 130
+        mock_main([EXAMPLE_FLOW, "--mock"], str(tmp_path / "logs"), 130)
     assert _signal.getsignal(_signal.SIGINT) == before
     assert any("記録の確定を待っています" in r.getMessage() for r in caplog.records)   # the second was deferred
     run_dir = next(os.path.join(dp, d) for dp, dn, _ in os.walk(tmp_path / "logs") for d in dn if d.startswith("mg400_5"))

@@ -491,6 +491,20 @@ four minutes), and after the disable the final `GetAngle()` read -26.83,
   (§3.11: three during the -1 retries, one by the run of §3.12) and survive
   only as reads made before that; the tool now refuses
   a folder that holds files. The observation tool still does not.
+- A mock flow run on the CI (GitHub Actions run 41775670673, Python 3.12,
+  2026-11-04) once ended in an autonomous stop: the feedback watcher judged
+  packet 427 with RobotMode 7 after the phase had left `moving` and its 0.3 s
+  grace had passed. The stop sequence ended `reset_disable` and the run was
+  marked failed. The fake controller's Dashboard and feedback read the same
+  mode, so the likely cause is a delivery lag of the feedback reader (packets
+  sent while moving, read more than 0.3 s later on a busy runner); the
+  watcher judges a packet by when it is read, not by its own timestamp. Not
+  reproduced locally (12 runs under CPU load); the record of that run is
+  lost, and the wiring tests now put the MG400 record into the assertion
+  when a mock run ends otherwise than expected. On the arm the same lag would
+  stop a run spuriously (safe side, but a false fault). A change to judge by
+  the packet's own timestamp touches the reader all three tools share and
+  waits for evidence and its own reviewed plan.
 
 ## 5. Interrupting a run
 
