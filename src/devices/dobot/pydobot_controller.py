@@ -252,9 +252,14 @@ class PyDobotController:
         if self.verbose:
             logger.info(f"[PyDobot] move_angle (MOVJ_ANGLE): current J1={current_j1:.1f} -> target J1={angle:.1f}")
 
+        # J4 も J1 と逆に回して r（= J1 + J4）を保つ。XYZ 移動は r を保つので、
+        # ここで J4 を保つと「J1 回転 → XYZ 移動」のたびに J4 が ΔJ1 ずつたまり、
+        # やがて J4 の可動域（約 ±150°）を超えて alarm 0x22 になる。
+        target_j4 = j4 - (angle - current_j1)
+
         # MOVJ_ANGLEモードでジョイント角度を直接指定
         # _set_ptp_cmd(j1, j2, j3, j4, mode, wait)
-        self.device._set_ptp_cmd(angle, j2, j3, j4, mode=PTPMode.MOVJ_ANGLE, wait=True)
+        self.device._set_ptp_cmd(angle, j2, j3, target_j4, mode=PTPMode.MOVJ_ANGLE, wait=True)
 
         if self.verbose:
             new_pose = self._safe_pose()
