@@ -162,7 +162,10 @@ never a silent fallback to the built-in defaults. The CI workflow in
   inherited, and its numbers are not measurements. Ask the user for the
   address (chat only, never a tracked file) and for the rest pose and clear
   volume measured in DobotStudio Pro; tighten `workspace` and set
-  `home_position` to the rest pose. Start from `examples/mg400/z_hop.json`;
+  `home_position` to the rest pose; for `--mock` at that pose set
+  `shared_devices.mock_start_pose` (the rest pose, x, y, z, r) and
+  `mock_kinematics: {5: fitted_planar_v1}` (a fitted approximation, still a
+  fake). Start from `examples/mg400/z_hop.json`;
   `--validate-only`, then `--mock`, and stop there: the real run asks the
   human for Enter on the terminal (`docs/setup.md` §13), and the bench stages
   C1 to D (`docs/mg400-commissioning.md` §2) run only when the human asks.

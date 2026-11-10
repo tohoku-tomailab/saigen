@@ -743,6 +743,30 @@ python -m src.flow.run_flow examples/mg400/z_hop.json --validate-only
 python -m src.flow.run_flow examples/mg400/z_hop.json --mock
 ```
 
+By default the fake answers from a stand-in planar model (not the MG400's
+kinematics), which fits the example's box but cannot reach a real rest pose
+near the base. For a mock run with your measured configuration, start the fake
+at the measured pose and choose the fitted model, both in `config.yaml`:
+
+```yaml
+shared_devices:
+  mock_start_pose:
+    5: [x, y, z, r]                 # the rest pose as observe.py's PositiveSolution reports it
+  mock_kinematics:
+    5: fitted_planar_v1
+```
+
+`fitted_planar_v1` is a fitted planar approximation to one controller's
+`PositiveSolution` answers at 13 joint sets (J2 / J3 between about -22° and
+30°). It is intended for use near those joints; its accuracy between and beyond
+them is unverified, and it is still a fake. A mock run that passes with it does
+not show that the controller will accept the moves: the real run asks the
+controller's `InverseSolution` for every sample. Only the mock reads
+`mock_kinematics`; an unknown name, or a value that is not a mapping by robot
+id, is a configuration error, and `fitted_planar_v1` without a `mock_start_pose`
+is refused. The model used is written into the run's MG400 record
+(`mock_kinematics`).
+
 A real run (`python -m src.flow.run_flow examples/mg400/z_hop.json`, the
 address in `config.yaml` or `--robot5-mg400 <address>`) prints what will happen
 (robot, address, box, speed ratio, home, the first MG400 step, what a stop

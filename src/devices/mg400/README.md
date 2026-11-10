@@ -305,9 +305,15 @@ configuration keys and the bench order are in `docs/setup.md` §13; the flow for
   motion port, exact form checked before it is written; the robot type sends it at 1..10.
   Its echo rule accepts the controller's echo without the optional parameters.
 - `fake.ik` / `FakeMG400(ik_model=True)`: the fake answers `InverseSolution` from a planar
-  two-link model of its own `fk` (a stand-in with the arm's link lengths, not the
-  controller's kinematics) and moves linearly on `MovL`, so the validation steps and the
-  arrival wait run end to end in `--mock` and the tests.
+  two-link model of its own forward model and moves linearly on `MovL`, so the validation
+  steps and the arrival wait run end to end in `--mock` and the tests. Two models of the same
+  form (`fake.KINEMATICS`, `planar_fk` / `planar_ik`): `standin` (the default; not the
+  controller's kinematics, `FakeMG400.fk`) and `fitted_planar_v1`, a fitted planar
+  approximation to one controller's `PositiveSolution` answers at 13 joint sets (record of
+  2026-11-04), intended for use near those joints and unverified between and beyond them.
+  `FakeMG400(kinematics=...)` chooses one; `--mock` takes it from
+  `shared_devices.mock_kinematics` (`docs/setup.md` §13). Every internal caller goes through
+  `fake.ik` / `fake.model_fk`, so a test that replaces `fake.ik` still reaches them all.
 
 The real run of a flow is the human's, exactly as the jog tool's: the runner asks for Enter
 on a terminal (the GUI for its confirmation) before any device is opened; the agent runs

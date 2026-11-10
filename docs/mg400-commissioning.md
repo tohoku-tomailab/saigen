@@ -93,7 +93,9 @@ the stages of the flow plan, each only on the human's request in the session
    accepted C1 as passed (2026-11-04).
 10. C2: with the real `config.yaml` (robot 5, a box measured in DobotStudio
    Pro around the rest pose, `home_position` = the rest pose, `speed_ratio`
-   10): `--validate-only`, `--mock`, then the real run of
+   10): `--validate-only`, `--mock` (started at the measured rest pose with
+   the fitted fake model, `shared_devices.mock_start_pose` and
+   `mock_kinematics: {5: fitted_planar_v1}`, `docs/setup.md` §13), then the real run of
    `examples/mg400/z_hop.json` (the human presses Enter at the runner's
    prompt). The first `MovL`, the first `InverseSolution` sampling on the
    arm, the first `go_home` (expected "already at home"), arrival timing and
