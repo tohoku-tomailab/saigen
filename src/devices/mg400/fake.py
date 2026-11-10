@@ -19,6 +19,13 @@ RobotMode in the packets (None: the fake's own mode); ``feedback_error_status`` 
 error_status. All may be set at any time. (``settle`` is linear, not the first-order lag the
 tracking plan named: it exercises the same settle-and-retry path.)
 
+Kinematics (fake-kinematics plan): ``kinematics="standin"`` (default) is the smooth stand-in
+of ``fk`` (not the MG400's); ``"fitted_planar_v1"`` is a fitted planar approximation to one
+controller's PositiveSolution answers (record ``observe_c2_rest``, 2026-11-04: 13 joint sets,
+J2 / J3 in about -22..30 deg), intended for use near those joints; its accuracy between and
+beyond the samples is unverified, and it is still a fake. Both have the same form
+(``planar_fk``); ``model_fk`` / ``ik`` follow the instance's model.
+
 Knobs for the jog tool's tests: ``enable_s`` (how long EnableRobot takes to show mode 5;
 None = never), ``stuck_running`` (a move never ends: mode stays 7), ``refuse_motion``
 (JointMovJ answers ErrorID -1), ``disable_fails`` (DisableRobot is answered but the mode
@@ -34,6 +41,47 @@ from . import feedback
 
 LOOPBACK = "127.0.0.1"
 
+#: (L0, H, L1, L2) of r = L0 + L1 sin J2 + L2 cos J3, z = H + L1 cos J2 - L2 sin J3,
+#: x = r cos J1, y = r sin J1, R = J1 + J4
+KINEMATICS = {
+    "standin": (200.0, 100.0, 175.0, 175.0),               # not the MG400's kinematics
+    # least-squares fit to the 13 PositiveSolution answers of record observe_c2_rest
+    # (2026-11-04), every answer reproduced within 0.00003 mm; not Dobot's published model
+    "fitted_planar_v1": (109.5, -53.0, 174.2076, 175.0707),
+}
+J2_RANGE, J3_RANGE = (-25.0, 85.0), (-25.0, 105.0)
+
+
+def planar_fk(model, j):
+    l0, h, l1, l2 = model
+    r = l0 + l1 * math.sin(math.radians(j[1])) + l2 * math.cos(math.radians(j[2]))
+    z = h + l1 * math.cos(math.radians(j[1])) - l2 * math.sin(math.radians(j[2]))
+    a = math.radians(j[0])
+    return [r * math.cos(a), r * math.sin(a), z, j[0] + j[3]]
+
+
+def planar_ik(model, x, y, z):
+    """[J1, J2, J3] of ``planar_fk`` (one elbow branch), or None: beyond the annulus
+    |L1 - L2| .. L1 + L2, or J2 / J3 outside J2_RANGE / J3_RANGE (no clipping, no other branch).
+    Link angles from the vertical: t1 = J2 (link L1), t2 = J3 + 90 (link L2)"""
+    l0, h, l1, l2 = model
+    j1 = math.degrees(math.atan2(y, x))
+    a, b = math.hypot(x, y) - l0, z - h
+    d = math.hypot(a, b)
+    if d == 0.0 or d > l1 + l2 or d < abs(l1 - l2):
+        return None
+    phi = math.degrees(math.atan2(a, b))
+    if l1 == l2:                                           # the stand-in: today's expressions
+        c1 = c2 = math.degrees(math.acos(d / (l1 + l2)))
+    else:
+        c1 = math.degrees(math.acos(max(-1.0, min(1.0, (l1 * l1 + d * d - l2 * l2) / (2 * l1 * d)))))
+        c2 = math.degrees(math.acos(max(-1.0, min(1.0, (l2 * l2 + d * d - l1 * l1) / (2 * l2 * d)))))
+    j2 = phi - c1
+    j3 = (phi + c2) - 90.0
+    if not (J2_RANGE[0] <= j2 <= J2_RANGE[1] and J3_RANGE[0] <= j3 <= J3_RANGE[1]):
+        return None
+    return [j1, j2, j3]
+
 
 class FakeMG400:
     def __init__(self, mode: int = 4, pose=(308.141606, 0.384430, 67.673470, 18.632881),
@@ -44,7 +92,10 @@ class FakeMG400:
                  refuse_motion: bool = False, disable_fails: bool = False,
                  alarm_on_move: bool = False, reset_fails: bool = False,
                  alarm_keeps_moving: bool = False, ik_model: bool = False,
-                 ack_no_motion: bool = False):
+                 ack_no_motion: bool = False, kinematics: str = "standin"):
+        if kinematics not in KINEMATICS:
+            raise ValueError(f"unknown fake kinematics {kinematics!r} (known: {', '.join(KINEMATICS)})")
+        self.kinematics = kinematics
         self.mode = mode
         self.pose = list(pose)
         self.angles = list(angles)
@@ -222,7 +273,7 @@ class FakeMG400:
             return f"0,{{{fmt(angles)}}},GetAngle();"
         if name == "PositiveSolution":
             j = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
-            return f"0,{{{fmt(self.fk(j))}}},{cmd};"
+            return f"0,{{{fmt(self.model_fk(j))}}},{cmd};"
         if name == "InverseSolution":
             # the bench controller refused the joint-near form with -20000 (its record); that
             # it answers the six-parameter form is this fake's assumption, with the current
@@ -335,7 +386,7 @@ class FakeMG400:
                     if gen != self._move_gen or self.mode != 9:
                         return
                     self.angles[0] += 0.2
-                    self.pose = self.fk(self.angles[:4])
+                    self.pose = self.model_fk(self.angles[:4])
         steps = max(1, int(self.move_s / 0.02))
         for i in range(1, steps + 1):
             time.sleep(self.move_s / steps)
@@ -343,7 +394,7 @@ class FakeMG400:
                 if gen != self._move_gen:
                     return                       # Reset / Disable / Enable ended this move
                 self.angles[:4] = [a + (b - a) * i / steps for a, b in zip(start, target)]
-                self.pose = self.fk(self.angles[:4])
+                self.pose = self.model_fk(self.angles[:4])
         with self._lock:
             if gen == self._move_gen and not self.stuck_running:
                 self.mode = 5
@@ -369,7 +420,7 @@ class FakeMG400:
         return f"0,{{}},{cmd};"          # the echo keeps every optional parameter (this fake's assumption)
 
     def _move_pose(self, target, gen):
-        start = self.fk(self.angles[:4])
+        start = self.model_fk(self.angles[:4])
         with self._lock:
             if gen != self._move_gen:
                 return
@@ -390,37 +441,30 @@ class FakeMG400:
                     return
                 if joints is not None:
                     self.angles[:4] = joints
-                self.pose = self.fk(self.angles[:4])
+                self.pose = self.model_fk(self.angles[:4])
         with self._lock:
             if gen == self._move_gen and not self.stuck_running:
                 self.mode = 5
                 self._move_end_t = time.monotonic()
 
     def ik(self, x, y, z, r=None):
-        """The inverse of fk(): J1 = atan2(y, x); J2 / J3 from the two-link planar model
-        (both links 175, the datasheet-like stand-in of fk); J4 = R - J1 (None keeps J4).
-        None when the model cannot reach the point or J2 / J3 leave the datasheet range"""
-        j1 = math.degrees(math.atan2(y, x))
-        a, b = math.hypot(x, y) - 200.0, z - 100.0
-        d = math.hypot(a, b)
-        if d == 0.0 or d > 350.0:
+        """The inverse of model_fk() in the instance's model (``planar_ik``); J4 = R - J1
+        (None keeps J4). None when the model cannot reach the point or J2 / J3 leave the range.
+        Every internal caller goes through this method, so a test may replace it"""
+        j = planar_ik(KINEMATICS[self.kinematics], x, y, z)
+        if j is None:
             return None
-        phi = math.degrees(math.atan2(a, b))
-        h = math.degrees(math.acos(d / 350.0))
-        j2 = phi - h
-        j3 = (phi + h) - 90.0
-        if not (-25.0 <= j2 <= 85.0 and -25.0 <= j3 <= 105.0):
-            return None
-        j4 = (r - j1) if r is not None else self.angles[3]
-        return [j1, j2, j3, j4]
+        j4 = (r - j[0]) if r is not None else self.angles[3]
+        return [j[0], j[1], j[2], j4]
+
+    def model_fk(self, j):
+        """The instance's model (``kinematics``)"""
+        return planar_fk(KINEMATICS[self.kinematics], j)
 
     @staticmethod
     def fk(j):
-        """Not the MG400's kinematics: a smooth stand-in so the tool has numbers to record"""
-        r = 200.0 + 175.0 * math.sin(math.radians(j[1])) + 175.0 * math.cos(math.radians(j[2]))
-        z = 100.0 + 175.0 * math.cos(math.radians(j[1])) - 175.0 * math.sin(math.radians(j[2]))
-        a = math.radians(j[0])
-        return [r * math.cos(a), r * math.sin(a), z, j[0] + j[3]]
+        """Not the MG400's kinematics: the stand-in, a smooth model so the tool has numbers to record"""
+        return planar_fk(KINEMATICS["standin"], j)
 
     # -- feedback ---------------------------------------------------------
     def packet(self) -> bytes:

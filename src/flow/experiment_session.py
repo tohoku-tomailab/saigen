@@ -261,6 +261,32 @@ def mg400_mock_start_pose(robot_id, shared_config: Optional[dict] = None):
     return parts
 
 
+def mg400_mock_kinematics(robot_id, shared_config: Optional[dict] = None) -> str:
+    """MG400 の Mock の関節モデル（``shared_devices.mock_kinematics`` の robot_id の値）。
+    キーが無ければ "standin"。null・辞書でない値・文字列でない名前・未知の名前は
+    ConfigError（書かれた値を黙って既定に戻さない）。Mock だけが読む設定で、実機の経路には渡らない"""
+    from src.devices.mg400.fake import KINEMATICS
+    if shared_config is None:
+        shared_config = lab_config.get_shared_devices()
+    shared_config = shared_config or {}
+    if "mock_kinematics" not in shared_config:
+        return "standin"
+    value = shared_config["mock_kinematics"]
+    if not isinstance(value, dict):
+        raise lab_config.ConfigError(
+            f"shared_devices.mock_kinematics はロボット ID をキーにした辞書で書いてください（例 {{5: fitted_planar_v1}}）: {value!r}")
+    if robot_id in value:
+        name = value[robot_id]
+    elif str(robot_id) in value:
+        name = value[str(robot_id)]
+    else:
+        return "standin"
+    if not isinstance(name, str) or name not in KINEMATICS:
+        raise lab_config.ConfigError(
+            f"shared_devices.mock_kinematics.{robot_id} = {name!r} は使えません（{', '.join(KINEMATICS)} のどれか）")
+    return name
+
+
 def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator, **extra):
     """MockLabRobot を生成するファクトリ（実機なしでの動作確認用）
 
@@ -273,11 +299,14 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator, **ex
     if robot_type(ports) == "mg400":
         from src.devices.safety.mg400_robot import MockMG400Robot  # 遅延 import
         start_pose = mg400_mock_start_pose(robot_id)
+        kinematics = mg400_mock_kinematics(robot_id)
         if start_pose is not None:
             logger.info(f"[MOCK] Robot {robot_id}（MG400）の開始姿勢: {start_pose}")
+        logger.info(f"[MOCK] Robot {robot_id}（MG400）の fake の関節モデル: {kinematics}")
         return MockMG400Robot(
             workspace_validator=workspace_validator,
             start_pose=start_pose,
+            kinematics=kinematics,
             record_folder=extra.get("record_folder"),
             **robot_options(ports),
         )

@@ -601,16 +601,24 @@ class MockMG400Robot(MG400Robot):
 
     def __init__(self, workspace_validator: Optional[WorkspaceValidator] = None,
                  start_pose: Optional[Sequence[float]] = None, record_folder: Optional[str] = None,
-                 **device_configs):
-        from src.devices.mg400.fake import LOOPBACK, FakeMG400
-        self.fake = FakeMG400(ik_model=True)
+                 kinematics: str = "standin", **device_configs):
+        from src.devices.mg400.fake import KINEMATICS, LOOPBACK, FakeMG400
+        if kinematics not in KINEMATICS:
+            raise ValueError(f"MG400 の mock_kinematics {kinematics!r} は未知です（{', '.join(KINEMATICS)}）")
+        if kinematics != "standin" and start_pose is None:
+            raise ValueError(f"MG400 の mock_kinematics {kinematics!r} には mock_start_pose が必要です"
+                             "（その姿勢から fake を始めます）")
+        self.kinematics = kinematics
+        self.fake = FakeMG400(ik_model=True, kinematics=kinematics)
         if start_pose is not None:
-            joints = self.fake.ik(*list(start_pose)[:4]) if len(list(start_pose)) >= 4 else \
-                self.fake.ik(start_pose[0], start_pose[1], start_pose[2], None)
+            pose = list(start_pose)
+            joints = self.fake.ik(*pose[:4]) if len(pose) >= 4 else self.fake.ik(pose[0], pose[1], pose[2], None)
             if joints is None:
-                raise ValueError(f"MG400 の mock_start_pose {list(start_pose)} は fake の関節モデルで解けません")
+                self.fake.close()
+                raise ValueError(f"MG400 の mock_start_pose {pose} は fake の関節モデル {kinematics!r} で解けません"
+                                 "（到達範囲 |L1-L2|..L1+L2 または J2 -25..85 / J3 -25..105 の外）")
             self.fake.angles[:4] = joints
-            self.fake.pose = self.fake.fk(joints)
+            self.fake.pose = self.fake.model_fk(joints)
         fake = self.fake
         ports = {control.DASHBOARD_PORT: fake.dashboard_port, control.FEEDBACK_PORT: fake.feedback_port,
                  control.MOTION_PORT: fake.motion_port}
@@ -619,7 +627,9 @@ class MockMG400Robot(MG400Robot):
             return control._connect_fixed(LOOPBACK, ports[port], timeout)
 
         def factory(address, folder):
-            return control.Controller(LOOPBACK, folder, connect=connect)
+            ctl = control.Controller(LOOPBACK, folder, connect=connect)
+            ctl.note({"mock_kinematics": kinematics})          # which fake model answered
+            return ctl
 
         super().__init__(LOOPBACK, workspace_validator=workspace_validator, controller_factory=factory,
                          record_folder=record_folder, confirmed=True, **device_configs)
