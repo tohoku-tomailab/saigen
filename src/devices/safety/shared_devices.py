@@ -86,6 +86,7 @@ class SharedDevices:
         self.microscope_serial = None
         self.daq = None
         self.daq_policy = None
+        self.daq_service = None
 
         # デバイス設定
         self.device_configs = device_configs
@@ -234,18 +235,20 @@ class SharedDevices:
             return False
         try:
             logger.info(f"DAQ（{device}）を初期化中...")
-            from src.devices.nidaq import DaqOutputPolicy, NIDaq
+            from src.devices.nidaq import DaqService, NIDaq
 
-            # 出力の許可リストと電圧範囲。設定が不正ならここで止める
-            self.daq_policy = DaqOutputPolicy.from_config(self.device_configs)
+            # 信号名・出力の許可リスト・電圧範囲。設定が不正ならここで止める
             daq = NIDaq(device=device)
+            service = DaqService(daq, self.device_configs)
             if not daq.connect():
                 return False
             self.daq = daq
+            self.daq_service = service
+            self.daq_policy = service.policy
             logger.info(f"✓ DAQ 初期化完了 ({device}, {daq.product_type}) "
-                        f"出力許可: AO {sorted(self.daq_policy.ao_channels) or 'なし'} "
-                        f"[{self.daq_policy.ao_min_v:g}..{self.daq_policy.ao_max_v:g} V], "
-                        f"DO {sorted(self.daq_policy.do_lines) or 'なし'}")
+                        f"出力許可: {service.policy.describe()}"
+                        + (f" / 信号: {', '.join(service.signals.names())}"
+                           if service.signals.names() else ""))
             return True
 
         except Exception as e:
@@ -533,80 +536,51 @@ class SharedDevices:
     # ========================================
 
     def _require_daq(self):
-        if not self.use_daq or self.daq is None or self.daq_policy is None:
+        if not self.use_daq or self.daq is None or self.daq_service is None:
             raise RuntimeError("DAQ が初期化されていません "
                                "(config.yaml の shared_devices.daq_device を設定してください)")
-        return self.daq
+        return self.daq_service
+
+    async def daq_step(self, action: str, **params) -> dict:
+        """
+        daq_* ステップを 1 つ実行する（全 DAQ アクションの入口）
+
+        信号名の解決（config.yaml の daq_signals）と出力の許可判定（daq_ao_channels /
+        daq_do_lines / daq_co_counters、電圧・周波数の上限）は DaqService が行い、
+        許可されない出力は DaqPolicyError で拒否する（デバイスには何も送らない）。
+        MockSharedDevices も同じ DaqService を通る。
+
+        Args:
+            action: "daq_read_analog" などのアクション名
+            **params: ステップのフィールド（action 以外）
+
+        Returns:
+            dict: 記録用データ（daq_channel / voltage / digital_state / daq_value /
+                daq_unit / data_path のうち該当するもの）
+        """
+        return await self._require_daq().run(action, **params)
 
     async def daq_read_analog(self, channel: str, samples: int = 100, rate_hz: float = 1000.0,
                               v_range: float = 10.0, terminal: str = "default") -> float:
-        """
-        アナログ入力 1 チャンネルの電圧（samples 回の平均）を読む
-
-        Args:
-            channel: "ai0" など（デバイス名は付けない）
-            samples: 平均するサンプル数
-            rate_hz: サンプリング周波数 (Hz)
-            v_range: 入力レンジ ±v_range (V)
-            terminal: 配線方式 "default" / "rse" / "nrse" / "diff"
-
-        Returns:
-            float: 平均電圧 (V)
-        """
-        daq = self._require_daq()
-        try:
-            # 取り込みは samples / rate_hz 秒ブロックするので別スレッドで待つ
-            volts = await asyncio.to_thread(daq.read_analog, channel, samples, rate_hz,
-                                            v_range, terminal)
-            logger.info(f"✓ DAQ {channel}: {volts:+.5f} V（{samples} 点平均）")
-            return volts
-        except Exception as e:
-            logger.error(f"DAQ アナログ入力エラー ({channel}): {e}")
-            raise
+        """アナログ入力 1 チャンネルの電圧（samples 回の平均, V）を読む"""
+        result = await self.daq_step("daq_read_analog", channel=channel, samples=samples,
+                                rate_hz=rate_hz, v_range=v_range, terminal=terminal)
+        return result["voltage"]
 
     async def daq_write_analog(self, channel: str, voltage: float) -> float:
-        """
-        アナログ出力 1 チャンネルを DC 電圧に設定して保持する
-
-        config.yaml の daq_ao_channels に無いチャンネル、daq_ao_min_v..daq_ao_max_v の
-        外の電圧は DaqPolicyError で拒否する（デバイスには何も送らない）。
-        """
-        daq = self._require_daq()
-        name, volts = self.daq_policy.check_analog_output(channel, voltage)
-        try:
-            daq.write_analog(name, volts)
-            logger.info(f"✓ DAQ {name} = {volts:+.4f} V")
-            return volts
-        except Exception as e:
-            logger.error(f"DAQ アナログ出力エラー ({name}): {e}")
-            raise
+        """アナログ出力 1 チャンネルを DC 電圧に設定して保持する（許可されたものだけ）"""
+        result = await self.daq_step("daq_write_analog", channel=channel, voltage=voltage)
+        return result["voltage"]
 
     async def daq_read_digital(self, line: str) -> bool:
         """デジタル 1 ラインを入力として読む（True = High）"""
-        daq = self._require_daq()
-        try:
-            state = bool(daq.read_digital(line))
-            logger.info(f"✓ DAQ {line}: {'High' if state else 'Low'}")
-            return state
-        except Exception as e:
-            logger.error(f"DAQ デジタル入力エラー ({line}): {e}")
-            raise
+        result = await self.daq_step("daq_read_digital", line=line)
+        return result["digital_state"]
 
     async def daq_write_digital(self, line: str, state: bool) -> bool:
-        """
-        デジタル 1 ラインを High / Low に駆動して保持する
-
-        config.yaml の daq_do_lines に無いラインは DaqPolicyError で拒否する。
-        """
-        daq = self._require_daq()
-        name = self.daq_policy.check_digital_output(line)
-        try:
-            daq.write_digital(name, bool(state))
-            logger.info(f"✓ DAQ {name} = {'High' if state else 'Low'}")
-            return bool(state)
-        except Exception as e:
-            logger.error(f"DAQ デジタル出力エラー ({name}): {e}")
-            raise
+        """デジタル 1 ラインを High / Low に駆動して保持する（許可されたものだけ）"""
+        result = await self.daq_step("daq_write_digital", line=line, state=state)
+        return result["digital_state"]
 
     # ========================================
     # ライフサイクル管理
@@ -619,7 +593,7 @@ class SharedDevices:
         # DAQ を最初に閉じる: 駆動した出力を 0 V / Low に戻すのを他の後始末より先にする
         try:
             if self.daq:
-                failed = self.daq.close()
+                failed = self.daq_service.close() if self.daq_service else self.daq.close()
                 if failed:
                     logger.error(f"DAQ の出力を安全状態に戻せませんでした: {failed} "
                                  "（配線先の機器を手で止めてください）")
