@@ -29,6 +29,7 @@ pydobot>=1.3.2            # Dobot Magician
 bleak>=0.21               # Picus 2 over Bluetooth LE (also used by src/imaging)
 opencv-python==4.12.0.88 ; sys_platform != "win32"   # webcam capture (win32 pin above)
 numpy>=1.26
+nidaqmx>=1.0              # NI DAQ (USB-6351), daq_* steps; also needs the NI-DAQmx driver from ni.com
 pandas>=2.0               # IKA logging helpers
 matplotlib>=3.8
 
