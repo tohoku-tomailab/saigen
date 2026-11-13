@@ -65,6 +65,16 @@ shared_devices:
   microscope_index: 2     # USB digital microscope (UVC, e.g. 400-CAM106) used by capture_microscope
   microscope_port: ""     # its control serial port (CP210x, e.g. COM10) for microscope_led; "" = no LED control
   microscope_resolution: "3840x2160"   # capture size; 4K is the sharpest and fastest mode (0.4-2 MB per JPEG). Use "1280x720" to keep data small
+  # National Instruments DAQ (USB-6351), used by the daq_* steps. Needs the NI-DAQmx driver.
+  daq_device: ""          # device name shown in NI MAX, e.g. Dev1; "" = no DAQ
+  # Outputs can switch whatever is wired to the terminal block, so a flow may drive
+  # only the channels listed here (inputs are always allowed). Leave empty until the
+  # wiring has been checked. Every output driven by a run returns to 0 V / low when
+  # the run ends, including on Ctrl+C and on an error.
+  daq_ao_channels: []     # e.g. [ao0]
+  daq_do_lines: []        # e.g. [port0/line0, port0/line1]
+  daq_ao_min_v: 0.0       # allowed analog output span (the device itself can do -10..10 V)
+  daq_ao_max_v: 5.0
 
 # Dobot workspace limits. WorkspaceValidator checks every move against
 # these BEFORE the robot is commanded, for all robots (except where a

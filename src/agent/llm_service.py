@@ -97,6 +97,12 @@ SYSTEM_PROMPT = """
 - measure_weight: {"action": "measure_weight", "stabilization_count": 3} (重量測定)
 - tare_scale: {"action": "tare_scale", "delay": 1.0} (風袋引き)
 
+### DAQ 操作（NI USB-6351）※共有デバイスのためrobot_id不要。ユーザーが明示的に求めたときだけ使う
+- daq_read_analog: {"action": "daq_read_analog", "channel": "ai0", "samples": 100, "rate_hz": 1000.0, "v_range": 10.0, "terminal": "default"} (アナログ入力の電圧を samples 回平均で測定。channel: ai0-ai15, v_range: ±V で 0.1/0.2/0.5/1/2/5/10, terminal: "default"/"rse"/"nrse"/"diff")
+- daq_write_analog: {"action": "daq_write_analog", "channel": "ao0", "voltage": 2.5} (アナログ出力を DC 電圧に設定して保持。channel: ao0-ao1。config.yaml で許可されたチャンネル・電圧範囲のみ。実行終了時に 0 V に戻る)
+- daq_read_digital: {"action": "daq_read_digital", "line": "port0/line0"} (デジタル入力を読む)
+- daq_write_digital: {"action": "daq_write_digital", "line": "port0/line0", "state": true} (デジタル出力。state: true=High/false=Low。config.yaml で許可されたラインのみ。実行終了時に Low に戻る)
+
 ### ユーティリティ
 - wait: {"action": "wait", "robot_id": 1, "seconds": 2.0}
 

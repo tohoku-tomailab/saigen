@@ -239,14 +239,24 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
     )
 
 
+#: 共有デバイス設定のうち DAQ（NI USB-6351）に渡すキー
+DAQ_CONFIG_KEYS = ("daq_device", "daq_ao_channels", "daq_do_lines", "daq_ao_min_v", "daq_ao_max_v")
+
+
+def _daq_config(config) -> dict:
+    return {k: config[k] for k in DAQ_CONFIG_KEYS if k in config}
+
+
 def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
-                           use_microscope_serial=False):
+                           use_microscope_serial=False, use_daq=False):
     """実機 SharedDevices を生成する既定ファクトリ"""
     return SharedDevices(
         use_scale=use_scale,
         use_camera=use_camera,
         use_microscope=use_microscope,
         use_microscope_serial=use_microscope_serial,
+        use_daq=use_daq,
+        **_daq_config(config),
         scale_port=config["scale_port"],
         camera_index=config["camera_index"],
         microscope_index=config.get("microscope_index", 2),
@@ -256,11 +266,15 @@ def default_shared_factory(*, use_scale, use_camera, config, use_microscope=Fals
 
 
 def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
-                        use_microscope_serial=False):
-    """MockSharedDevices を生成するファクトリ"""
+                        use_microscope_serial=False, use_daq=False):
+    """MockSharedDevices を生成するファクトリ
+
+    DAQ の出力許可リスト・電圧範囲だけは設定から渡す（モックも実機と同じ判定をする）。
+    """
     return MockSharedDevices(use_scale=use_scale, use_camera=use_camera,
                              use_microscope=use_microscope,
-                             use_microscope_serial=use_microscope_serial)
+                             use_microscope_serial=use_microscope_serial,
+                             use_daq=use_daq, **_daq_config(config))
 
 
 class ExperimentSession:
@@ -455,12 +469,15 @@ class ExperimentSession:
         robot.set_current_position_as_home()
 
     async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
-                         use_microscope: bool = False, use_microscope_serial: bool = False):
+                         use_microscope: bool = False, use_microscope_serial: bool = False,
+                         use_daq: bool = False):
         """設定の値で共有デバイスを生成・初期化して登録する"""
+        # use_daq は必要なときだけ渡す（DAQ を知らない差し替えファクトリをそのまま使えるように）
+        extra = {"use_daq": True} if use_daq else {}
         shared = self.shared_factory(
             use_scale=use_scale, use_camera=use_camera, use_microscope=use_microscope,
             use_microscope_serial=use_microscope_serial,
-            config=self.shared_config(),
+            config=self.shared_config(), **extra,
         )
         if not await shared.initialize():
             raise RuntimeError("共有デバイスの初期化に失敗しました")

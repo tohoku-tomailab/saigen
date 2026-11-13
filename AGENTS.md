@@ -32,6 +32,7 @@ configuration and flow files, not in the driver code.
 | `src/devices/safety/` | `LabRobot` (real), `MockLabRobot` (no hardware), shared devices and the workspace validators. **All flows run through this layer.** |
 | `src/devices/{dobot,picus2,scale,ika,webcam}/` | Per-instrument drivers. |
 | `src/devices/maxarm/` | Hiwonder MaxArm (optional robot 4, `type: maxarm`): serial client, protocol and the MicroPython firmware with its human-run installer `deploy_firmware.py`. Wrapped by `MaxArmRobot` / `MockMaxArmRobot` in `src/devices/safety/`. |
+| `src/devices/nidaq/` | National Instruments USB-6351 DAQ (optional): analog and digital I/O for the `daq_*` steps, through `SharedDevices`. Outputs are refused unless listed in `config.yaml` (`daq_ao_channels`, `daq_do_lines`) and return to 0 V / low when a run ends. Enabling an output is the human's decision, like widening a workspace limit. |
 | `src/agent/` | LLM-based generation of flows from natural language, plus preset flows. |
 | `src/gui/` | Streamlit GUI. `src/voice/` voice input. |
 | `src/monitoring/` | Sensor dashboard (FastAPI) and Raspberry Pi agent; own `config.example.yaml`. |
@@ -40,6 +41,7 @@ configuration and flow files, not in the driver code.
 | `examples/zif8/` | Example flows of the paper's ZIF-8 demonstration. |
 | `examples/microscope/` | Example flow using the USB digital microscope (`capture_microscope`). |
 | `examples/maxarm/` | Suction pick-and-place flow for the MaxArm (robot 4). |
+| `examples/daq/` | Input-only example flow for the NI DAQ (`daq_read_analog`, `daq_read_digital`). |
 | `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument, MaxArm commissioning notes (`maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery). |
 | `tests/`, `src/monitoring/tests/`, `src/imaging/tests/` | Unit tests; none need hardware. |
 

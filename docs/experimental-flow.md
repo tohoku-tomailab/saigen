@@ -115,6 +115,19 @@ the Dobots are still sent home as before. See
 | `capture_microscope` | `file_path` (string, `""` = auto-generate) | Capture an image with the USB digital microscope (UVC, e.g. Sanwa Supply 400-CAM106); saved into the run's `images/` folder with `_microscope` in the name. Opens only the microscope camera; `microscope_led` opens only its serial port; `microscope_focus` opens both |
 | `microscope_led` | `on` (bool, default true), `level` (0–255, optional) | Switch the microscope's LED ring on or off and optionally set its brightness (factory level 12). Needs `microscope_port` in `config.yaml` (the UM22's CP210x serial port) |
 | `microscope_focus` | `mode` (`auto` / `position` / `step`, default `auto`), `position` (0–65535, for `position`), `direction` (`in`/`out`) and `steps` (1–100, for `step`), `timeout` (1–300 s, default 60) | Focus the microscope: single-shot autofocus, move the lens motor to a recorded position, or step it. Waits until the motor stops and writes the lens position and whether it converged to the `focus_position` / `focus_converged` columns of `measurements.csv`. Autofocus needs a textured target and a non-saturating LED level; on a blank field it hunts until `timeout` and then falls back to manual mode. For reproducibility, record the position once and replay it with `mode: "position"`. Needs `microscope_port` |
+| `daq_read_analog` | `channel` (`ai0`..), `samples` (1–100000, default 100), `rate_hz` (1–100000, default 1000), `v_range` (0.1 / 0.2 / 0.5 / 1 / 2 / 5 / 10, default 10), `terminal` (`default` / `rse` / `nrse` / `diff`) | Read one analog input of the NI DAQ device (USB-6351): the mean of `samples` readings taken at `rate_hz` (at most 60 s), with the input range ±`v_range` V. Written to the `daq_channel` / `voltage_v` columns of `measurements.csv` |
+| `daq_write_analog` | `channel` (`ao0`, `ao1`), `voltage` (−10–10 V) | Set one analog output to a DC voltage and hold it. Refused at run time (and at `--mock`) unless the channel is listed in `daq_ao_channels` and the voltage lies inside `daq_ao_min_v`..`daq_ao_max_v` in `config.yaml`. The value set is logged in `voltage_v` |
+| `daq_read_digital` | `line` (`port0/line0`..) | Read one digital line; `digital_state` in `measurements.csv` is 1 (high) or 0 (low). A line the run is driving as an output cannot be read |
+| `daq_write_digital` | `line`, `state` (bool, required) | Drive one digital line high (`true`) or low and hold it. Refused unless the line is listed in `daq_do_lines` in `config.yaml` |
+
+Channels of the DAQ are written without the device name; the name (`Dev1`, as
+shown in NI MAX) is `shared_devices.daq_device` in `config.yaml`. Every output a
+run drove returns to 0 V / low when the run ends, including on Ctrl+C and on an
+error, so wire loads such that low means off. These steps are single values per
+step; waveform capture, counters and triggering are not covered. A flow with
+only `daq_*` steps opens no robot. See
+[`examples/daq/read_voltage.json`](../examples/daq/read_voltage.json) and
+[`src/devices/nidaq/README.md`](../src/devices/nidaq/README.md).
 
 ### Utility and control flow
 

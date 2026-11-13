@@ -524,6 +524,136 @@ class ActionTareScale(_StrictModel):
     )
 
 # ==========================================
+# 1.75 個別のアクション定義 (共有デバイス: NI DAQ USB-6351 用)
+# ==========================================
+#
+# チャンネルはデバイス名を付けずに書く（"ai0" / "ao0" / "port0/line0"）。
+# デバイス名（Dev1 など）は config.yaml の shared_devices.daq_device。
+# 出力（daq_write_*）は config.yaml の daq_ao_channels / daq_do_lines に載せた
+# チャンネルだけが実行時（--mock を含む）に許可される。
+
+class ActionDaqReadAnalog(_StrictModel):
+    """
+    DAQ のアナログ入力 1 チャンネルの電圧を読む（samples 回の平均）
+    SharedDevices.daq_read_analog(channel, samples, rate_hz, v_range, terminal) に対応
+
+    測定値は measurements.csv の voltage_v 列に記録される。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_read_analog"] = Field(
+        ...,
+        description="アクション識別子: DAQ アナログ入力"
+    )
+    channel: str = Field(
+        ...,
+        pattern=r"^ai\d{1,2}$",
+        description="アナログ入力チャンネル（例: ai0。USB-6351 は ai0-ai15）"
+    )
+    samples: int = Field(
+        default=100,
+        ge=1,
+        le=100000,
+        description="平均するサンプル数（1 = 単発読み取り）"
+    )
+    rate_hz: float = Field(
+        default=1000.0,
+        ge=1.0,
+        le=100000.0,
+        description="サンプリング周波数 (Hz)。samples / rate_hz 秒かけて取り込む"
+    )
+    v_range: Literal[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0] = Field(
+        default=10.0,
+        description="入力レンジ ±v_range (V)。信号が収まる最小のレンジが最も分解能が高い"
+    )
+    terminal: Literal["default", "rse", "nrse", "diff"] = Field(
+        default="default",
+        description="配線方式: rse = GND 基準シングルエンド / nrse / diff = 差動 / default = デバイス既定"
+    )
+
+    @model_validator(mode="after")
+    def _acquisition_time_bounded(self):
+        if self.samples / self.rate_hz > 60.0:
+            raise ValueError("daq_read_analog: samples / rate_hz（取り込み時間）は 60 秒以下にしてください")
+        return self
+
+
+class ActionDaqWriteAnalog(_StrictModel):
+    """
+    DAQ のアナログ出力 1 チャンネルを DC 電圧に設定する（次の設定か実行終了まで保持）
+    SharedDevices.daq_write_analog(channel, voltage) に対応
+
+    実行終了時（中断・エラーを含む）に 0 V に戻る。config.yaml の daq_ao_channels に
+    無いチャンネル、daq_ao_min_v..daq_ao_max_v の外の電圧は実行時に拒否される。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_write_analog"] = Field(
+        ...,
+        description="アクション識別子: DAQ アナログ出力"
+    )
+    channel: str = Field(
+        ...,
+        pattern=r"^ao\d$",
+        description="アナログ出力チャンネル（例: ao0。USB-6351 は ao0-ao1）"
+    )
+    voltage: float = Field(
+        ...,
+        ge=-10.0,
+        le=10.0,
+        description="出力電圧 (V)。許容範囲は config.yaml の daq_ao_min_v / daq_ao_max_v でさらに絞られる"
+    )
+
+
+class ActionDaqReadDigital(_StrictModel):
+    """
+    DAQ のデジタル 1 ラインを入力として読む
+    SharedDevices.daq_read_digital(line) に対応
+
+    結果は measurements.csv の digital_state 列に 1 (High) / 0 (Low) で記録される。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_read_digital"] = Field(
+        ...,
+        description="アクション識別子: DAQ デジタル入力"
+    )
+    line: str = Field(
+        ...,
+        pattern=r"^port\d/line\d{1,2}$",
+        description="デジタルライン（例: port0/line0）"
+    )
+
+
+class ActionDaqWriteDigital(_StrictModel):
+    """
+    DAQ のデジタル 1 ラインを High / Low に駆動する（次の設定か実行終了まで保持）
+    SharedDevices.daq_write_digital(line, state) に対応
+
+    実行終了時（中断・エラーを含む）に Low に戻る。config.yaml の daq_do_lines に
+    無いラインは実行時に拒否される。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_write_digital"] = Field(
+        ...,
+        description="アクション識別子: DAQ デジタル出力"
+    )
+    line: str = Field(
+        ...,
+        pattern=r"^port\d/line\d{1,2}$",
+        description="デジタルライン（例: port0/line0）"
+    )
+    state: bool = Field(
+        ...,
+        description="True = High (5 V), False = Low (0 V)"
+    )
+
+# ==========================================
 # 1.8 個別のアクション定義 (ループ制御)
 # ==========================================
 
@@ -600,6 +730,11 @@ LabRobotAction = Union[
     # 電子天秤操作（BCE8221）
     ActionMeasureWeight,
     ActionTareScale,
+    # DAQ（NI USB-6351）操作
+    ActionDaqReadAnalog,
+    ActionDaqWriteAnalog,
+    ActionDaqReadDigital,
+    ActionDaqWriteDigital,
     # ユーティリティ
     ActionWait,
     # ループ制御

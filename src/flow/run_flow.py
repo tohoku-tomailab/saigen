@@ -60,7 +60,8 @@ from pydantic import ValidationError
 from src import config as lab_config
 from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS
+from src.flow.executor import (execute_step, expand_loops, SHARED_DEVICE_ACTIONS, DAQ_ACTIONS,
+                               MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS)
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, robot_type, validator_for_robot
 from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
@@ -260,6 +261,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="capture_microscope 用の顕微鏡カメラ index（既定: MICROSCOPE_INDEX / config.yaml）")
     p.add_argument("--microscope-port", default=None,
                    help="顕微鏡 LED 制御用シリアルポート（既定: MICROSCOPE_PORT / config.yaml。空なら LED 制御なし）")
+    p.add_argument("--daq-device", default=None,
+                   help="daq_* 用の NI DAQ デバイス名（NI MAX 上の名前、例: Dev1。既定: DAQ_DEVICE / config.yaml）")
     record = p.add_mutually_exclusive_group()
     record.add_argument("--record", dest="record", action="store_true", default=None,
                         help="センサーCSV・動画の録画を行う（実機実行時の既定）")
@@ -316,6 +319,10 @@ def resolve_ports(args) -> Tuple[dict, dict]:
         shared_config["microscope_port"] = cli_port
     elif os.getenv("MICROSCOPE_PORT"):
         shared_config["microscope_port"] = os.getenv("MICROSCOPE_PORT")
+    # DAQ はデバイス名だけ上書きできる（出力の許可リスト・電圧範囲は config.yaml のみ）
+    daq = getattr(args, "daq_device", None) or os.getenv("DAQ_DEVICE")
+    if daq:
+        shared_config["daq_device"] = daq
 
     return robot_ports, shared_config
 
@@ -638,6 +645,14 @@ def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
             needs_microscope, needs_microscope_serial)
 
 
+def plan_daq(steps: list) -> bool:
+    """フローが NI の DAQ デバイス（daq_* アクション）を必要とするか。
+
+    plan_resources の戻り値の形を変えないため別関数にしている。
+    """
+    return any(s.get("action") in DAQ_ACTIONS for s in steps)
+
+
 def _fmt_params(step: dict) -> str:
     return " ".join(f"{k}={v}" for k, v in step.items() if k not in ("action", "_iteration"))
 
@@ -664,7 +679,9 @@ async def run(args) -> int:
 
     (robot_ids, picus2_robots, needs_scale, needs_camera,
      needs_microscope, needs_microscope_serial) = plan_resources(steps)
-    needs_shared = needs_scale or needs_camera or needs_microscope or needs_microscope_serial
+    needs_daq = plan_daq(steps)
+    needs_shared = (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
+                    or needs_daq)
     robot_types = report.robot_types
 
     # 実機実行では既定で録画する。Mock モードでは常に録画しない。
@@ -691,7 +708,8 @@ async def run(args) -> int:
     if needs_shared:
         parts = [n for n, need in (("天秤", needs_scale), ("カメラ", needs_camera),
                                    ("顕微鏡カメラ", needs_microscope),
-                                   ("顕微鏡制御ポート", needs_microscope_serial)) if need]
+                                   ("顕微鏡制御ポート", needs_microscope_serial),
+                                   ("DAQ", needs_daq)) if need]
         logger.info(f"共有デバイス: {', '.join(parts)}")
 
     # 録画セッション開始（CSV: ダッシュボード経由 / 動画: ローカルスレッド）
@@ -732,7 +750,8 @@ async def run(args) -> int:
         if needs_shared:
             await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
                                      use_microscope=needs_microscope,
-                                     use_microscope_serial=needs_microscope_serial)
+                                     use_microscope_serial=needs_microscope_serial,
+                                     use_daq=needs_daq)
 
         logger.info("=== フロー実行開始 ===")
         total = len(steps)

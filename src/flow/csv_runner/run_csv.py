@@ -488,10 +488,13 @@ async def run_two_solution_mixing(
     async def body():
         for rid in robot_ids:
             await session.add_robot(rid, use_picus2=(rid in picus2_robots))
-        if needs_scale or needs_camera or needs_microscope or needs_microscope_serial:
+        needs_daq = run_flow.plan_daq(steps)
+        if (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
+                or needs_daq):
             await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
                                      use_microscope=needs_microscope,
-                                     use_microscope_serial=needs_microscope_serial)
+                                     use_microscope_serial=needs_microscope_serial,
+                                     use_daq=needs_daq)
 
         logger.info("=== two-solution mixing started ===")
         total = len(steps)

@@ -18,7 +18,11 @@ _default_logger = logging.getLogger(__name__)
 
 # 共有デバイス用アクション（robot_idに依存しない）
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
-                         "capture_microscope", "microscope_led", "microscope_focus"}
+                         "capture_microscope", "microscope_led", "microscope_focus",
+                         "daq_read_analog", "daq_write_analog",
+                         "daq_read_digital", "daq_write_digital"}
+# NI の DAQ デバイス（USB-6351）が要るアクション
+DAQ_ACTIONS = {"daq_read_analog", "daq_write_analog", "daq_read_digital", "daq_write_digital"}
 MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
 # 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
 MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}
@@ -177,6 +181,32 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
         delay = step.get("delay", 1.0) if isinstance(step, dict) else step.delay
         await shared_devices.tare_scale(delay)
         return None
+
+    # ===== DAQ（NI USB-6351）操作 =====
+    elif action in DAQ_ACTIONS:
+        def param(name, default=None):
+            value = step.get(name) if isinstance(step, dict) else getattr(step, name, None)
+            return default if value is None else value
+
+        if action == "daq_read_analog":
+            channel = param("channel")
+            volts = await shared_devices.daq_read_analog(
+                channel, param("samples", 100), param("rate_hz", 1000.0),
+                param("v_range", 10.0), param("terminal", "default"))
+            logger.info(f"  測定結果: {channel} = {volts:+.5f} V")
+            return {"voltage": volts, "daq_channel": channel}
+        if action == "daq_write_analog":
+            channel = param("channel")
+            volts = await shared_devices.daq_write_analog(channel, param("voltage"))
+            return {"voltage": volts, "daq_channel": channel}
+        if action == "daq_read_digital":
+            line = param("line")
+            state = await shared_devices.daq_read_digital(line)
+            logger.info(f"  測定結果: {line} = {'High' if state else 'Low'}")
+            return {"digital_state": bool(state), "daq_channel": line}
+        line = param("line")
+        state = await shared_devices.daq_write_digital(line, param("state"))
+        return {"digital_state": bool(state), "daq_channel": line}
 
     else:
         # 未知のアクションを警告だけで読み飛ばすと、後続ステップが想定外の

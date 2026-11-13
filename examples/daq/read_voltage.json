@@ -1,0 +1,10 @@
+{
+  "name": "daq_read_voltage",
+  "description": "Read the voltage on analog input ai0 of the NI DAQ device (USB-6351) five times, each the mean of one second of samples, then one digital input. Inputs only: nothing is driven and no robot is opened, so it is safe to run with nothing wired (a floating input reads an arbitrary voltage).",
+  "steps": [
+    {"action": "loop_start", "loop_id": "read", "count": 5},
+    {"action": "daq_read_analog", "channel": "ai0", "samples": 1000, "rate_hz": 1000.0, "v_range": 10.0, "terminal": "rse"},
+    {"action": "loop_end", "loop_id": "read"},
+    {"action": "daq_read_digital", "line": "port0/line0"}
+  ]
+}

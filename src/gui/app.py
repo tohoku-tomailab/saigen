@@ -142,6 +142,24 @@ ACTION_CONFIG = {
         "icon": "🔄", "label": "風袋引き", "category": "sensor",
         "defaults": {"delay": 1.0}
     },
+    # DAQ（NI USB-6351）
+    "daq_read_analog": {
+        "icon": "📈", "label": "電圧測定 (DAQ)", "category": "daq",
+        "defaults": {"channel": "ai0", "samples": 100, "rate_hz": 1000.0,
+                     "v_range": 10.0, "terminal": "default"}
+    },
+    "daq_write_analog": {
+        "icon": "🎚️", "label": "電圧出力 (DAQ)", "category": "daq",
+        "defaults": {"channel": "ao0", "voltage": 0.0}
+    },
+    "daq_read_digital": {
+        "icon": "🔎", "label": "デジタル入力 (DAQ)", "category": "daq",
+        "defaults": {"line": "port0/line0"}
+    },
+    "daq_write_digital": {
+        "icon": "🔌", "label": "デジタル出力 (DAQ)", "category": "daq",
+        "defaults": {"line": "port0/line0", "state": False}
+    },
     # ループ制御
     "loop_start": {
         "icon": "🔁", "label": "ループ開始", "category": "loop",
@@ -170,6 +188,7 @@ CATEGORIES = {
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
     "maxarm": ("🧲 MaxArm", ["suction"]),
     "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale"]),
+    "daq": ("🔌 DAQ", ["daq_read_analog", "daq_write_analog", "daq_read_digital", "daq_write_digital"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
 }
@@ -820,6 +839,14 @@ def get_param_summary(step):
         return f"測定: {step.get('stabilization_count', 3)}回"
     elif action == "tare_scale":
         return f"待機: {step.get('delay', 1.0)}秒"
+    elif action == "daq_read_analog":
+        return f"{step.get('channel', 'ai0')} ±{step.get('v_range', 10.0)}V x{step.get('samples', 100)}"
+    elif action == "daq_write_analog":
+        return f"{step.get('channel', 'ao0')} = {step.get('voltage', 0.0)} V"
+    elif action == "daq_read_digital":
+        return f"{step.get('line', 'port0/line0')}"
+    elif action == "daq_write_digital":
+        return f"{step.get('line', 'port0/line0')} = {'High' if step.get('state') else 'Low'}"
     elif action == "go_home":
         return ""
     elif action == "loop_start":
@@ -973,6 +1000,33 @@ def render_step_params(step, idx):
     elif action == "tare_scale":
         _num(st, "待機時間(秒)", step, idx, "delay", float, 1.0,
              min_value=0.1, max_value=10.0, step=0.1)
+
+    elif action == "daq_read_analog":
+        _text(st, "チャンネル（例: ai0）", step, idx, "channel")
+        c1, c2 = st.columns(2)
+        _num(c1, "サンプル数（平均）", step, idx, "samples", int, 100,
+             min_value=1, max_value=100000)
+        _num(c2, "周波数 (Hz)", step, idx, "rate_hz", float, 1000.0,
+             min_value=1.0, max_value=100000.0, step=100.0)
+        c3, c4 = st.columns(2)
+        _select(c3, "レンジ ±V", step, idx, "v_range", [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0], 10.0)
+        _select(c4, "配線", step, idx, "terminal", ["default", "rse", "nrse", "diff"], "default")
+
+    elif action == "daq_write_analog":
+        _text(st, "チャンネル（例: ao0）", step, idx, "channel")
+        _num(st, "電圧 (V)", step, idx, "voltage", float, 0.0,
+             min_value=-10.0, max_value=10.0, step=0.1)
+        st.caption("config.yaml の daq_ao_channels に載せたチャンネルだけ出力できます。"
+                   "実行終了時に 0 V に戻ります")
+
+    elif action == "daq_read_digital":
+        _text(st, "ライン（例: port0/line0）", step, idx, "line")
+
+    elif action == "daq_write_digital":
+        _text(st, "ライン（例: port0/line0）", step, idx, "line")
+        _check(st, "High にする（OFF で Low）", step, idx, "state", False)
+        st.caption("config.yaml の daq_do_lines に載せたラインだけ出力できます。"
+                   "実行終了時に Low に戻ります")
 
     elif action == "loop_start":
         _num(st, "繰り返し回数", step, idx, "count", int, 10, min_value=1, max_value=1000)

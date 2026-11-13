@@ -188,6 +188,8 @@ class ExperimentLogger:
         nominal_time = result.get("nominal_time_s")
         focus_position = result.get("focus_position")
         focus_converged = result.get("focus_converged")
+        voltage = result.get("voltage")
+        digital_state = result.get("digital_state")
         # 撮影ステップが「画像なし」で成功扱いになるのを防ぐ（executor も例外に
         # するが、戻り値だけを渡す呼び出し側があっても記録を誤らせない）
         if status == "ok" and "image_path" in result and not image_path:
@@ -210,6 +212,11 @@ class ExperimentLogger:
             "image_path": image_path or "",
             "focus_position": str(focus_position) if isinstance(focus_position, int) else "",
             "focus_converged": ("" if focus_converged is None else ("True" if focus_converged else "False")),
+            # DAQ: 読み取り値と、出力ステップで設定した値（再現に必要なので両方残す）
+            "daq_channel": result.get("daq_channel") or "",
+            "voltage_v": (f"{voltage:.6f}" if isinstance(voltage, (int, float))
+                          and not isinstance(voltage, bool) else ""),
+            "digital_state": "" if digital_state is None else ("1" if digital_state else "0"),
             "error": error or "",
         }
         self.records.append(record)
@@ -264,7 +271,7 @@ class ExperimentLogger:
         fields = ["timestamp", "mode", "elapsed_s", "step_index", "total_steps",
                   "iteration", "action", "robot_id", "status", "duration_s",
                   "weight_g", "nominal_time_s", "image_path", "focus_position",
-                  "focus_converged", "error"]
+                  "focus_converged", "daq_channel", "voltage_v", "digital_state", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -390,6 +397,10 @@ class ExperimentLogger:
                 note = f"lens {r['focus_position']}"
                 if r.get("focus_converged") == "False":
                     note += " (not converged)"
+            elif r.get("voltage_v"):
+                note = f"{r['daq_channel']} {float(r['voltage_v']):+.5f} V"
+            elif r.get("digital_state"):
+                note = f"{r['daq_channel']} {'High' if r['digital_state'] == '1' else 'Low'}"
             elif r["error"]:
                 note = f"⚠️ {r['error']}"
             state = "✅" if r["status"] == "ok" else "❌"
