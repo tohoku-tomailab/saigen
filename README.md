@@ -31,9 +31,19 @@ https://youtu.be/5X2-4LuQfns
 
 ## Repository layout
 
-The repository has five parts: control code (`src/`), fixture design data (`cad/`),
-procedures for setting up and modifying the system (`docs/`), a knowledge base
-(`knowledge/`) and example experiments (`examples/`).
+The repository's main resources are organized into five parts:
+
+| Part | Folder |
+|---|---|
+| Control code for the instruments | [`src/`](src/) |
+| Fixture design data (CAD design bank) | [`cad/`](cad/) |
+| Procedures for setting up and modifying the system | [`docs/`](docs/) |
+| Knowledge base: what bringing each instrument into the cell taught us | [`knowledge/`](knowledge/) |
+| Example experiments | [`examples/`](examples/) |
+
+Beside these, `tests/` and `.github/` hold the automated tests and their CI, and
+`detection/` is an optional object-detection module kept apart for licensing
+reasons (see below). In detail:
 
 | Path | Contents |
 |---|---|

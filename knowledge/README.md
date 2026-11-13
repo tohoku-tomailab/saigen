@@ -17,7 +17,7 @@ specifications.
 | Note | Instrument | Connection | What it covers |
 |---|---|---|---|
 | [`maxarm-commissioning.md`](maxarm-commissioning.md) | Hiwonder MaxArm (suction arm) | USB serial | Order of work, numbers measured on the arm, why the reachable envelope is not the workspace box, recovery |
-| [`mg400-commissioning.md`](mg400-commissioning.md) | Dobot MG400 (desktop arm) | TCP/IP | Observation-only scope, replies that differ from the vendor documents, order of work for the bench stages, what an interruption does |
+| [`mg400-commissioning.md`](mg400-commissioning.md) | Dobot MG400 (desktop arm) | TCP/IP | Read-only observation, supervised jog and stop trials, the staged order of work towards flows, replies that differ from the vendor documents, what an interruption does |
 | [`keithley2002-commissioning.md`](keithley2002-commissioning.md) | Keithley 2002 digital multimeter | GPIB | Order of work, what the firmware accepted, manual facts that shaped the driver, interruption and clean-up rules |
 | [`li5640-commissioning.md`](li5640-commissioning.md) | NF LI5640 lock-in amplifier | GPIB | Read-only scope, what the firmware answered, defects found by review, the internal-oscillator bench test |
 | [`dso1000-commissioning.md`](dso1000-commissioning.md) | Agilent DSO1014A oscilloscope | USB | Read-only scope, reply forms, the hang on return-to-local over USB, defects found on the bench and by review |
@@ -30,10 +30,11 @@ Rules for AI coding agents working in this repository are in
 Write one note per instrument, named `<instrument>-commissioning.md`, when the
 instrument is first brought up (step 8 of
 [`docs/adding-an-instrument.md`](../docs/adding-an-instrument.md)), and keep
-adding to it as the bench teaches more. Use the sections the existing notes
-share:
+adding to it as the bench teaches more. Use the following topics as a
+checklist, adapting the headings to the instrument:
 
-1. **Configuration checked**: model, firmware, interface, operating system, date.
+1. **Configuration checked**: model, firmware, interface, operating system, date
+   (write `not recorded` for what is unknown).
 2. **Scope chosen**: what the driver does and what it deliberately does not.
 3. **Order of work that worked**: the steps in the order they succeeded.
 4. **What the unit answered**: replies as observed, and where they differ from the manual.
@@ -41,8 +42,12 @@ share:
 6. **Open points**: what is not yet verified.
 7. **Things not to do**.
 
-Record only what was observed, and say on which unit. Do not include serial
-numbers, addresses, API keys or other laboratory-specific values. Never write a
-measured value that is not backed by a record.
+Keep apart what was observed on the unit, what comes from the manual, what a
+review found, what is inferred and what is not yet verified. Give measured
+values with their conditions and the unit they were taken on. Do not include
+secrets or identifiers of the laboratory's equipment (API keys, serial numbers,
+network addresses). Never write a measured value that is not backed by a
+record. Writing a note does not authorise running the instrument: say so in
+the note when nothing has run on real hardware yet.
 
 The notes are licensed under CC BY 4.0, like the documentation in `docs/`.

@@ -345,6 +345,8 @@ as in the CI.
                                    restore once, result decides the run (§2)
 [ ] src/gui/app.py (optional)      ACTION_CONFIG, CATEGORIES, two elif branches
 [ ] docs/experimental-flow.md, src/devices/README.md, docs/bom.md, docs/setup.md
+[ ] knowledge/<name>-commissioning.md + one row in knowledge/README.md
+                                   (state it if nothing ran on real hardware)
 [ ] pytest, --validate-only, --mock all green
 ```
 

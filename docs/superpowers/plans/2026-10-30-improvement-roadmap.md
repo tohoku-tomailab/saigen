@@ -110,7 +110,7 @@ Phase 0 の完了条件: 全項目のテストが CI で緑。`python -m pytest 
 | 1d | **監視 API と安全インターロックを区別する** | `src/monitoring/dashboard/launch_sensor_dashboard.py:1121-1123` の `/is_safe` と `/api/is_safe` は常に `{"safe": true}`。`gui/runner.py:179-227` `check_is_safe` は到達不能でも通す。CLI・CSV にはゲートが無い | 第一段（D3）: 新名称（例 `/api/sensor_status`）を追加し、**`/is_safe` と `/api/is_safe` は互換エンドポイントとして残して廃止予定を記す**。`check_is_safe` の利用者も移行。表現を直す対象は次の 4 か所: `src/gui/README.md:45,61`、`docs/setup.md:250`（英語 "safety gate"）、GUI の文字列「安全確認ゲート」（`gui/app.py:529,660`）、`gui/runner.py` のコメントと docstring（`:168,675` ほか、`safety gate` / `interlock`）。第二段（別フェーズ）: 閾値を `src/monitoring/config.yaml` に持つ本物のインターロック。開始拒否だけでなく実行中の検知と通信断時の挙動を定義 | 第一段: 新旧エンドポイントの両方がテストで通る。上記 4 か所の表現が直っていることを列挙して確認（文字列 0 件を受入にしない）。第二段: 閾値超過で開始拒否・実行中中断・通信断時の既定の各テスト | 第一段 S〜M、第二段は別設計 |
 | 1f | **Picus2 の中断・故障経路（ワーカーと接続の寿命まで）** | USB の `flush/write/readline` は async 関数内で同期実行され（`picus2_controller.py:320-328`、`readline` は `:369`）、イベントループを止め得る。シリアル生成（`:192`）に `write_timeout` が無く、pyserial の `flush()` は `write_timeout` の対象でもない。Bluetooth の END 待ちは渡された timeout を使わない。接続後に通知の設定が失敗すると、`self.client = None` にしてから例外を返すので、接続された BleakClient が参照を失う（`:239-262`）。その後の `disconnect()` は True を返すが何も切断しない（`:285-292`。v3 再評価で fake により確認）。初期化の再試行（`lab_robot.py:232`）は motor 設定に失敗した旧インスタンスを切断せずに置き換える。吸引・分注は公称時間の待機で完了扱い。v3 再評価では、同期 I/O をワーカースレッドに移しただけの fake で `FLUSH 開始 → キャンセルが呼出し側へ返る → WRITE` が起きた | **独立にできる部分**: (1) 接続失敗の経路では、BleakClient を捨てる前に `disconnect()` する。(2) 再試行で旧インスタンスを `await disconnect()`（`:265`。`close()` は無い）で切断する。(3) timeout を Bluetooth 経路へ渡し、シリアルに `write_timeout` を付ける。`flush()` には上限が無いので、送信前の `flush()` をやめるか、上限付きの方法に替える。(4) 同期 I/O はワーカースレッドで実行し、**キャンセルの印を各 write の直前に同じロックの中で確かめる**。キャンセル後は送らない。(5) **ワーカーの所有**: ワーカーが残っている controller は新しい操作を拒否する。再試行・再接続は、旧ワーカーが終わるか、旧接続のポートを閉じて旧ワーカーの送信が失敗することを確かめてから行う。(6) 終了処理（切断）に時間上限を付ける。**C2・C5 に依存する部分**: 「公称時間の待機」を記録上「完了確認なし」として、アームの停止確認とは別に記録する | 接続失敗と再試行で、fake client の `disconnect` が 1 回呼ばれ、`is_connected` が False になる（`disconnect()` の戻り値ではなく、接続が解放されたことを検査）。USB と Bluetooth の両方。timeout が伝わる。`flush` か `write` で止めた fake で、キャンセルが時間上限内に返り、**キャンセルの後に WRITE が 1 件も出ない**。残存ワーカーがある間の新しい操作と再接続が拒否される | M〜L |
 
-Phase 1 の完了条件: 0-1 の各ケースが表の期待どおりになる。全テスト緑。0-9 の表どおりに examples の `--mock` が通る／拒否される。人が bench で 1a（回転と go_home の拒否、`move_z` と `move_slider` の送信値）と 1b（Stop、停止後の新操作の拒否、再開）を確認した記録を `docs/*-commissioning.md` に残す。
+Phase 1 の完了条件: 0-1 の各ケースが表の期待どおりになる。全テスト緑。0-9 の表どおりに examples の `--mock` が通る／拒否される。人が bench で 1a（回転と go_home の拒否、`move_z` と `move_slider` の送信値）と 1b（Stop、停止後の新操作の拒否、再開）を確認した記録を `knowledge/*-commissioning.md` に残す。
 
 ---
 
@@ -219,7 +219,7 @@ Phase 4: 随時
 - 完了報告の前に `python -m pytest tests/ src/monitoring/tests/ src/imaging/tests/ -q` と、0-9 の表どおりの `--validate-only` / `--mock` を実行する。
 - `src/devices/safety/` を編集する項目（0-6、1a、1b、1c、1f、3h、W3）は着手前に人の承認を得る。limits を緩める方向の変更は一切行わない。拒否が増える変更は CHANGELOG と README に明記する。
 - 新しい拒否は必ず `ValidationError` の派生で投げ、副作用の前に置く（C1）。
-- 実機を動かす確認（1a の回転・go_home・`move_z` の送信値、1b の Stop）は人が行い、結果を `docs/*-commissioning.md` に書く。AI は `--mock` までで止まる。
+- 実機を動かす確認（1a の回転・go_home・`move_z` の送信値、1b の Stop）は人が行い、結果を `knowledge/*-commissioning.md` に書く。AI は `--mock` までで止まる。
 - 各項目の実装手順書は着手時に `docs/superpowers/plans/YYYY-MM-DD-<id>-<slug>.md` として書く。共通契約 C1〜C6 は `docs/superpowers/specs/YYYY-MM-DD-<id>-<slug>.md` に 1 件 1 ファイル。
 
 ## 今回は含めないもの
