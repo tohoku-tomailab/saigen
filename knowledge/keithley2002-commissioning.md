@@ -4,9 +4,9 @@ Field notes from bringing a Keithley 2002 digital multimeter into the SAIGEN
 cell (October 2026). They complement the reference material in
 [`src/devices/keithley2002/README.md`](../src/devices/keithley2002/README.md)
 (command sequence, driver) and the procedure in
-[`setup.md` §10](setup.md#10-keithley-2002-digital-multimeter-optional).
+[`docs/setup.md` §10](../docs/setup.md#10-keithley-2002-digital-multimeter-optional).
 The general implementation rules that came out of this work are in
-[`adding-an-instrument.md`](adding-an-instrument.md) (§2 and §6).
+[`docs/adding-an-instrument.md`](../docs/adding-an-instrument.md) (§2 and §6).
 
 Configuration checked: one MODEL 2002 (firmware A09 /A02), one NI GPIB-USB-HS+
 adapter, Windows 11, NI-488.2 with NI-VISA, PyVISA 1.16, on 2026-10-15. Only
@@ -31,7 +31,7 @@ authorise an agent to open the hardware.
    VISA library was present, and PyVISA had no backend to load. Installing
    NI-488.2 with NI-VISA (administrator rights, a reboot) fixed that: class
    "GPIB", status OK. Other vendors and the PyVISA-py route behave
-   differently; see `setup.md` §10.
+   differently; see `docs/setup.md` §10.
 2. **List GPIB resources only:**
    `pyvisa.ResourceManager().list_resources("GPIB?*::INSTR")`. The default query
    also returns serial (ASRL) resources. Listing is not opening, but on this
@@ -134,7 +134,7 @@ stronger (planned, not done); it would still not explain the change.
 Each item below was a real defect found by review during this work and is now
 covered by a regression test in `tests/test_keithley2002.py`. They apply to any
 instrument whose I/O blocks; the general form is in
-[`adding-an-instrument.md`](adding-an-instrument.md) §2.
+[`docs/adding-an-instrument.md`](../docs/adding-an-instrument.md) §2.
 
 - **Ctrl+C stops the robots first.** If the DMM is still initialising (a GPIB
   reply pending), `ExperimentSession.add_shared()` does not wait for it: it

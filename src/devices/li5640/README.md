@@ -198,7 +198,7 @@ finally:
 ```
 
 What was confirmed on the instrument and what was not (the replies of firmware 1.60, the
-defects found by review, the open points) are in `docs/li5640-commissioning.md`.
+defects found by review, the open points) are in `knowledge/li5640-commissioning.md`.
 
 Connection check (run by a human; read-only, and OTYP is restored):
 

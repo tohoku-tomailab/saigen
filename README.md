@@ -31,6 +31,20 @@ https://youtu.be/5X2-4LuQfns
 
 ## Repository layout
 
+The repository's main resources are organized into five parts:
+
+| Part | Folder |
+|---|---|
+| Control code for the instruments | [`src/`](src/) |
+| Fixture design data (CAD design bank) | [`cad/`](cad/) |
+| Procedures for setting up and modifying the system | [`docs/`](docs/) |
+| Knowledge base: what bringing each instrument into the cell taught us | [`knowledge/`](knowledge/) |
+| Example experiments | [`examples/`](examples/) |
+
+Beside these, `tests/` and `.github/` hold the automated tests and their CI, and
+`detection/` is an optional object-detection module kept apart for licensing
+reasons (see below). In detail:
+
 | Path | Contents |
 |---|---|
 | `src/agent/` | AI agent that generates JSON experimental flows from natural language (Gemini API or any OpenAI-compatible endpoint) and the preset flows |
@@ -42,7 +56,8 @@ https://youtu.be/5X2-4LuQfns
 | `src/imaging/` | Appearance-imaging system: NEEWER RGB62 light + Logitech C920n camera control, white/red/green/blue capture sequence, cropped-image comparison and depth-direction transmitted-light profiles (paper Figure 6) |
 | `detection/` | Object detection based on YOLOv8 â€” **kept separate for licensing reasons, see below** |
 | `cad/` | CAD design bank of 3D-printable experimental components (STL + editable Fusion 360 sources) |
-| `docs/` | Bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument, MaxArm and MG400 commissioning notes |
+| `docs/` | Procedures: bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument |
+| `knowledge/` | Knowledge base: what bringing each instrument into the cell taught us (order of work, replies that differed from the manual, defects found, open points). Index in [`knowledge/README.md`](knowledge/README.md) |
 | `examples/zif8/` | Sample experimental flows of the ZIF-8 demonstration (JSON equivalents of the spreadsheet sequence) and monitoring CSV templates |
 | `examples/microscope/` | Example flow that photographs the product with the USB digital microscope (`capture_microscope`) |
 | `examples/maxarm/` | Example suction pick-and-place flow for the optional Hiwonder MaxArm (robot 4) |
@@ -138,7 +153,7 @@ JSON equivalents of the spreadsheet sequence the paper's batches were run with â
   (Copyright 2017 Luis Mesas, MIT License) with a small patch in
   `src/devices/dobot/pydobot_patch.py`. The vendor SDK (DobotDll) is **not** used and
   is not included in this repository.
-- **CAD models and documentation** (`cad/`, `docs/`): Creative Commons Attribution 4.0
+- **CAD models and documentation** (`cad/`, `docs/`, `knowledge/`): Creative Commons Attribution 4.0
   (CC BY 4.0, https://creativecommons.org/licenses/by/4.0/); the CAD-specific notes are in
   [`cad/README.md`](cad/README.md).
 - **Object detection** (`detection/`): depends on [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics),

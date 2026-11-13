@@ -4,9 +4,9 @@ Field notes from bringing an NF LI5640 lock-in amplifier into the SAIGEN cell
 (October 2026). They complement the reference material in
 [`src/devices/li5640/README.md`](../src/devices/li5640/README.md) (commands,
 meaning of the values, what is discarded) and the procedure in
-[`setup.md` §11](setup.md#11-nf-li5640-lock-in-amplifier-optional-read-only).
+[`docs/setup.md` §11](../docs/setup.md#11-nf-li5640-lock-in-amplifier-optional-read-only).
 The general rules that came out of this work are in
-[`adding-an-instrument.md`](adding-an-instrument.md) (§2 and §4).
+[`docs/adding-an-instrument.md`](../docs/adding-an-instrument.md) (§2 and §4).
 
 Configuration checked: one LI5640 (firmware 1.60), one NI GPIB-USB-HS+
 adapter, Windows 11, NI-488.2 with NI-VISA, PyVISA 1.16, on 2026-10-16. The

@@ -4,9 +4,9 @@ Field notes from bringing an Agilent DSO1014A oscilloscope into the SAIGEN cell
 (October 2026). They complement the reference material in
 [`src/devices/dso1000/README.md`](../src/devices/dso1000/README.md) (commands,
 items, units, what is discarded) and the procedure in
-[`setup.md` §12](setup.md#12-agilent-1000-series-oscilloscope-optional-read-only).
+[`docs/setup.md` §12](../docs/setup.md#12-agilent-1000-series-oscilloscope-optional-read-only).
 The general rules for new instruments are in
-[`adding-an-instrument.md`](adding-an-instrument.md).
+[`docs/adding-an-instrument.md`](../docs/adding-an-instrument.md).
 
 Configuration checked: one DSO1014A (firmware 00.04.04) on the rear USB DEVICE
 port, Windows 11, NI-VISA, PyVISA 1.16, on 2026-10-16 and 2026-10-19. A signal

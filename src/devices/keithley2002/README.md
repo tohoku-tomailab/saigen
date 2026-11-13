@@ -95,4 +95,4 @@ the middle of a transfer).
 
 What commissioning on the instrument taught (order of work, the commands firmware A09
 accepted, the unresolved observation about line synchronisation, what not to do) is in
-[`docs/keithley2002-commissioning.md`](../../../docs/keithley2002-commissioning.md).
+[`knowledge/keithley2002-commissioning.md`](../../../knowledge/keithley2002-commissioning.md).

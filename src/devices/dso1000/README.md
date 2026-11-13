@@ -4,7 +4,7 @@ DSO1002A / 1004A / 1012A / 1014A / 1022A / 1024A (2 or 4 channels). SAIGEN talks
 through the rear USB DEVICE port (USBTMC) with PyVISA over a VISA library (NI-VISA etc.).
 Setup is in `docs/setup.md` §12. The commands were checked against the "Agilent 1000 Series
 Oscilloscopes Programmer's Guide" (edition 011.04.00.04.06, April 2010); "p.n" below are its
-pages. What commissioning the first unit taught is in `docs/dso1000-commissioning.md`.
+pages. What commissioning the first unit taught is in `knowledge/dso1000-commissioning.md`.
 
 ## Policy: set-up on the front panel, SAIGEN only reads automatic measurements
 

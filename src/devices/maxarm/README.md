@@ -318,7 +318,7 @@ first either way. Alternatives: interrupt the boot with Thonny, or re-flash
 
 What commissioning a real arm taught (safe order of work, measured timings,
 the reachable envelope, things not to do, recovery) is collected in
-[`docs/maxarm-commissioning.md`](../../../docs/maxarm-commissioning.md).
+[`knowledge/maxarm-commissioning.md`](../../../knowledge/maxarm-commissioning.md).
 
 ## Teaching positions (`teach.py`, human-run)
 

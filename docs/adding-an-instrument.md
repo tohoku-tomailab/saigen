@@ -13,17 +13,17 @@ GPIB, was later added by following them: its action is `measure_dmm`, its
 setting `dmm_resource`, and its code (`src/devices/keithley2002/`,
 `SharedDevices.measure_dmm`, `tests/test_keithley2002.py`) is the worked
 example for an instrument whose I/O blocks; what its commissioning taught is in
-[`keithley2002-commissioning.md`](keithley2002-commissioning.md). The NF LI5640
+[`knowledge/keithley2002-commissioning.md`](../knowledge/keithley2002-commissioning.md). The NF LI5640
 lock-in amplifier (`src/devices/li5640/`, `measure_lockin`,
 `tests/test_li5640.py`) followed next, as a read-only instrument whose values
 mean what its front panel says; its notes are in
-[`li5640-commissioning.md`](li5640-commissioning.md). The Agilent 1000 series
+[`knowledge/li5640-commissioning.md`](../knowledge/li5640-commissioning.md). The Agilent 1000 series
 oscilloscope (`src/devices/dso1000/`, `measure_scope`, `tests/test_dso1000.py`)
 is the third such instrument and the first over USB; it shows how to record
 several quantities per step (JSON columns keyed by item) and how to refuse
 instrument states whose meaning the code cannot check (X-Y time base, non-edge
 trigger) instead of recording ambiguous values; its notes are in
-[`dso1000-commissioning.md`](dso1000-commissioning.md). The LI5640's internal
+[`knowledge/dso1000-commissioning.md`](../knowledge/dso1000-commissioning.md). The LI5640's internal
 oscillator (`set_lockin_oscillator`, `tests/test_li5640_oscillator.py`) is the
 first output SAIGEN *writes* to an instrument; the rules it needed are under
 "Instruments that write an output" in §2, and its bench test is §8 of the
@@ -323,6 +323,9 @@ as in the CI.
   `SharedDevices` row.
 - `docs/bom.md`: the instrument, with model and interface.
 - `docs/setup.md`: how to connect it and find its port.
+- `knowledge/<instrument>-commissioning.md`: what bringing the instrument up
+  taught (order of work, replies that differed from the manual, defects, open
+  points), and one row in the table of `knowledge/README.md`.
 - `src/agent/llm_service.py`: the action list given to the flow-generating
   LLM. Add the action there if the agent should be able to use it; leave it out
   if it should not.
@@ -342,6 +345,8 @@ as in the CI.
                                    restore once, result decides the run (§2)
 [ ] src/gui/app.py (optional)      ACTION_CONFIG, CATEGORIES, two elif branches
 [ ] docs/experimental-flow.md, src/devices/README.md, docs/bom.md, docs/setup.md
+[ ] knowledge/<name>-commissioning.md + one row in knowledge/README.md
+                                   (state it if nothing ran on real hardware)
 [ ] pytest, --validate-only, --mock all green
 ```
 

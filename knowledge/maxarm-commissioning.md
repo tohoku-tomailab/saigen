@@ -2,7 +2,7 @@
 
 Field notes from bringing a MaxArm into the SAIGEN cell (September 2026). They
 complement the reference material in [`src/devices/maxarm/README.md`](../src/devices/maxarm/README.md)
-(protocol, driver, firmware) and the procedure in [`setup.md` §9](setup.md#9-maxarm-hiwonder-robot-optional).
+(protocol, driver, firmware) and the procedure in [`docs/setup.md` §9](../docs/setup.md#9-maxarm-hiwonder-robot-optional).
 Everything here was observed on one arm (MicroPython 1.12 build, 2020-10-20);
 another unit may differ in details, so treat the numbers as expectations to
 re-check, not as specifications.
