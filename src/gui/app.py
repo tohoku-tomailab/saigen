@@ -145,12 +145,36 @@ ACTION_CONFIG = {
     # DAQ（NI USB-6351）
     "daq_read_analog": {
         "icon": "📈", "label": "電圧測定 (DAQ)", "category": "daq",
-        "defaults": {"channel": "ai0", "samples": 100, "rate_hz": 1000.0,
-                     "v_range": 10.0, "terminal": "default"}
+        "defaults": {"channel": "ai0", "samples": 100, "rate_hz": 1000.0}
+    },
+    "daq_acquire": {
+        "icon": "〰️", "label": "波形取り込み (DAQ)", "category": "daq",
+        "defaults": {"channels": ["ai0"], "rate_hz": 1000.0, "duration_s": 1.0}
+    },
+    "daq_start_logging": {
+        "icon": "⏺️", "label": "連続記録 開始 (DAQ)", "category": "daq",
+        "defaults": {"channels": ["ai0"], "rate_hz": 100.0}
+    },
+    "daq_stop_logging": {
+        "icon": "⏹️", "label": "連続記録 終了 (DAQ)", "category": "daq",
+        "defaults": {}
+    },
+    "daq_wait_analog": {
+        "icon": "⏳", "label": "電圧の条件待ち (DAQ)", "category": "daq",
+        "defaults": {"channel": "ai0", "threshold": 1.0, "condition": "above", "timeout_s": 60.0}
     },
     "daq_write_analog": {
         "icon": "🎚️", "label": "電圧出力 (DAQ)", "category": "daq",
         "defaults": {"channel": "ao0", "voltage": 0.0}
+    },
+    "daq_generate_waveform": {
+        "icon": "🌊", "label": "波形出力 (DAQ)", "category": "daq",
+        "defaults": {"channel": "ao0", "waveform": "sine", "frequency_hz": 10.0,
+                     "amplitude_v": 1.0, "offset_v": 1.0, "duration_s": 1.0}
+    },
+    "daq_stop_output": {
+        "icon": "🛑", "label": "出力停止 (DAQ)", "category": "daq",
+        "defaults": {"channel": "ao0"}
     },
     "daq_read_digital": {
         "icon": "🔎", "label": "デジタル入力 (DAQ)", "category": "daq",
@@ -159,6 +183,26 @@ ACTION_CONFIG = {
     "daq_write_digital": {
         "icon": "🔌", "label": "デジタル出力 (DAQ)", "category": "daq",
         "defaults": {"line": "port0/line0", "state": False}
+    },
+    "daq_pulse_digital": {
+        "icon": "⚡", "label": "デジタルパルス (DAQ)", "category": "daq",
+        "defaults": {"line": "port0/line0", "duration_s": 0.5, "state": True}
+    },
+    "daq_wait_digital": {
+        "icon": "⏳", "label": "デジタルの条件待ち (DAQ)", "category": "daq",
+        "defaults": {"line": "port0/line0", "state": True, "timeout_s": 60.0}
+    },
+    "daq_count_edges": {
+        "icon": "🔢", "label": "エッジカウント (DAQ)", "category": "daq",
+        "defaults": {"terminal": "pfi0", "duration_s": 1.0, "edge": "rising"}
+    },
+    "daq_measure_frequency": {
+        "icon": "📶", "label": "周波数測定 (DAQ)", "category": "daq",
+        "defaults": {"terminal": "pfi0", "min_hz": 1.0, "max_hz": 100000.0, "timeout_s": 5.0}
+    },
+    "daq_generate_pulses": {
+        "icon": "🎛️", "label": "パルス列 / PWM (DAQ)", "category": "daq",
+        "defaults": {"counter": "ctr0", "frequency_hz": 10.0, "duty_cycle": 0.5, "duration_s": 1.0}
     },
     # ループ制御
     "loop_start": {
@@ -188,7 +232,11 @@ CATEGORIES = {
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
     "maxarm": ("🧲 MaxArm", ["suction"]),
     "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale"]),
-    "daq": ("🔌 DAQ", ["daq_read_analog", "daq_write_analog", "daq_read_digital", "daq_write_digital"]),
+    "daq": ("🔌 DAQ", ["daq_read_analog", "daq_acquire", "daq_start_logging", "daq_stop_logging",
+                      "daq_wait_analog", "daq_write_analog", "daq_generate_waveform",
+                      "daq_stop_output", "daq_read_digital", "daq_write_digital",
+                      "daq_pulse_digital", "daq_wait_digital", "daq_count_edges",
+                      "daq_measure_frequency", "daq_generate_pulses"]),
     "utility": ("⚙️ その他", ["wait"]),
     "loop": ("🔄 ループ", ["loop_start"]),  # loop_endはloop_start追加時に自動追加
 }
@@ -840,13 +888,47 @@ def get_param_summary(step):
     elif action == "tare_scale":
         return f"待機: {step.get('delay', 1.0)}秒"
     elif action == "daq_read_analog":
-        return f"{step.get('channel', 'ai0')} ±{step.get('v_range', 10.0)}V x{step.get('samples', 100)}"
+        return f"{step.get('channel', 'ai0')} x{step.get('samples', 100)}"
+    elif action in ("daq_acquire", "daq_start_logging"):
+        text = f"{', '.join(step.get('channels') or [])} @ {step.get('rate_hz', 1000.0):g} Hz"
+        if action == "daq_acquire":
+            text += f" x {step.get('duration_s', 1.0):g} s"
+            if step.get("trigger"):
+                text += f" (trigger {step['trigger']})"
+        return text
+    elif action == "daq_stop_logging":
+        return ""
+    elif action == "daq_wait_analog":
+        return (f"{step.get('channel', 'ai0')} {'>' if step.get('condition', 'above') == 'above' else '<'} "
+                f"{step.get('threshold', 0.0):g}（最大 {step.get('timeout_s', 60.0):g} 秒）")
     elif action == "daq_write_analog":
         return f"{step.get('channel', 'ao0')} = {step.get('voltage', 0.0)} V"
+    elif action == "daq_generate_waveform":
+        tail = f" x {step['duration_s']:g} s" if step.get("duration_s") else "（継続）"
+        return (f"{step.get('channel', 'ao0')} {step.get('waveform', 'sine')} "
+                f"{step.get('frequency_hz', 0.0):g} Hz, {step.get('offset_v', 0.0):g} ± "
+                f"{step.get('amplitude_v', 0.0):g} V{tail}")
+    elif action == "daq_stop_output":
+        return f"{step.get('channel', '')}"
     elif action == "daq_read_digital":
         return f"{step.get('line', 'port0/line0')}"
     elif action == "daq_write_digital":
         return f"{step.get('line', 'port0/line0')} = {'High' if step.get('state') else 'Low'}"
+    elif action == "daq_pulse_digital":
+        return (f"{step.get('line', 'port0/line0')} {'High' if step.get('state', True) else 'Low'} "
+                f"x {step.get('duration_s', 0.0):g} s")
+    elif action == "daq_wait_digital":
+        return (f"{step.get('line', 'port0/line0')} = {'High' if step.get('state', True) else 'Low'}"
+                f"（最大 {step.get('timeout_s', 60.0):g} 秒）")
+    elif action == "daq_count_edges":
+        return f"{step.get('terminal', 'pfi0')} x {step.get('duration_s', 1.0):g} s"
+    elif action == "daq_measure_frequency":
+        return f"{step.get('terminal', 'pfi0')}"
+    elif action == "daq_generate_pulses":
+        tail = (f" x {step['count']} パルス" if step.get("count") else
+                f" x {step['duration_s']:g} s" if step.get("duration_s") else "（継続）")
+        return (f"{step.get('counter', 'ctr0')} {step.get('frequency_hz', 0.0):g} Hz, "
+                f"duty {step.get('duty_cycle', 0.5):g}{tail}")
     elif action == "go_home":
         return ""
     elif action == "loop_start":
@@ -895,6 +977,63 @@ def _text(container, label, step, idx, param):
     key = _wkey(param, idx)
     container.text_input(label, value=step.get(param) or "", key=key,
                          on_change=_update_step_param, args=(idx, param, key))
+
+
+def _update_optional_param(idx, param, key, empty):
+    """省略できる項目の on_change: 空（``empty``）ならキーごと消し、スキーマの既定に任せる"""
+    step = st.session_state.workflow_data["steps"][idx]
+    value = st.session_state[key]
+    if isinstance(value, str):
+        value = value.strip()
+    if value == empty or value is None:
+        step.pop(param, None)
+    else:
+        step[param] = value
+
+
+def _update_list_param(idx, param, key):
+    """カンマ区切りの入力をリストとして保存する（daq の channels）"""
+    step = st.session_state.workflow_data["steps"][idx]
+    step[param] = [c.strip() for c in st.session_state[key].split(",") if c.strip()]
+
+
+def _list(container, label, step, idx, param):
+    key = _wkey(param, idx)
+    container.text_input(label, value=", ".join(step.get(param) or []), key=key,
+                         on_change=_update_list_param, args=(idx, param, key))
+
+
+def _opt_text(container, label, step, idx, param):
+    """空欄で省略できる文字列"""
+    key = _wkey(param, idx)
+    container.text_input(label, value=step.get(param) or "", key=key,
+                         on_change=_update_optional_param, args=(idx, param, key, ""))
+
+
+def _opt_num(container, label, step, idx, param, kind, **kwargs):
+    """0 で省略できる数値"""
+    key = _wkey(param, idx)
+    container.number_input(label, value=kind(step.get(param) or 0), key=key, min_value=kind(0),
+                           on_change=_update_optional_param, args=(idx, param, key, kind(0)),
+                           **kwargs)
+
+
+_DAQ_AUTO = "信号の設定 / 既定"
+
+
+def _daq_input_options(container, step, idx):
+    """アナログ入力のレンジと配線。「信号の設定 / 既定」はキーを書かず、config.yaml の
+    daq_signals の値（無ければ ±10 V / default）に任せる。"""
+    c1, c2 = container.columns(2)
+    for col, label, param, options in (
+            (c1, "レンジ ±V", "v_range", [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]),
+            (c2, "配線", "terminal", ["default", "rse", "nrse", "diff"])):
+        key = _wkey(param, idx)
+        choices = [_DAQ_AUTO] + options
+        current = step.get(param)
+        col.selectbox(label, options=choices,
+                      index=choices.index(current) if current in options else 0, key=key,
+                      on_change=_update_optional_param, args=(idx, param, key, _DAQ_AUTO))
 
 
 def _toggle_led_level(idx, key):
@@ -1002,31 +1141,127 @@ def render_step_params(step, idx):
              min_value=0.1, max_value=10.0, step=0.1)
 
     elif action == "daq_read_analog":
-        _text(st, "チャンネル（例: ai0）", step, idx, "channel")
+        _text(st, "チャンネル（信号名 / ai0）", step, idx, "channel")
         c1, c2 = st.columns(2)
         _num(c1, "サンプル数（平均）", step, idx, "samples", int, 100,
              min_value=1, max_value=100000)
         _num(c2, "周波数 (Hz)", step, idx, "rate_hz", float, 1000.0,
              min_value=1.0, max_value=100000.0, step=100.0)
-        c3, c4 = st.columns(2)
-        _select(c3, "レンジ ±V", step, idx, "v_range", [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0], 10.0)
-        _select(c4, "配線", step, idx, "terminal", ["default", "rse", "nrse", "diff"], "default")
+        _daq_input_options(st, step, idx)
+
+    elif action in ("daq_acquire", "daq_start_logging"):
+        _list(st, "チャンネル（カンマ区切り。信号名 / ai0）", step, idx, "channels")
+        if action == "daq_acquire":
+            c1, c2 = st.columns(2)
+            _num(c1, "周波数 (Hz/ch)", step, idx, "rate_hz", float, 1000.0,
+                 min_value=1.0, max_value=1250000.0, step=100.0)
+            _num(c2, "時間 (秒)", step, idx, "duration_s", float, 1.0,
+                 min_value=0.001, max_value=3600.0, step=0.1)
+            _daq_input_options(st, step, idx)
+            c3, c4 = st.columns(2)
+            _opt_text(c3, "開始トリガ（空欄 = すぐ開始。pfi0 など）", step, idx, "trigger")
+            _select(c4, "トリガのエッジ", step, idx, "trigger_edge", ["rising", "falling"], "rising")
+            st.caption("波形は実行フォルダの data/ に CSV で保存されます")
+        else:
+            _num(st, "周波数 (Hz/ch)", step, idx, "rate_hz", float, 100.0,
+                 min_value=0.1, max_value=10000.0, step=10.0)
+            _daq_input_options(st, step, idx)
+            st.caption("「連続記録 終了」か実行終了まで、他のステップの実行中も記録が続きます。"
+                       "記録中は他のアナログ入力ステップは使えません")
+
+    elif action == "daq_stop_logging":
+        st.caption("連続記録を止め、記録した点数を残します")
+
+    elif action == "daq_wait_analog":
+        _text(st, "チャンネル（信号名 / ai0）", step, idx, "channel")
+        c1, c2 = st.columns(2)
+        _select(c1, "条件", step, idx, "condition", ["above", "below"], "above")
+        _num(c2, "しきい値（信号の単位 / V）", step, idx, "threshold", float, 0.0, step=0.1)
+        _num(st, "待つ上限 (秒)", step, idx, "timeout_s", float, 60.0,
+             min_value=0.1, max_value=86400.0, step=1.0)
+        _daq_input_options(st, step, idx)
+        st.caption("上限までに成立しなければフローは止まります（Mock では成立したものとして進みます）")
 
     elif action == "daq_write_analog":
-        _text(st, "チャンネル（例: ao0）", step, idx, "channel")
+        _text(st, "チャンネル（信号名 / ao0）", step, idx, "channel")
         _num(st, "電圧 (V)", step, idx, "voltage", float, 0.0,
              min_value=-10.0, max_value=10.0, step=0.1)
         st.caption("config.yaml の daq_ao_channels に載せたチャンネルだけ出力できます。"
                    "実行終了時に 0 V に戻ります")
 
+    elif action == "daq_generate_waveform":
+        _text(st, "チャンネル（信号名 / ao0）", step, idx, "channel")
+        c1, c2 = st.columns(2)
+        _select(c1, "波形", step, idx, "waveform", ["sine", "square", "triangle", "sawtooth"], "sine")
+        _num(c2, "周波数 (Hz)", step, idx, "frequency_hz", float, 10.0,
+             min_value=0.001, max_value=100000.0, step=1.0)
+        c3, c4 = st.columns(2)
+        _num(c3, "振幅 (V, 片側)", step, idx, "amplitude_v", float, 1.0,
+             min_value=0.0, max_value=10.0, step=0.1)
+        _num(c4, "オフセット (V)", step, idx, "offset_v", float, 0.0,
+             min_value=-10.0, max_value=10.0, step=0.1)
+        _opt_num(st, "出力時間 (秒, 0 = 出力停止か実行終了まで継続)", step, idx, "duration_s", float,
+                 max_value=86400.0, step=0.5)
+        st.caption("オフセット ± 振幅 が daq_ao_min_v..daq_ao_max_v に入っている必要があります")
+
+    elif action == "daq_stop_output":
+        _text(st, "出力（信号名 / ao0 / port0/line0 / ctr0）", step, idx, "channel")
+        st.caption("0 V / Low / パルス列停止 に戻します")
+
     elif action == "daq_read_digital":
-        _text(st, "ライン（例: port0/line0）", step, idx, "line")
+        _text(st, "ライン（信号名 / port0/line0）", step, idx, "line")
 
     elif action == "daq_write_digital":
-        _text(st, "ライン（例: port0/line0）", step, idx, "line")
+        _text(st, "ライン（信号名 / port0/line0）", step, idx, "line")
         _check(st, "High にする（OFF で Low）", step, idx, "state", False)
         st.caption("config.yaml の daq_do_lines に載せたラインだけ出力できます。"
                    "実行終了時に Low に戻ります")
+
+    elif action == "daq_pulse_digital":
+        _text(st, "ライン（信号名 / port0/line0）", step, idx, "line")
+        _num(st, "パルスの長さ (秒)", step, idx, "duration_s", float, 0.5,
+             min_value=0.001, max_value=3600.0, step=0.1)
+        _check(st, "High のパルス（OFF で Low のパルス）", step, idx, "state", True)
+        st.caption("config.yaml の daq_do_lines に載せたラインだけ出力できます")
+
+    elif action == "daq_wait_digital":
+        _text(st, "ライン（信号名 / port0/line0）", step, idx, "line")
+        _check(st, "High を待つ（OFF で Low を待つ）", step, idx, "state", True)
+        _num(st, "待つ上限 (秒)", step, idx, "timeout_s", float, 60.0,
+             min_value=0.1, max_value=86400.0, step=1.0)
+        st.caption("上限までに成立しなければフローは止まります（Mock では成立したものとして進みます）")
+
+    elif action in ("daq_count_edges", "daq_measure_frequency"):
+        _text(st, "入力端子（信号名 / pfi0）", step, idx, "terminal")
+        if action == "daq_count_edges":
+            _num(st, "数える時間 (秒)", step, idx, "duration_s", float, 1.0,
+                 min_value=0.001, max_value=3600.0, step=0.1)
+        else:
+            c1, c2 = st.columns(2)
+            _num(c1, "予想の下限 (Hz)", step, idx, "min_hz", float, 1.0,
+                 min_value=0.001, max_value=10000000.0)
+            _num(c2, "予想の上限 (Hz)", step, idx, "max_hz", float, 100000.0,
+                 min_value=0.001, max_value=10000000.0)
+            _num(st, "信号を待つ上限 (秒)", step, idx, "timeout_s", float, 5.0,
+                 min_value=0.1, max_value=600.0, step=1.0)
+        c3, c4 = st.columns(2)
+        _select(c3, "エッジ", step, idx, "edge", ["rising", "falling"], "rising")
+        _opt_text(c4, "カウンタ（空欄 = 自動。ctr0 など）", step, idx, "counter")
+
+    elif action == "daq_generate_pulses":
+        _text(st, "カウンタ（信号名 / ctr0）", step, idx, "counter")
+        c1, c2 = st.columns(2)
+        _num(c1, "周波数 (Hz)", step, idx, "frequency_hz", float, 10.0,
+             min_value=0.001, max_value=1000000.0, step=1.0)
+        _num(c2, "デューティ比", step, idx, "duty_cycle", float, 0.5,
+             min_value=0.01, max_value=0.99, step=0.05)
+        c3, c4 = st.columns(2)
+        _opt_num(c3, "パルス数 (0 = 指定しない)", step, idx, "count", int, max_value=100000000)
+        _opt_num(c4, "出力時間 (秒, 0 = 指定しない)", step, idx, "duration_s", float,
+                 max_value=86400.0, step=0.5)
+        st.caption("出力端子は ctr0 = PFI12, ctr1 = PFI13, ctr2 = PFI14, ctr3 = PFI15。"
+                   "config.yaml の daq_co_counters に載せたカウンタだけ出力でき、周波数は "
+                   "daq_co_max_hz まで。パルス数と時間はどちらか一方（両方 0 なら継続）")
 
     elif action == "loop_start":
         _num(st, "繰り返し回数", step, idx, "count", int, 10, min_value=1, max_value=1000)

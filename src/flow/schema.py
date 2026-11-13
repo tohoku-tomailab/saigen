@@ -1,7 +1,10 @@
 #jsonの型検証ファイル（validation有）
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import Literal, Union, List, Optional
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from typing import Annotated, Literal, Union, List, Optional
+
+# DAQ のチャンネル名の検査（ハードウェアにも nidaqmx にも依存しない）
+from src.devices.nidaq.policy import check_flow_name
 
 # ==========================================
 # 0. 共通の基底モデル
@@ -527,17 +530,46 @@ class ActionTareScale(_StrictModel):
 # 1.75 個別のアクション定義 (共有デバイス: NI DAQ USB-6351 用)
 # ==========================================
 #
-# チャンネルはデバイス名を付けずに書く（"ai0" / "ao0" / "port0/line0"）。
-# デバイス名（Dev1 など）は config.yaml の shared_devices.daq_device。
-# 出力（daq_write_*）は config.yaml の daq_ao_channels / daq_do_lines に載せた
-# チャンネルだけが実行時（--mock を含む）に許可される。
+# チャンネルは、config.yaml の shared_devices.daq_signals で付けた信号名
+# （"photodiode" など）か、デバイス名を付けない物理名（"ai0" / "ao0" /
+# "port0/line0" / "ctr0" / "pfi0"）で書く。配線（どの端子か、差動か、換算係数）は
+# config.yaml、実験の手順はフロー、と分けるためで、信号名で書いたフローは配線の
+# 違う別の装置でもそのまま使える。デバイス名（Dev1 など）は daq_device。
+#
+# 出力（daq_write_* / daq_pulse_digital / daq_generate_*）は config.yaml の
+# daq_ao_channels / daq_do_lines / daq_co_counters に載せた物理チャンネルだけが
+# 実行時（--mock を含む）に許可される。駆動した出力は実行終了時（中断・エラーを
+# 含む）に 0 V / Low / 停止 に戻る。
+
+def _daq_name(*kinds):
+    """チャンネル欄の検査: その種類の物理名か、信号名の形をしていること。"""
+    def check(value: str) -> str:
+        check_flow_name(value, kinds)
+        return value
+    return AfterValidator(check)
+
+
+DaqAiName = Annotated[str, _daq_name("ai")]
+DaqAoName = Annotated[str, _daq_name("ao")]
+DaqLineName = Annotated[str, _daq_name("line")]
+DaqCounterName = Annotated[str, _daq_name("counter")]
+DaqTerminalName = Annotated[str, _daq_name("terminal")]
+DaqOutputName = Annotated[str, _daq_name("ao", "line", "counter")]
+
+DaqVRange = Optional[Literal[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]]
+DaqTerminalConfig = Optional[Literal["default", "rse", "nrse", "diff"]]
+_V_RANGE_DOC = ("入力レンジ ±v_range (V)。信号が収まる最小のレンジが最も分解能が高い。"
+                "省略時は信号の設定、無ければ 10")
+_TERMINAL_DOC = ("配線方式: rse = GND 基準シングルエンド / nrse / diff = 差動 / default = デバイス既定。"
+                 "省略時は信号の設定、無ければ default")
+
 
 class ActionDaqReadAnalog(_StrictModel):
     """
     DAQ のアナログ入力 1 チャンネルの電圧を読む（samples 回の平均）
-    SharedDevices.daq_read_analog(channel, samples, rate_hz, v_range, terminal) に対応
 
-    測定値は measurements.csv の voltage_v 列に記録される。
+    測定値は measurements.csv の voltage_v 列に記録される。信号に換算係数
+    （scale / offset / unit）があれば、換算値が daq_value / daq_unit 列にも入る。
 
     Note:
         共有デバイスのため、robot_idは不要です。
@@ -546,10 +578,9 @@ class ActionDaqReadAnalog(_StrictModel):
         ...,
         description="アクション識別子: DAQ アナログ入力"
     )
-    channel: str = Field(
+    channel: DaqAiName = Field(
         ...,
-        pattern=r"^ai\d{1,2}$",
-        description="アナログ入力チャンネル（例: ai0。USB-6351 は ai0-ai15）"
+        description="アナログ入力（信号名、または ai0-ai15）"
     )
     samples: int = Field(
         default=100,
@@ -563,14 +594,8 @@ class ActionDaqReadAnalog(_StrictModel):
         le=100000.0,
         description="サンプリング周波数 (Hz)。samples / rate_hz 秒かけて取り込む"
     )
-    v_range: Literal[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0] = Field(
-        default=10.0,
-        description="入力レンジ ±v_range (V)。信号が収まる最小のレンジが最も分解能が高い"
-    )
-    terminal: Literal["default", "rse", "nrse", "diff"] = Field(
-        default="default",
-        description="配線方式: rse = GND 基準シングルエンド / nrse / diff = 差動 / default = デバイス既定"
-    )
+    v_range: DaqVRange = Field(default=None, description=_V_RANGE_DOC)
+    terminal: DaqTerminalConfig = Field(default=None, description=_TERMINAL_DOC)
 
     @model_validator(mode="after")
     def _acquisition_time_bounded(self):
@@ -579,10 +604,177 @@ class ActionDaqReadAnalog(_StrictModel):
         return self
 
 
+class ActionDaqAcquire(_StrictModel):
+    """
+    DAQ のアナログ入力（複数可）の波形をハードウェアタイミングで取り込み、CSV に保存する
+
+    rate_hz × duration_s 点を全チャンネル同時刻で取り込む。trigger を指定すると、
+    その端子のデジタルエッジで取り込みを開始する。保存先は実行フォルダの data/
+    （measurements.csv の data_path 列）。1 チャンネルのときは平均が voltage_v 列にも入る。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_acquire"] = Field(
+        ...,
+        description="アクション識別子: DAQ 波形取り込み"
+    )
+    channels: List[DaqAiName] = Field(
+        ...,
+        min_length=1,
+        max_length=16,
+        description="アナログ入力のリスト（信号名、または ai0-ai15）"
+    )
+    rate_hz: float = Field(
+        default=1000.0,
+        gt=0.0,
+        le=1250000.0,
+        description="チャンネルあたりのサンプリング周波数 (Hz)。1 ch は 1.25 MHz まで、"
+                    "複数 ch は合計 1 MHz まで"
+    )
+    duration_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=3600.0,
+        description="取り込み時間 (秒)"
+    )
+    v_range: DaqVRange = Field(default=None, description=_V_RANGE_DOC)
+    terminal: DaqTerminalConfig = Field(default=None, description=_TERMINAL_DOC)
+    trigger: Optional[DaqTerminalName] = Field(
+        default=None,
+        description="開始トリガの端子（信号名、または pfi0-pfi15）。省略時はすぐ開始"
+    )
+    trigger_edge: Literal["rising", "falling"] = Field(
+        default="rising",
+        description="トリガのエッジ"
+    )
+    timeout_s: float = Field(
+        default=10.0,
+        gt=0.0,
+        le=3600.0,
+        description="トリガを待つ上限 (秒)。来なければステップは失敗する"
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="保存先 CSV（省略時は実行フォルダの data/ に自動で付ける）"
+    )
+
+    @model_validator(mode="after")
+    def _within_device_limits(self):
+        n = len(self.channels)
+        if len({c.strip().lower() for c in self.channels}) != n:
+            raise ValueError("daq_acquire: channels に同じチャンネルが重複しています")
+        if n > 1 and self.rate_hz * n > 1000000.0:
+            raise ValueError("daq_acquire: 複数チャンネルでは rate_hz × チャンネル数を 1 MHz 以下に"
+                             "してください")
+        points = self.rate_hz * self.duration_s
+        if points < 2:
+            raise ValueError("daq_acquire: rate_hz × duration_s は 2 点以上にしてください")
+        if points * n > 2000000:
+            raise ValueError("daq_acquire: 1 ステップは合計 200 万点まで（短くするか rate_hz を下げる。"
+                             "長時間の記録は daq_start_logging）")
+        return self
+
+
+class ActionDaqStartLogging(_StrictModel):
+    """
+    DAQ のアナログ入力（複数可）の連続記録を開始する（他のステップの実行中も記録が続く）
+
+    daq_stop_logging か実行終了まで、CSV に書き続ける。保存先は実行フォルダの data/。
+    記録中は他の daq_read_analog / daq_acquire / daq_wait_analog は使えない
+    （アナログ入力のタイミング回路は 1 つ。読みたいチャンネルは channels に入れる）。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_start_logging"] = Field(
+        ...,
+        description="アクション識別子: DAQ 連続記録の開始"
+    )
+    channels: List[DaqAiName] = Field(
+        ...,
+        min_length=1,
+        max_length=16,
+        description="アナログ入力のリスト（信号名、または ai0-ai15）"
+    )
+    rate_hz: float = Field(
+        default=100.0,
+        gt=0.0,
+        le=10000.0,
+        description="チャンネルあたりのサンプリング周波数 (Hz)。CSV に全点を書くので 10 kHz まで"
+    )
+    v_range: DaqVRange = Field(default=None, description=_V_RANGE_DOC)
+    terminal: DaqTerminalConfig = Field(default=None, description=_TERMINAL_DOC)
+    file_path: Optional[str] = Field(
+        default=None,
+        description="保存先 CSV（省略時は実行フォルダの data/ に自動で付ける）"
+    )
+
+    @model_validator(mode="after")
+    def _no_duplicates(self):
+        if len({c.strip().lower() for c in self.channels}) != len(self.channels):
+            raise ValueError("daq_start_logging: channels に同じチャンネルが重複しています")
+        return self
+
+
+class ActionDaqStopLogging(_StrictModel):
+    """
+    daq_start_logging で始めた連続記録を止める（記録した点数が daq_value 列に入る）
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_stop_logging"] = Field(
+        ...,
+        description="アクション識別子: DAQ 連続記録の終了"
+    )
+
+
+class ActionDaqWaitAnalog(_StrictModel):
+    """
+    DAQ のアナログ入力がしきい値を超える（下回る）まで待つ
+
+    timeout_s 以内に条件が成立しなければステップは失敗し、フローは止まる。
+    しきい値は、信号に換算係数があればその単位、無ければ V。Mock では成立したものとして進む。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_wait_analog"] = Field(
+        ...,
+        description="アクション識別子: DAQ アナログ入力の条件待ち"
+    )
+    channel: DaqAiName = Field(
+        ...,
+        description="アナログ入力（信号名、または ai0-ai15）"
+    )
+    threshold: float = Field(
+        ...,
+        description="しきい値（信号の単位。換算の無い信号・物理名では V）"
+    )
+    condition: Literal["above", "below"] = Field(
+        default="above",
+        description="above = しきい値より大きくなるまで / below = 小さくなるまで"
+    )
+    timeout_s: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=86400.0,
+        description="待つ上限 (秒)"
+    )
+    samples: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description="1 回の判定で平均するサンプル数（1 kHz）"
+    )
+    v_range: DaqVRange = Field(default=None, description=_V_RANGE_DOC)
+    terminal: DaqTerminalConfig = Field(default=None, description=_TERMINAL_DOC)
+
+
 class ActionDaqWriteAnalog(_StrictModel):
     """
     DAQ のアナログ出力 1 チャンネルを DC 電圧に設定する（次の設定か実行終了まで保持）
-    SharedDevices.daq_write_analog(channel, voltage) に対応
 
     実行終了時（中断・エラーを含む）に 0 V に戻る。config.yaml の daq_ao_channels に
     無いチャンネル、daq_ao_min_v..daq_ao_max_v の外の電圧は実行時に拒否される。
@@ -594,10 +786,9 @@ class ActionDaqWriteAnalog(_StrictModel):
         ...,
         description="アクション識別子: DAQ アナログ出力"
     )
-    channel: str = Field(
+    channel: DaqAoName = Field(
         ...,
-        pattern=r"^ao\d$",
-        description="アナログ出力チャンネル（例: ao0。USB-6351 は ao0-ao1）"
+        description="アナログ出力（信号名、または ao0-ao1）"
     )
     voltage: float = Field(
         ...,
@@ -607,10 +798,78 @@ class ActionDaqWriteAnalog(_StrictModel):
     )
 
 
+class ActionDaqGenerateWaveform(_StrictModel):
+    """
+    DAQ のアナログ出力から周期波形を出す（ハードウェアタイミング）
+
+    offset_v ± amplitude_v の範囲で振れる。両端とも config.yaml の
+    daq_ao_min_v..daq_ao_max_v に入っていなければ拒否される。duration_s を指定すると
+    その時間だけ出して 0 V に戻す（ステップはその間ブロックする）。省略すると
+    daq_stop_output か実行終了まで出し続け、次のステップへ進む。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_generate_waveform"] = Field(
+        ...,
+        description="アクション識別子: DAQ 波形出力"
+    )
+    channel: DaqAoName = Field(
+        ...,
+        description="アナログ出力（信号名、または ao0-ao1）"
+    )
+    waveform: Literal["sine", "square", "triangle", "sawtooth"] = Field(
+        default="sine",
+        description="波形"
+    )
+    frequency_hz: float = Field(
+        ...,
+        gt=0.0,
+        le=100000.0,
+        description="周波数 (Hz)"
+    )
+    amplitude_v: float = Field(
+        ...,
+        ge=0.0,
+        le=10.0,
+        description="振幅 (V, 片側)。出力は offset_v ± amplitude_v"
+    )
+    offset_v: float = Field(
+        default=0.0,
+        ge=-10.0,
+        le=10.0,
+        description="オフセット (V)"
+    )
+    duration_s: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=86400.0,
+        description="出力時間 (秒)。省略時は daq_stop_output か実行終了まで"
+    )
+
+
+class ActionDaqStopOutput(_StrictModel):
+    """
+    DAQ の出力 1 つを安全な状態に戻す（アナログ出力 = 0 V、デジタル = Low、パルス列 = 停止）
+
+    このランで駆動していない出力には何も送らない。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_stop_output"] = Field(
+        ...,
+        description="アクション識別子: DAQ 出力の停止"
+    )
+    channel: DaqOutputName = Field(
+        ...,
+        description="出力（信号名、または ao0 / port0/line0 / ctr0 など）"
+    )
+
+
 class ActionDaqReadDigital(_StrictModel):
     """
     DAQ のデジタル 1 ラインを入力として読む
-    SharedDevices.daq_read_digital(line) に対応
 
     結果は measurements.csv の digital_state 列に 1 (High) / 0 (Low) で記録される。
 
@@ -621,17 +880,15 @@ class ActionDaqReadDigital(_StrictModel):
         ...,
         description="アクション識別子: DAQ デジタル入力"
     )
-    line: str = Field(
+    line: DaqLineName = Field(
         ...,
-        pattern=r"^port\d/line\d{1,2}$",
-        description="デジタルライン（例: port0/line0）"
+        description="デジタルライン（信号名、または port0/line0 など）"
     )
 
 
 class ActionDaqWriteDigital(_StrictModel):
     """
     DAQ のデジタル 1 ラインを High / Low に駆動する（次の設定か実行終了まで保持）
-    SharedDevices.daq_write_digital(line, state) に対応
 
     実行終了時（中断・エラーを含む）に Low に戻る。config.yaml の daq_do_lines に
     無いラインは実行時に拒否される。
@@ -643,15 +900,212 @@ class ActionDaqWriteDigital(_StrictModel):
         ...,
         description="アクション識別子: DAQ デジタル出力"
     )
-    line: str = Field(
+    line: DaqLineName = Field(
         ...,
-        pattern=r"^port\d/line\d{1,2}$",
-        description="デジタルライン（例: port0/line0）"
+        description="デジタルライン（信号名、または port0/line0 など）"
     )
     state: bool = Field(
         ...,
         description="True = High (5 V), False = Low (0 V)"
     )
+
+
+class ActionDaqPulseDigital(_StrictModel):
+    """
+    DAQ のデジタル 1 ラインを duration_s のあいだ state にして、元に戻す（ソフトウェアタイミング）
+
+    時間の精度は数 ms 程度。正確なパルスや繰り返しは daq_generate_pulses。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_pulse_digital"] = Field(
+        ...,
+        description="アクション識別子: DAQ デジタルパルス"
+    )
+    line: DaqLineName = Field(
+        ...,
+        description="デジタルライン（信号名、または port0/line0 など）"
+    )
+    duration_s: float = Field(
+        ...,
+        gt=0.0,
+        le=3600.0,
+        description="パルスの長さ (秒)"
+    )
+    state: bool = Field(
+        default=True,
+        description="パルス中のレベル。True = High にして Low に戻す"
+    )
+
+
+class ActionDaqWaitDigital(_StrictModel):
+    """
+    DAQ のデジタル 1 ラインが指定のレベルになるまで待つ（外部機器の完了信号・スイッチなど）
+
+    timeout_s 以内にならなければステップは失敗し、フローは止まる。
+    Mock では成立したものとして進む。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_wait_digital"] = Field(
+        ...,
+        description="アクション識別子: DAQ デジタル入力の条件待ち"
+    )
+    line: DaqLineName = Field(
+        ...,
+        description="デジタルライン（信号名、または port0/line0 など）"
+    )
+    state: bool = Field(
+        default=True,
+        description="待つレベル。True = High"
+    )
+    timeout_s: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=86400.0,
+        description="待つ上限 (秒)"
+    )
+
+
+class ActionDaqCountEdges(_StrictModel):
+    """
+    DAQ のカウンタで、端子に来たエッジを duration_s のあいだ数える
+
+    結果は daq_value 列（daq_unit = count）。流量計・回転計・フォトンカウンタなどのパルス出力用。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_count_edges"] = Field(
+        ...,
+        description="アクション識別子: DAQ エッジカウント"
+    )
+    terminal: DaqTerminalName = Field(
+        ...,
+        description="入力端子（信号名、または pfi0-pfi15。100khztimebase は配線不要の内部基準）"
+    )
+    duration_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=3600.0,
+        description="数える時間 (秒, ソフトウェアタイミング)"
+    )
+    edge: Literal["rising", "falling"] = Field(
+        default="rising",
+        description="数えるエッジ"
+    )
+    counter: Optional[DaqCounterName] = Field(
+        default=None,
+        description="使うカウンタ（信号名、または ctr0-ctr3）。省略時は空いているものを使う"
+    )
+
+
+class ActionDaqMeasureFrequency(_StrictModel):
+    """
+    DAQ のカウンタで、端子の信号の周波数を測る（1 周期から求める）
+
+    結果は daq_value 列（daq_unit = Hz）。timeout_s 以内に信号が来なければ失敗する。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_measure_frequency"] = Field(
+        ...,
+        description="アクション識別子: DAQ 周波数測定"
+    )
+    terminal: DaqTerminalName = Field(
+        ...,
+        description="入力端子（信号名、または pfi0-pfi15）"
+    )
+    min_hz: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=10000000.0,
+        description="予想される周波数の下限 (Hz)"
+    )
+    max_hz: float = Field(
+        default=100000.0,
+        gt=0.0,
+        le=10000000.0,
+        description="予想される周波数の上限 (Hz)"
+    )
+    timeout_s: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=600.0,
+        description="信号を待つ上限 (秒)"
+    )
+    edge: Literal["rising", "falling"] = Field(
+        default="rising",
+        description="周期の基準にするエッジ"
+    )
+    counter: Optional[DaqCounterName] = Field(
+        default=None,
+        description="使うカウンタ（信号名、または ctr0-ctr3）。省略時は空いているものを使う"
+    )
+
+    @model_validator(mode="after")
+    def _range_ordered(self):
+        if not self.min_hz < self.max_hz:
+            raise ValueError("daq_measure_frequency: min_hz < max_hz にしてください")
+        return self
+
+
+class ActionDaqGeneratePulses(_StrictModel):
+    """
+    DAQ のカウンタからパルス列（PWM）を出す（ハードウェアタイミング）
+
+    出力端子はカウンタごとの既定（USB-6351: ctr0 = PFI12, ctr1 = PFI13, ctr2 = PFI14,
+    ctr3 = PFI15）。config.yaml の daq_co_counters に無いカウンタ、daq_co_max_hz を
+    超える周波数は実行時に拒否される。count（パルス数）か duration_s（秒）を指定すると
+    その分だけ出して止める（ステップはその間ブロックする）。どちらも省略すると
+    daq_stop_output か実行終了まで出し続け、次のステップへ進む。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_generate_pulses"] = Field(
+        ...,
+        description="アクション識別子: DAQ パルス列出力"
+    )
+    counter: DaqCounterName = Field(
+        ...,
+        description="カウンタ（信号名、または ctr0-ctr3）"
+    )
+    frequency_hz: float = Field(
+        ...,
+        gt=0.0,
+        le=1000000.0,
+        description="周波数 (Hz)。config.yaml の daq_co_max_hz でさらに絞られる"
+    )
+    duty_cycle: float = Field(
+        default=0.5,
+        gt=0.0,
+        lt=1.0,
+        description="デューティ比（High の割合、0-1）"
+    )
+    count: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=100000000,
+        description="パルス数。出し終えるまで待つ"
+    )
+    duration_s: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=86400.0,
+        description="出力時間 (秒)"
+    )
+
+    @model_validator(mode="after")
+    def _count_or_duration(self):
+        if self.count is not None and self.duration_s is not None:
+            raise ValueError("daq_generate_pulses: count と duration_s はどちらか一方にしてください")
+        if self.count is not None and self.count / self.frequency_hz > 86400.0:
+            raise ValueError("daq_generate_pulses: count / frequency_hz は 86400 秒以下にしてください")
+        return self
 
 # ==========================================
 # 1.8 個別のアクション定義 (ループ制御)
@@ -732,9 +1186,20 @@ LabRobotAction = Union[
     ActionTareScale,
     # DAQ（NI USB-6351）操作
     ActionDaqReadAnalog,
+    ActionDaqAcquire,
+    ActionDaqStartLogging,
+    ActionDaqStopLogging,
+    ActionDaqWaitAnalog,
     ActionDaqWriteAnalog,
+    ActionDaqGenerateWaveform,
+    ActionDaqStopOutput,
     ActionDaqReadDigital,
     ActionDaqWriteDigital,
+    ActionDaqPulseDigital,
+    ActionDaqWaitDigital,
+    ActionDaqCountEdges,
+    ActionDaqMeasureFrequency,
+    ActionDaqGeneratePulses,
     # ユーティリティ
     ActionWait,
     # ループ制御

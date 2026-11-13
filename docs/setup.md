@@ -19,8 +19,8 @@ See [`bom.md`](bom.md) for the full list. The minimum for the ZIF-8 demonstratio
   used by the `capture_microscope` step
 - 1 × Hiwonder MaxArm with suction nozzle — optional robot 4 for pick-and-place,
   USB (see §9); not needed for the ZIF-8 demonstration
-- 1 × National Instruments USB-6351 multifunction DAQ — optional, analog and digital
-  I/O for the `daq_*` steps. Needs the NI-DAQmx driver from ni.com; the device name
+- 1 × National Instruments USB-6351 multifunction DAQ — optional, analog, digital
+  and counter I/O for the `daq_*` steps. Needs the NI-DAQmx driver from ni.com; the device name
   shown in NI MAX (e.g. `Dev1`) goes into `shared_devices.daq_device`. Outputs stay
   disabled until their channels are listed in `config.yaml`; see
   [`src/devices/nidaq/README.md`](../src/devices/nidaq/README.md)
@@ -69,7 +69,7 @@ Edit `config.yaml`:
 | Section | Purpose |
 |---|---|
 | `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); a robot without `type` is a Dobot |
-| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy). For the NI DAQ: `daq_device`, the outputs a flow may drive (`daq_ao_channels`, `daq_do_lines`; empty = none) and the allowed analog output span (`daq_ao_min_v`, `daq_ao_max_v`) |
+| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy). For the NI DAQ: `daq_device`, the named signals flows refer to (`daq_signals`: name → channel, wiring, conversion to a unit), the outputs a flow may drive (`daq_ao_channels`, `daq_do_lines`, `daq_co_counters`; empty = none) and their limits (`daq_ao_min_v`, `daq_ao_max_v`, `daq_co_max_hz`) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
 If `config.yaml` is absent the tracked `config.example.yaml` is used, and if that is

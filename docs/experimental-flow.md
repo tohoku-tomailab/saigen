@@ -115,18 +115,45 @@ the Dobots are still sent home as before. See
 | `capture_microscope` | `file_path` (string, `""` = auto-generate) | Capture an image with the USB digital microscope (UVC, e.g. Sanwa Supply 400-CAM106); saved into the run's `images/` folder with `_microscope` in the name. Opens only the microscope camera; `microscope_led` opens only its serial port; `microscope_focus` opens both |
 | `microscope_led` | `on` (bool, default true), `level` (0–255, optional) | Switch the microscope's LED ring on or off and optionally set its brightness (factory level 12). Needs `microscope_port` in `config.yaml` (the UM22's CP210x serial port) |
 | `microscope_focus` | `mode` (`auto` / `position` / `step`, default `auto`), `position` (0–65535, for `position`), `direction` (`in`/`out`) and `steps` (1–100, for `step`), `timeout` (1–300 s, default 60) | Focus the microscope: single-shot autofocus, move the lens motor to a recorded position, or step it. Waits until the motor stops and writes the lens position and whether it converged to the `focus_position` / `focus_converged` columns of `measurements.csv`. Autofocus needs a textured target and a non-saturating LED level; on a blank field it hunts until `timeout` and then falls back to manual mode. For reproducibility, record the position once and replay it with `mode: "position"`. Needs `microscope_port` |
-| `daq_read_analog` | `channel` (`ai0`..), `samples` (1–100000, default 100), `rate_hz` (1–100000, default 1000), `v_range` (0.1 / 0.2 / 0.5 / 1 / 2 / 5 / 10, default 10), `terminal` (`default` / `rse` / `nrse` / `diff`) | Read one analog input of the NI DAQ device (USB-6351): the mean of `samples` readings taken at `rate_hz` (at most 60 s), with the input range ±`v_range` V. Written to the `daq_channel` / `voltage_v` columns of `measurements.csv` |
-| `daq_write_analog` | `channel` (`ao0`, `ao1`), `voltage` (−10–10 V) | Set one analog output to a DC voltage and hold it. Refused at run time (and at `--mock`) unless the channel is listed in `daq_ao_channels` and the voltage lies inside `daq_ao_min_v`..`daq_ao_max_v` in `config.yaml`. The value set is logged in `voltage_v` |
-| `daq_read_digital` | `line` (`port0/line0`..) | Read one digital line; `digital_state` in `measurements.csv` is 1 (high) or 0 (low). A line the run is driving as an output cannot be read |
-| `daq_write_digital` | `line`, `state` (bool, required) | Drive one digital line high (`true`) or low and hold it. Refused unless the line is listed in `daq_do_lines` in `config.yaml` |
+| `daq_read_analog` | `channel`, `samples` (1–100000, default 100), `rate_hz` (1–100000, default 1000), `v_range`, `terminal` | Read one analog input of the NI DAQ device (USB-6351): the mean of `samples` readings taken at `rate_hz` (at most 60 s). Logged in `daq_channel` / `voltage_v`; a signal with a conversion also fills `daq_value` / `daq_unit` |
+| `daq_acquire` | `channels` (list, 1–16), `rate_hz` (default 1000; one channel up to 1.25 MHz, several up to 1 MHz in total), `duration_s` (default 1), `v_range`, `terminal`, `trigger` (a PFI terminal, optional), `trigger_edge` (`rising` / `falling`), `timeout_s` (default 10), `file_path` | Hardware-timed waveform of the listed inputs, saved as CSV (`time_s`, one voltage column per channel, plus the converted value where a signal defines one) in the run folder's `data/`; path in `data_path`. With `trigger` the acquisition starts on that digital edge and the step fails if none comes within `timeout_s`. At most 2,000,000 points per step |
+| `daq_start_logging` | `channels` (list), `rate_hz` (default 100, up to 10000), `v_range`, `terminal`, `file_path` | Start a continuous recording to a CSV in `data/`; it keeps running while the following steps execute. Other analog-input steps are refused until it is stopped |
+| `daq_stop_logging` | (none) | Stop the recording; the number of samples is logged in `daq_value`. A recording still running when the run ends is stopped and kept |
+| `daq_wait_analog` | `channel`, `threshold`, `condition` (`above` / `below`, default `above`), `timeout_s` (default 60), `samples` (default 10), `v_range`, `terminal` | Wait until the input is above / below the threshold (in the signal's unit, else volts). The step fails after `timeout_s`. Taken as met in `--mock` |
+| `daq_write_analog` | `channel`, `voltage` (−10–10 V) | Set one analog output to a DC voltage and hold it. The value set is logged in `voltage_v` |
+| `daq_generate_waveform` | `channel`, `waveform` (`sine` / `square` / `triangle` / `sawtooth`), `frequency_hz` (up to 100000), `amplitude_v`, `offset_v` (default 0), `duration_s` (optional) | Hardware-timed periodic waveform swinging `offset_v` ± `amplitude_v`. With `duration_s` the step blocks for that time and returns the output to 0 V; without it the waveform continues while the next steps run, until `daq_stop_output` or the end of the run. One waveform at a time (the device has one analog-output clock) |
+| `daq_stop_output` | `channel` (an analog output, a digital line or a counter) | Return one output to its safe state: 0 V, low, or pulse train stopped. Nothing is sent for an output the run is not driving |
+| `daq_read_digital` | `line` | Read one digital line; `digital_state` in `measurements.csv` is 1 (high) or 0 (low). A line the run is driving as an output cannot be read |
+| `daq_write_digital` | `line`, `state` (bool, required) | Drive one digital line high (`true`) or low and hold it |
+| `daq_pulse_digital` | `line`, `duration_s`, `state` (default `true`) | Drive the line to `state` for `duration_s`, then back (software-timed, a few ms of jitter). Interrupted, the line ends low whatever `state` was |
+| `daq_wait_digital` | `line`, `state` (default `true`), `timeout_s` (default 60) | Wait until the line is at that level (a ready signal, a switch). The step fails after `timeout_s`. Taken as met in `--mock` |
+| `daq_count_edges` | `terminal`, `duration_s` (default 1), `edge` (`rising` / `falling`), `counter` (optional) | Count the edges arriving on a terminal during `duration_s`; logged in `daq_value` with `daq_unit` = `count` |
+| `daq_measure_frequency` | `terminal`, `min_hz` (default 1), `max_hz` (default 100000), `timeout_s` (default 5), `edge`, `counter` (optional) | Frequency of the signal on a terminal; logged in `daq_value` with `daq_unit` = `Hz`. Fails when no signal arrives within `timeout_s` |
+| `daq_generate_pulses` | `counter`, `frequency_hz`, `duty_cycle` (default 0.5), `count` or `duration_s` (optional, not both) | Pulse train / PWM on a counter's output terminal (ctr0 → PFI12 … ctr3 → PFI15; that pin, also port2/line4 … 7, cannot be used as a digital line meanwhile). With `count` or `duration_s` the step blocks until done and stops the output; with neither it continues until `daq_stop_output` or the end of the run |
 
-Channels of the DAQ are written without the device name; the name (`Dev1`, as
-shown in NI MAX) is `shared_devices.daq_device` in `config.yaml`. Every output a
-run drove returns to 0 V / low when the run ends, including on Ctrl+C and on an
-error, so wire loads such that low means off. These steps are single values per
-step; waveform capture, counters and triggering are not covered. A flow with
-only `daq_*` steps opens no robot. See
-[`examples/daq/read_voltage.json`](../examples/daq/read_voltage.json) and
+**Naming DAQ channels.** A channel field takes either a *signal name* defined in
+`config.yaml` (`shared_devices.daq_signals`, e.g. `photodiode`) or a physical
+name without the device: `ai0`–`ai15`, `ao0`–`ao1`, `port0/line0`…, `ctr0`–`ctr3`,
+`pfi0`–`pfi15`. The split is deliberate: the code knows how to measure, the
+configuration knows what is wired where (terminal, differential or single-ended,
+range, conversion to a physical unit, which outputs may be driven), and the flow
+says what the experiment does. A flow written with signal names runs unchanged on
+a cell that wired the same signals elsewhere. `v_range` (0.1 / 0.2 / 0.5 / 1 / 2 /
+5 / 10, the input range ±V) and `terminal` (`default` / `rse` / `nrse` / `diff`)
+may be omitted: the signal's values are used, else ±10 V and the device default.
+`measurements.csv` records the name together with the channel (`photodiode:ai0`).
+The device name (`Dev1`, as shown in NI MAX) is `shared_devices.daq_device`.
+
+**Outputs are off until enabled.** Every step that drives something
+(`daq_write_*`, `daq_pulse_digital`, `daq_generate_*`) is refused at run time, and
+at `--mock`, unless the physical channel is listed in `daq_ao_channels` /
+`daq_do_lines` / `daq_co_counters`; analog levels must lie inside
+`daq_ao_min_v`..`daq_ao_max_v` and pulse trains below `daq_co_max_hz`. Every output a
+run drove returns to 0 V / low / stopped when the run ends, including on Ctrl+C and on
+an error. `--validate-only` checks the shape of the steps; whether a signal name
+exists and an output is enabled depends on `config.yaml` and is checked by
+`--mock`. A flow with only `daq_*` steps opens no robot. See
+[`examples/daq/`](../examples/daq/README.md) and
 [`src/devices/nidaq/README.md`](../src/devices/nidaq/README.md).
 
 ### Utility and control flow

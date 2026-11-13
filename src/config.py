@@ -71,6 +71,10 @@ DEFAULTS = {
         "daq_do_lines": [],
         "daq_ao_min_v": 0.0,
         "daq_ao_max_v": 5.0,
+        "daq_co_counters": [],
+        "daq_co_max_hz": 1000.0,
+        # name -> {channel: ai0, terminal: diff, v_range: 1, scale: 2.0, offset: 0, unit: mW}
+        "daq_signals": {},
     },
     "workspace": {
         "x_min": -300.0, "x_max": 300.0,

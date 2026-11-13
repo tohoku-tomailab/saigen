@@ -14,12 +14,15 @@ import types
 import pytest
 from pydantic import ValidationError
 
-from src.devices.nidaq import DaqOutputPolicy, DaqPolicyError, NIDaq
+from src.devices.nidaq import (DAQ_ACTION_NAMES, DaqOutputPolicy, DaqPolicyError, DaqService,
+                               DaqSignals, MockNIDaq, NIDaq)
+from src.devices.nidaq.service import waveform_period
 from src.devices.nidaq import policy as daq_policy
 from src.devices.safety.mock_robot import MockSharedDevices
 from src.devices.safety.shared_devices import SharedDevices
 from src.flow import run_flow
-from src.flow.executor import DAQ_ACTIONS, SHARED_DEVICE_ACTIONS, execute_step
+from src.flow.executor import (DAQ_ACTIONS, DAQ_DATA_ACTIONS, SHARED_DEVICE_ACTIONS,
+                               execute_step)
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession
 from src.flow.schema import ExperimentWorkflow
@@ -38,11 +41,25 @@ class Bench:
         self.devices = list(devices)
         self.inputs = {}          # physical channel -> value returned by read()
         self.outputs = {}         # physical channel -> last value written
-        self.events = []          # ("write", phys, value) / ("close", phys)
+        self.events = []          # ("write", phys, value) / ("close", phys) / ("start"|"stop", phys)
         self.ai_configs = []      # kwargs of add_ai_voltage_chan
         self.timings = []
         self.fail_write = set()   # physical channels whose write raises
         self.open_tasks = 0
+        self.triggers = []        # (source, edge) of cfg_dig_edge_start_trig
+        self.stream_chunks = []   # what successive READ_ALL_AVAILABLE reads return (per channel)
+        self.counters = []        # {"kind": "count"|"freq"|"pulse", "phys":.., ...}
+        self.counter_value = 0    # what a counter-input task reads
+        self.read_error = None    # raised by the next read()
+        self.pulses_done = True
+        self.coerced_rate = None  # the sample clock the device reports (None = as asked)
+        self.fail_start = set()   # physical channels whose task.start() raises
+
+
+class FakeDaqError(Exception):
+    def __init__(self, code):
+        super().__init__(f"DAQmx error {code}")
+        self.error_code = code
 
 
 def install_fake_nidaqmx(monkeypatch, bench):
@@ -52,24 +69,49 @@ def install_fake_nidaqmx(monkeypatch, bench):
 
         def _add(self, phys, **kwargs):
             self.task.kind, self.task.phys = self.kind, phys
+            self.task.chans.append(phys)
             if self.kind == "ai":
                 bench.ai_configs.append({"phys": phys, **kwargs})
+            chan = types.SimpleNamespace()
+            if self.kind in ("ci_count", "ci_freq", "co"):
+                self.task.counter = {"kind": self.kind, "phys": phys, "chan": chan, **kwargs}
+                bench.counters.append(self.task.counter)
+            return chan
 
         add_ai_voltage_chan = add_ao_voltage_chan = add_do_chan = add_di_chan = _add
+        add_ci_count_edges_chan = add_ci_freq_chan = add_co_pulse_chan_freq = _add
 
     class _Timing:
+        def __init__(self, task):
+            self.task = task
+
         def cfg_samp_clk_timing(self, rate, sample_mode=None, samps_per_chan=None):
             bench.timings.append((rate, sample_mode, samps_per_chan))
+            self.samp_clk_rate = bench.coerced_rate or rate
+
+        def cfg_implicit_timing(self, sample_mode=None, samps_per_chan=None):
+            self.task.counter["mode"] = sample_mode
+            self.task.counter["count"] = samps_per_chan
+
+    class _StartTrigger:
+        def cfg_dig_edge_start_trig(self, trigger_source, trigger_edge=None):
+            bench.triggers.append((trigger_source, trigger_edge))
 
     class Task:
         def __init__(self):
             bench.open_tasks += 1
-            self.kind = self.phys = None
+            self.kind = self.phys = self.counter = None
+            self.chans = []
             self.ai_channels = _Channels(self, "ai")
             self.ao_channels = _Channels(self, "ao")
             self.do_channels = _Channels(self, "do")
             self.di_channels = _Channels(self, "di")
-            self.timing = _Timing()
+            self.ci_channels = _Channels(self, "ci_count")
+            self.co_channels = _Channels(self, "co")
+            self.timing = _Timing(self)
+            self.triggers = types.SimpleNamespace(start_trigger=_StartTrigger())
+            # add_ci_freq_chan must be told apart from add_ci_count_edges_chan
+            self.ci_channels.add_ci_freq_chan = _Channels(self, "ci_freq")._add
 
         def __enter__(self):
             return self
@@ -78,16 +120,42 @@ def install_fake_nidaqmx(monkeypatch, bench):
             self.close()
             return False
 
+        def start(self):
+            if self.phys in bench.fail_start:
+                raise RuntimeError("start failed")
+            bench.events.append(("start", self.phys))
+
+        def stop(self):
+            bench.events.append(("stop", self.phys))
+
+        def is_task_done(self):
+            return bench.pulses_done
+
         def read(self, number_of_samples_per_channel=None, timeout=10.0):
+            if bench.read_error is not None:
+                error, bench.read_error = bench.read_error, None
+                raise error
+            if self.kind in ("ci_count", "ci_freq"):
+                return bench.counter_value
+            if number_of_samples_per_channel == -1:              # READ_ALL_AVAILABLE
+                chunk = bench.stream_chunks.pop(0) if bench.stream_chunks else [[] for _ in self.chans]
+                return chunk[0] if len(self.chans) == 1 else chunk
+            if len(self.chans) > 1:
+                return [self._column(phys, number_of_samples_per_channel) for phys in self.chans]
             value = bench.inputs.get(self.phys, 0.0)
             if number_of_samples_per_channel is None:
                 return value
-            return [value] * number_of_samples_per_channel if not isinstance(value, list) else value
+            return self._column(self.phys, number_of_samples_per_channel)
+
+        @staticmethod
+        def _column(phys, n):
+            value = bench.inputs.get(phys, 0.0)
+            return list(value) if isinstance(value, list) else [value] * n
 
         def write(self, data, auto_start=None):
             if self.phys in bench.fail_write:
                 raise RuntimeError("write failed")
-            assert auto_start is True
+            assert auto_start is (False if isinstance(data, list) else True)
             bench.outputs[self.phys] = data
             bench.events.append(("write", self.phys, data))
 
@@ -110,8 +178,11 @@ def install_fake_nidaqmx(monkeypatch, bench):
     constants = types.ModuleType("nidaqmx.constants")
     constants.TerminalConfiguration = types.SimpleNamespace(
         DEFAULT="T_DEFAULT", RSE="T_RSE", NRSE="T_NRSE", DIFF="T_DIFF")
-    constants.AcquisitionType = types.SimpleNamespace(FINITE="FINITE")
+    constants.AcquisitionType = types.SimpleNamespace(FINITE="FINITE", CONTINUOUS="CONTINUOUS")
     constants.LineGrouping = types.SimpleNamespace(CHAN_PER_LINE="CHAN_PER_LINE")
+    constants.Edge = types.SimpleNamespace(RISING="RISING", FALLING="FALLING")
+    constants.Level = types.SimpleNamespace(LOW="LOW", HIGH="HIGH")
+    constants.READ_ALL_AVAILABLE = -1
     system = types.ModuleType("nidaqmx.system")
     system.System = _System
     root = types.ModuleType("nidaqmx")
@@ -360,7 +431,8 @@ def _wf(step):
 
 def test_schema_defaults():
     step = _wf({"action": "daq_read_analog", "channel": "ai0"}).steps[0]
-    assert (step.samples, step.rate_hz, step.v_range, step.terminal) == (100, 1000.0, 10.0, "default")
+    # v_range / terminal are left to the signal's wiring (config.yaml) unless the step sets them
+    assert (step.samples, step.rate_hz, step.v_range, step.terminal) == (100, 1000.0, None, None)
     assert _wf({"action": "daq_read_analog", "channel": "ai15", "v_range": 5}).steps[0].v_range == 5
 
 
@@ -558,3 +630,936 @@ def test_real_cleanup_through_the_session_resets_outputs(bench):
         asyncio.run(go())
     assert bench.outputs == {"Dev1/port0/line0": False}     # low again although the run failed
     assert bench.open_tasks == 0
+
+
+# ======================================================================
+# Extended functions: named signals, waveforms, logging, counters
+# ======================================================================
+SIGNALS = {
+    "photodiode": {"channel": "ai2", "terminal": "diff", "v_range": 1, "scale": 2.0,
+                   "offset": 0.5, "unit": "mW"},
+    "lamp": {"channel": "ao0"},
+    "valve": "port0/line3",                     # shorthand: just the channel
+    "flow_meter": {"channel": "pfi4"},
+    "clock": {"channel": "ctr1"},
+}
+ENABLED = {"daq_signals": SIGNALS, "daq_ao_channels": ["ao0"], "daq_do_lines": ["port0/line3"],
+           "daq_co_counters": ["ctr1"], "daq_ao_min_v": 0.0, "daq_ao_max_v": 5.0,
+           "daq_co_max_hz": 500.0}
+
+
+# ----------------------------------------------------------------------
+# Signals and the extended policy
+# ----------------------------------------------------------------------
+def test_signals_resolve_names_and_physical_channels():
+    signals = DaqSignals.from_config({"daq_signals": SIGNALS})
+    pd = signals.resolve("Photodiode", "ai")
+    assert (pd.label, pd.channel, pd.terminal, pd.v_range, pd.unit) == (
+        "photodiode:ai2", "ai2", "diff", 1.0, "mW")
+    assert pd.scaled and pd.value(1.0) == 2.5
+    raw = signals.resolve("ai7", "ai")
+    assert (raw.label, raw.channel, raw.scaled, raw.terminal, raw.v_range) == (
+        "ai7", "ai7", False, None, None)
+    assert signals.resolve("valve", "line").channel == "port0/line3"
+    assert signals.resolve("clock", ("ao", "line", "counter")).kind == "counter"
+    with pytest.raises(DaqPolicyError, match="is a analog input|analog input; this step needs"):
+        signals.resolve("photodiode", "ao")
+    with pytest.raises(DaqPolicyError, match="this step needs analog output"):
+        signals.resolve("ai0", "ao")
+    with pytest.raises(DaqPolicyError, match="daq_signals"):
+        signals.resolve("pump", "line")
+
+
+@pytest.mark.parametrize("signals", [
+    {"ai0": {"channel": "ai1"}},                        # a name shaped like a channel
+    {"Bad Name": {"channel": "ai0"}},
+    {"x": {"channel": "Dev1/ai0"}},
+    {"x": {}},
+    {"x": {"channel": "ai0", "gain": 2}},               # unknown key
+    {"x": {"channel": "ao0", "scale": 2.0}},            # conversion only on analog inputs
+    {"x": {"channel": "ai0", "scale": 0}},
+    {"x": {"channel": "ai0", "v_range": 3}},
+    {"x": {"channel": "ai0", "terminal": "floating"}},
+    ["ai0"],
+])
+def test_signals_reject_bad_configuration(signals):
+    with pytest.raises(DaqPolicyError):
+        DaqSignals.from_config({"daq_signals": signals})
+
+
+def test_check_flow_name_without_configuration():
+    assert daq_policy.check_flow_name("AI3", "ai") == "ai3"
+    assert daq_policy.check_flow_name("photodiode", "ai") == "photodiode"
+    assert daq_policy.check_flow_name("ctr0", ("ao", "line", "counter")) == "ctr0"
+    for bad, kinds in (("ao0", "ai"), ("Dev1/ai0", "ai"), ("port0", "line"), ("ai99x", "ai"),
+                       ("my signal", "ai"), ("pfi0", "counter"), ("", "ai")):
+        with pytest.raises(ValueError):
+            daq_policy.check_flow_name(bad, kinds)
+
+
+def test_policy_checks_both_ends_of_a_waveform_and_counter_outputs():
+    policy = DaqOutputPolicy.from_config(ENABLED)
+    assert policy.check_analog_waveform("ao0", 2.5, 2.5) == ("ao0", 2.5, 2.5)
+    for offset, amplitude in ((2.5, 2.6), (0.5, 1.0), (4.5, 1.0), (1.0, -0.1)):
+        with pytest.raises(DaqPolicyError):
+            policy.check_analog_waveform("ao0", offset, amplitude)
+    with pytest.raises(DaqPolicyError, match="not enabled"):
+        policy.check_analog_waveform("ao1", 1.0, 0.5)
+    assert policy.check_counter_output("CTR1", 500, 0.25) == ("ctr1", 500.0, 0.25)
+    with pytest.raises(DaqPolicyError, match="daq_co_counters"):
+        policy.check_counter_output("ctr0", 10, 0.5)
+    with pytest.raises(DaqPolicyError, match="daq_co_max_hz"):
+        policy.check_counter_output("ctr1", 501, 0.5)
+    for duty in (0.0, 1.0, float("nan")):
+        with pytest.raises(DaqPolicyError, match="duty_cycle"):
+            policy.check_counter_output("ctr1", 10, duty)
+    for config in ({"daq_co_max_hz": None}, {"daq_co_max_hz": 0}, {"daq_co_max_hz": 2e6},
+                   {"daq_co_counters": ["pfi12"]}):
+        with pytest.raises(DaqPolicyError):
+            DaqOutputPolicy.from_config(config)
+    # nothing is enabled by default
+    with pytest.raises(DaqPolicyError):
+        DaqOutputPolicy.from_config({}).check_counter_output("ctr0", 1, 0.5)
+
+
+# ----------------------------------------------------------------------
+# Driver: waveform acquisition, streaming
+# ----------------------------------------------------------------------
+def test_acquire_reads_all_channels_on_one_clock(bench):
+    bench.inputs["Dev1/ai0"] = [1.0, 2.0, 3.0]
+    bench.inputs["Dev1/ai5"] = [4.0, 5.0, 6.0]
+    daq = NIDaq(device="Dev1")
+    data = daq.acquire([("ai0", 10.0, "rse"), ("ai5", 1.0, "diff")], rate_hz=5000.0, samples=3)
+    assert data == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    assert bench.timings == [(5000.0, "FINITE", 3)]
+    assert [(c["phys"], c["terminal_config"], c["max_val"]) for c in bench.ai_configs] == [
+        ("Dev1/ai0", "T_RSE", 10.0), ("Dev1/ai5", "T_DIFF", 1.0)]
+    assert bench.triggers == [] and bench.open_tasks == 0
+    assert daq.acquire([("ai0", 10.0, "rse")], 1000.0, 3) == [[1.0, 2.0, 3.0]]
+
+
+def test_acquire_with_a_start_trigger_and_its_timeout(bench):
+    daq = NIDaq(device="Dev1")
+    daq.acquire([("ai0", 10.0, "default")], 1000.0, 4, trigger="pfi3", trigger_edge="falling")
+    assert bench.triggers == [("/Dev1/PFI3", "FALLING")]
+    bench.read_error = FakeDaqError(-200284)
+    with pytest.raises(TimeoutError, match="no rising edge on pfi3"):
+        daq.acquire([("ai0", 10.0, "default")], 1000.0, 4, trigger="pfi3", timeout_s=0.1)
+    bench.read_error = FakeDaqError(-50103)                 # any other error is passed on
+    with pytest.raises(FakeDaqError):
+        daq.acquire([("ai0", 10.0, "default")], 1000.0, 4, trigger="pfi3")
+    assert bench.open_tasks == 0
+
+
+@pytest.mark.parametrize("specs,rate,samples", [
+    ([("ai0", 10.0, "rse")], 1000.0, 1),                    # at least 2 samples
+    ([("ai0", 10.0, "rse")], 1_300_000.0, 10),              # single-channel limit
+    ([("ai0", 10.0, "rse"), ("ai1", 10.0, "rse")], 600_000.0, 10),   # aggregate limit
+    ([("ai0", 10.0, "rse"), ("ai0", 10.0, "rse")], 1000.0, 10),      # listed twice
+    ([("ai0", 20.0, "rse")], 1000.0, 10),
+    ([("ai0", 10.0, "floating")], 1000.0, 10),
+    ([("ao0", 10.0, "rse")], 1000.0, 10),
+    ([], 1000.0, 10),
+])
+def test_acquire_rejects_what_the_device_cannot_do(bench, specs, rate, samples):
+    with pytest.raises(ValueError):
+        NIDaq(device="Dev1").acquire(specs, rate, samples)
+    assert bench.open_tasks == 0
+
+
+def test_stream_blocks_other_analog_input_until_stopped(bench):
+    daq = NIDaq(device="Dev1")
+    daq.start_stream([("ai0", 10.0, "rse"), ("ai1", 10.0, "rse")], 200.0)
+    assert bench.timings == [(200.0, "CONTINUOUS", 2000)] and bench.open_tasks == 1
+    bench.stream_chunks = [[[1.0, 2.0], [3.0, 4.0]]]
+    assert daq.read_stream() == [[1.0, 2.0], [3.0, 4.0]]
+    assert daq.read_stream() == [[], []]
+    for call in (lambda: daq.read_analog("ai2"), lambda: daq.acquire([("ai2", 10.0, "rse")], 100.0, 2),
+                 lambda: daq.start_stream([("ai2", 10.0, "rse")], 100.0)):
+        with pytest.raises(RuntimeError, match="busy with a continuous acquisition"):
+            call()
+    daq.stop_stream()
+    assert bench.open_tasks == 0
+    with pytest.raises(RuntimeError, match="no continuous acquisition"):
+        daq.read_stream()
+    daq.start_stream([("ai3", 10.0, "rse")], 100.0)         # one channel: a flat list comes back
+    bench.stream_chunks = [[[7.0, 8.0]]]
+    assert daq.read_stream() == [[7.0, 8.0]]
+    assert daq.close() == [] and bench.open_tasks == 0      # close() stops a running stream
+
+
+# ----------------------------------------------------------------------
+# Driver: waveform output, counters
+# ----------------------------------------------------------------------
+def test_waveform_output_is_replaced_by_dc_and_reset_on_close(bench):
+    daq = NIDaq(device="Dev1")
+    daq.write_analog("ao0", 1.0)
+    daq.start_waveform("ao0", [0.0, 1.0, 2.0, 1.0], rate_hz=400.0)
+    assert bench.outputs["Dev1/ao0"] == [0.0, 1.0, 2.0, 1.0]
+    assert bench.timings[-1] == (400.0, "CONTINUOUS", 4)
+    assert bench.open_tasks == 1                            # the DC task was released first
+    assert daq.stop_output("ao0") is True
+    assert bench.outputs["Dev1/ao0"] == 0.0 and bench.open_tasks == 1
+    daq.start_waveform("ao1", [1.0, 2.0], rate_hz=100.0)
+    assert daq.close() == []
+    assert bench.outputs == {"Dev1/ao0": 0.0, "Dev1/ao1": 0.0} and bench.open_tasks == 0
+    for period, rate in (([1.0], 100.0), ([0.0, 10.5], 100.0), ([0.0, 1.0], 3e6), ([0.0, 1.0], 0)):
+        with pytest.raises(ValueError):
+            daq.start_waveform("ao0", period, rate)
+    assert bench.open_tasks == 0
+
+
+def test_count_edges_and_frequency_use_a_free_counter(bench):
+    bench.counter_value = 1234
+    daq = NIDaq(device="Dev1")
+    slept = []
+    assert daq.count_edges("pfi2", 0.5, edge="falling", sleep=slept.append) == 1234
+    counter = bench.counters[-1]
+    assert (counter["kind"], counter["phys"], counter["edge"]) == ("ci_count", "Dev1/ctr3", "FALLING")
+    assert counter["chan"].ci_count_edges_term == "/Dev1/PFI2" and slept == [0.5]
+    bench.counter_value = 99.5
+    assert daq.measure_frequency("100khztimebase", min_hz=10, max_hz=1e6, counter="ctr0") == 99.5
+    counter = bench.counters[-1]
+    assert (counter["kind"], counter["phys"], counter["min_val"], counter["max_val"]) == (
+        "ci_freq", "Dev1/ctr0", 10.0, 1e6)
+    assert counter["chan"].ci_freq_term == "/Dev1/100kHzTimebase"
+    bench.read_error = FakeDaqError(-200474)
+    with pytest.raises(TimeoutError, match="no signal on pfi0"):
+        daq.measure_frequency("pfi0", timeout_s=0.1)
+    for call in (lambda: daq.count_edges("pfi0", 0), lambda: daq.count_edges("ai0", 1.0),
+                 lambda: daq.count_edges("pfi0", 1.0, edge="both"),
+                 lambda: daq.measure_frequency("pfi0", min_hz=10, max_hz=5)):
+        with pytest.raises(ValueError):
+            call()
+    assert bench.open_tasks == 0
+
+
+def test_pulse_trains_and_the_counters_they_occupy(bench):
+    daq = NIDaq(device="Dev1")
+    daq.start_pulses("ctr3", 100.0, duty_cycle=0.25)
+    counter = bench.counters[-1]
+    assert (counter["kind"], counter["phys"], counter["freq"], counter["duty_cycle"],
+            counter["idle_state"], counter["mode"]) == ("co", "Dev1/ctr3", 100.0, 0.25, "LOW",
+                                                        "CONTINUOUS")
+    daq.start_pulses("ctr0", 10.0, count=5)
+    assert (bench.counters[-1]["mode"], bench.counters[-1]["count"]) == ("FINITE", 5)
+    bench.pulses_done = False
+    assert daq.pulses_done("ctr0") is False and daq.pulses_done("ctr1") is True
+    # a measurement takes the highest counter that is not generating
+    bench.counter_value = 7
+    assert daq.count_edges("pfi0", 0.1, sleep=lambda s: None) == 7
+    assert bench.counters[-1]["phys"] == "Dev1/ctr2"
+    with pytest.raises(RuntimeError, match="generating a pulse train"):
+        daq.count_edges("pfi0", 0.1, counter="ctr3", sleep=lambda s: None)
+    assert daq.stop_output("ctr3") is True and daq.stop_output("ctr3") is False
+    assert bench.open_tasks == 1
+    assert daq.close() == [] and bench.open_tasks == 0      # the other train is stopped too
+    for kwargs in ({"frequency_hz": 0}, {"frequency_hz": 10, "duty_cycle": 1.0},
+                   {"frequency_hz": 10, "count": 0}):
+        with pytest.raises(ValueError):
+            daq.start_pulses("ctr0", **kwargs)
+    with pytest.raises(ValueError):
+        daq.stop_output("ai0")
+    assert daq.stop_output("ao0") is False and daq.stop_output("port0/line0") is False
+    assert bench.open_tasks == 0                            # an undriven output is not touched
+
+
+def test_mock_device_has_the_methods_of_the_real_one():
+    public = [n for n, v in vars(NIDaq).items() if callable(v) and not n.startswith("_")]
+    assert len(public) > 15
+    for name in public:
+        real = inspect.signature(getattr(NIDaq, name))
+        mock = inspect.signature(getattr(MockNIDaq, name))
+        assert list(real.parameters) == list(mock.parameters), name
+
+
+# ----------------------------------------------------------------------
+# DaqService on the mock device
+# ----------------------------------------------------------------------
+def _service(config=None, mock=True):
+    backend = MockNIDaq()
+    return DaqService(backend, ENABLED if config is None else config, mock=mock), backend
+
+
+def _go(service, action, **params):
+    return asyncio.run(service.run(action, **params))
+
+
+def _csv(path):
+    with open(path, encoding="utf-8", newline="") as f:
+        return list(csv.reader(f))
+
+
+def test_service_reads_a_named_signal_with_its_wiring_and_conversion(monkeypatch):
+    service, backend = _service()
+    calls = []
+    monkeypatch.setattr(backend, "read_analog", lambda *a: calls.append(a) or 1.0)
+    assert _go(service, "daq_read_analog", channel="photodiode") == {
+        "voltage": 1.0, "daq_channel": "photodiode:ai2", "daq_value": 2.5, "daq_unit": "mW"}
+    assert calls == [("ai2", 100, 1000.0, 1.0, "diff")]     # the signal's range and terminal
+    _go(service, "daq_read_analog", channel="photodiode", v_range=5.0, terminal="rse", samples=3)
+    assert calls[-1] == ("ai2", 3, 1000.0, 5.0, "rse")      # the step's own values win
+    assert _go(service, "daq_read_analog", channel="ai0") == {"voltage": 1.0, "daq_channel": "ai0"}
+    assert calls[-1] == ("ai0", 100, 1000.0, 10.0, "default")
+    with pytest.raises(DaqPolicyError):
+        _go(service, "daq_read_analog", channel="lamp")     # an output is not an input
+    with pytest.raises(ValueError, match="unknown DAQ action"):
+        _go(service, "daq_reset_device")
+
+
+def test_service_acquire_writes_a_csv(tmp_path):
+    service, _ = _service()
+    path = str(tmp_path / "sub" / "wave.csv")
+    result = _go(service, "daq_acquire", channels=["photodiode", "ai0"], rate_hz=100.0,
+                 duration_s=0.05, file_path=path)
+    assert result == {"daq_channel": "photodiode:ai2+ai0", "data_path": path}
+    rows = _csv(path)
+    assert rows[0] == ["time_s", "photodiode:ai2_V", "photodiode:ai2_mW", "ai0_V"]
+    assert len(rows) == 6 and rows[1] == ["0.000000", "1.234000", "2.968", "1.234000"]
+    assert rows[-1][0] == "0.040000"
+    single = _go(service, "daq_acquire", channels=["photodiode"], rate_hz=100.0, duration_s=0.05,
+                 file_path=str(tmp_path / "one.csv"), trigger="flow_meter")
+    assert single["voltage"] == pytest.approx(1.234) and single["daq_unit"] == "mW"
+    assert single["daq_value"] == pytest.approx(2.968)
+    for kwargs in ({"channels": []}, {"channels": ["ai0", "AI0"]},
+                   {"channels": ["ai0"], "rate_hz": 10.0, "duration_s": 0.01},
+                   {"channels": ["ai0"], "rate_hz": 1e6, "duration_s": 3.0},
+                   {"channels": ["ai0"], "trigger_edge": "both"},
+                   {"channels": ["ai0"], "trigger": "valve"}):
+        with pytest.raises(ValueError):
+            _go(service, "daq_acquire", file_path=str(tmp_path / "x.csv"), **kwargs)
+
+
+def test_service_logging_runs_in_the_background_and_blocks_other_input(tmp_path):
+    service, backend = _service()
+    path = str(tmp_path / "log.csv")
+
+    async def scenario():
+        started = await service.run("daq_start_logging", channels=["photodiode"], rate_hz=1000.0,
+                                    file_path=path)
+        with pytest.raises(RuntimeError, match="already running"):
+            await service.run("daq_start_logging", channels=["ai0"], file_path=path)
+        with pytest.raises(RuntimeError, match="busy with a continuous acquisition"):
+            await service.run("daq_read_analog", channel="ai0")
+        await service.run("daq_count_edges", terminal="pfi0", duration_s=0.5)   # counters are free
+        await asyncio.sleep(0.3)
+        return started, await service.run("daq_stop_logging")
+
+    started, stopped = asyncio.run(scenario())
+    assert started == {"daq_channel": "photodiode:ai2", "data_path": path}
+    assert stopped["data_path"] == path and stopped["daq_unit"] == "samples"
+    rows = _csv(path)
+    assert rows[0] == ["time_s", "photodiode:ai2_V", "photodiode:ai2_mW"]
+    assert stopped["daq_value"] == len(rows) - 1 >= 100
+    assert rows[1][0] == "0.000000" and rows[2][0] == "0.001000"
+    assert backend._stream is None
+    with pytest.raises(RuntimeError, match="no logging session"):
+        _go(service, "daq_stop_logging")
+    assert _go(service, "daq_read_analog", channel="ai0")["voltage"] == 1.234   # free again
+
+
+def test_service_close_stops_a_recording_nobody_stopped(tmp_path):
+    service, backend = _service()
+    path = str(tmp_path / "log.csv")
+    _go(service, "daq_start_logging", channels=["ai0"], rate_hz=100.0, file_path=path)
+    assert service.close() == []
+    assert backend._stream is None and len(_csv(path)) >= 2     # header and at least one sample
+
+
+def test_service_reports_a_recording_that_broke(tmp_path, monkeypatch):
+    service, backend = _service()
+
+    def broken():
+        raise RuntimeError("device unplugged")
+
+    async def scenario():
+        await service.run("daq_start_logging", channels=["ai0"], file_path=str(tmp_path / "l.csv"))
+        monkeypatch.setattr(backend, "read_stream", broken)
+        await asyncio.sleep(0.5)
+        await service.run("daq_stop_logging")
+
+    with pytest.raises(RuntimeError, match="device unplugged"):
+        asyncio.run(scenario())
+
+
+def test_service_waveform_for_a_duration_returns_to_zero():
+    service, backend = _service()
+    seen = {}
+    original = backend.stop_output
+
+    def spy(name):
+        seen["while_running"] = dict(backend.waveforms)
+        return original(name)
+
+    backend.stop_output = spy
+    result = _go(service, "daq_generate_waveform", channel="lamp", waveform="square",
+                 frequency_hz=50.0, amplitude_v=1.0, offset_v=2.0, duration_s=5.0)
+    assert result == {"daq_channel": "lamp:ao0", "daq_value": 50.0, "daq_unit": "Hz"}
+    wave = seen["while_running"]["ao0"]
+    assert wave["rate_hz"] == 50.0 * 1000 and len(wave["points"]) == 1000
+    assert (min(wave["points"]), max(wave["points"])) == (1.0, 3.0)
+    assert backend.waveforms == {} and backend.analog_outputs == {"ao0": 0.0}
+
+
+def test_service_waveform_without_a_duration_continues_until_stopped():
+    service, backend = _service()
+    _go(service, "daq_generate_waveform", channel="ao0", frequency_hz=20000.0, amplitude_v=2.5,
+        offset_v=2.5)
+    wave = backend.waveforms["ao0"]
+    assert len(wave["points"]) == 100 and wave["rate_hz"] == 2_000_000.0   # fewer points when fast
+    assert min(wave["points"]) >= 0.0 and max(wave["points"]) <= 5.0
+    assert _go(service, "daq_stop_output", channel="lamp") == {"daq_channel": "lamp:ao0",
+                                                              "voltage": 0.0}
+    assert backend.waveforms == {} and backend.analog_outputs["ao0"] == 0.0
+    _go(service, "daq_generate_waveform", channel="ao0", frequency_hz=1.0, amplitude_v=1.0,
+        offset_v=1.0)
+    assert service.close() == [] and backend.waveforms == {}
+
+
+@pytest.mark.parametrize("params", [
+    {"channel": "ao1", "frequency_hz": 10.0, "amplitude_v": 1.0, "offset_v": 1.0},   # not enabled
+    {"channel": "ao0", "frequency_hz": 10.0, "amplitude_v": 1.0, "offset_v": 0.5},   # dips below 0 V
+    {"channel": "ao0", "frequency_hz": 10.0, "amplitude_v": 3.0, "offset_v": 2.5},   # above 5 V
+    {"channel": "valve", "frequency_hz": 10.0, "amplitude_v": 1.0, "offset_v": 1.0},  # not an AO
+])
+def test_service_refuses_waveforms_the_config_does_not_allow(params):
+    service, backend = _service()
+    with pytest.raises(DaqPolicyError):
+        _go(service, "daq_generate_waveform", **params)
+    assert backend.waveforms == {} and backend.analog_outputs == {}
+
+
+def test_waveform_shapes():
+    for name in ("sine", "square", "triangle", "sawtooth"):
+        points = waveform_period(name, 2.0, 1.0, 1000)
+        assert len(points) == 1000 and min(points) >= -1.0 - 1e-9 and max(points) <= 3.0 + 1e-9
+        assert max(points) - min(points) > 3.9
+    assert waveform_period("sine", 2.0, 1.0, 4) == pytest.approx([1.0, 3.0, 1.0, -1.0])
+    assert waveform_period("triangle", 1.0, 0.0, 4) == pytest.approx([0.0, 1.0, 0.0, -1.0])
+    with pytest.raises(ValueError):
+        waveform_period("noise", 1.0, 0.0, 10)
+    with pytest.raises(ValueError, match="too high"):
+        _go(_service()[0], "daq_generate_waveform", channel="ao0", frequency_hz=150000.0,
+            amplitude_v=1.0, offset_v=1.0)
+
+
+def test_service_digital_pulse_and_waits():
+    service, backend = _service()
+    states = []
+    original = backend.write_digital
+    backend.write_digital = lambda name, state: states.append((name, state)) or original(name, state)
+    assert _go(service, "daq_pulse_digital", line="valve", duration_s=3.0) == {
+        "digital_state": False, "daq_channel": "valve:port0/line3"}
+    assert states == [("port0/line3", True), ("port0/line3", False)]
+    _go(service, "daq_pulse_digital", line="port0/line3", duration_s=0.1, state=False)
+    assert states[2:] == [("port0/line3", False), ("port0/line3", True)]
+    with pytest.raises(DaqPolicyError):
+        _go(service, "daq_pulse_digital", line="port0/line0", duration_s=0.1)
+    with pytest.raises(ValueError):
+        _go(service, "daq_pulse_digital", line="valve", duration_s=0)
+    # in a mock run a wait is taken as met (the mock line reads low)
+    assert _go(service, "daq_wait_digital", line="port0/line1", state=True, timeout_s=0.1) == {
+        "digital_state": True, "daq_channel": "port0/line1"}
+    assert _go(service, "daq_wait_analog", channel="ai0", condition="below", threshold=0.0,
+               timeout_s=0.1)["voltage"] == 1.234
+
+
+def test_service_waits_time_out_when_the_condition_never_comes():
+    service, backend = _service(mock=False)                 # real timing, simulated device
+    assert _go(service, "daq_wait_digital", line="port0/line1", state=False)["digital_state"] is False
+    with pytest.raises(TimeoutError, match="did not go high within 0.1 s"):
+        _go(service, "daq_wait_digital", line="port0/line1", state=True, timeout_s=0.1)
+    met = _go(service, "daq_wait_analog", channel="photodiode", condition="above", threshold=2.9)
+    assert met["daq_value"] == pytest.approx(2.968)         # compared in the signal's unit
+    with pytest.raises(TimeoutError, match="below 2 mW"):
+        _go(service, "daq_wait_analog", channel="photodiode", condition="below", threshold=2.0,
+            timeout_s=0.1)
+    with pytest.raises(ValueError):
+        _go(service, "daq_wait_analog", channel="ai0", condition="equal", threshold=1.0)
+    readings = iter([False, False, True])
+    backend.read_digital = lambda name: next(readings)
+    assert _go(service, "daq_wait_digital", line="port0/line1", timeout_s=5.0)["digital_state"] is True
+
+
+def test_service_counters():
+    service, backend = _service()
+    assert _go(service, "daq_count_edges", terminal="flow_meter", duration_s=2.0) == {
+        "daq_channel": "flow_meter:pfi4", "daq_value": 2000, "daq_unit": "count"}
+    assert _go(service, "daq_measure_frequency", terminal="pfi0", counter="clock") == {
+        "daq_channel": "pfi0", "daq_value": 1000.0, "daq_unit": "Hz"}
+    with pytest.raises(DaqPolicyError):
+        _go(service, "daq_count_edges", terminal="valve")
+    # finite and timed trains stop themselves; a continuous one runs until stopped
+    assert _go(service, "daq_generate_pulses", counter="clock", frequency_hz=200.0, count=50) == {
+        "daq_channel": "clock:ctr1", "daq_value": 200.0, "daq_unit": "Hz"}
+    assert backend.pulse_trains == {}
+    _go(service, "daq_generate_pulses", counter="ctr1", frequency_hz=10.0, duration_s=2.0)
+    assert backend.pulse_trains == {}
+    _go(service, "daq_generate_pulses", counter="ctr1", frequency_hz=10.0, duty_cycle=0.2)
+    assert backend.pulse_trains == {"ctr1": {"frequency_hz": 10.0, "duty_cycle": 0.2, "count": None}}
+    with pytest.raises(RuntimeError, match="generating a pulse train"):
+        _go(service, "daq_count_edges", terminal="pfi0", counter="ctr1")
+    assert _go(service, "daq_stop_output", channel="clock") == {"daq_channel": "clock:ctr1"}
+    assert backend.pulse_trains == {}
+    for params in ({"counter": "ctr0", "frequency_hz": 10.0},                 # not enabled
+                   {"counter": "ctr1", "frequency_hz": 501.0},                # above daq_co_max_hz
+                   {"counter": "ctr1", "frequency_hz": 10.0, "duty_cycle": 1.0}):
+        with pytest.raises(DaqPolicyError):
+            _go(service, "daq_generate_pulses", **params)
+    with pytest.raises(ValueError, match="not both"):
+        _go(service, "daq_generate_pulses", counter="ctr1", frequency_hz=10.0, count=5,
+            duration_s=1.0)
+    assert backend.pulse_trains == {}
+
+
+def test_service_stop_output_leaves_undriven_outputs_alone():
+    service, backend = _service()
+    # nothing was sent, so no level is put on record
+    assert _go(service, "daq_stop_output", channel="valve") == {"daq_channel": "valve:port0/line3"}
+    assert _go(service, "daq_stop_output", channel="lamp") == {"daq_channel": "lamp:ao0"}
+    assert backend.digital_outputs == {} and backend.analog_outputs == {}
+    with pytest.raises(DaqPolicyError):
+        _go(service, "daq_stop_output", channel="photodiode")
+
+
+def test_service_on_the_real_driver_holds_outputs_and_resets_them(bench):
+    """The same service over NIDaq (fake nidaqmx): what reaches the device."""
+    shared = _shared(daq_device="Dev1", **ENABLED)
+
+    async def scenario():
+        await shared.daq_step("daq_generate_waveform", channel="lamp", frequency_hz=10.0,
+                              amplitude_v=1.0, offset_v=1.0)
+        await shared.daq_step("daq_generate_pulses", counter="clock", frequency_hz=100.0)
+        await shared.daq_step("daq_write_digital", line="valve", state=True)
+        with pytest.raises(DaqPolicyError):
+            await shared.daq_step("daq_generate_pulses", counter="ctr0", frequency_hz=100.0)
+        assert bench.open_tasks == 3
+        await shared.cleanup()
+
+    asyncio.run(scenario())
+    assert bench.outputs == {"Dev1/ao0": 0.0, "Dev1/port0/line3": False}
+    assert ("stop", "Dev1/ctr1") in bench.events and bench.open_tasks == 0
+
+
+def test_shared_devices_and_mock_expose_the_same_entry_point():
+    assert (inspect.signature(SharedDevices.daq_step)
+            == inspect.signature(MockSharedDevices.daq_step))
+    mock = MockSharedDevices(use_daq=True, **ENABLED)
+    assert asyncio.run(mock.daq_step("daq_write_analog", channel="lamp", voltage=2.0)) == {
+        "voltage": 2.0, "daq_channel": "lamp:ao0"}
+    assert mock.daq_analog_outputs == {"ao0": 2.0}
+    asyncio.run(mock.cleanup())
+    assert mock.daq_analog_outputs == {"ao0": 0.0}
+    with pytest.raises(RuntimeError, match="DAQ"):
+        asyncio.run(MockSharedDevices().daq_step("daq_read_analog", channel="ai0"))
+    with pytest.raises(DaqPolicyError):
+        MockSharedDevices(use_daq=True, daq_signals={"ai0": "ai1"})
+
+
+# ----------------------------------------------------------------------
+# Schema, executor, logger and runner for the extended steps
+# ----------------------------------------------------------------------
+EVERY_STEP = [
+    {"action": "daq_read_analog", "channel": "photodiode"},
+    {"action": "daq_acquire", "channels": ["photodiode", "ai0"], "rate_hz": 100.0, "duration_s": 0.05,
+     "trigger": "flow_meter"},
+    {"action": "daq_start_logging", "channels": ["ai1"], "rate_hz": 100.0},
+    {"action": "daq_count_edges", "terminal": "flow_meter", "duration_s": 0.5},
+    {"action": "daq_measure_frequency", "terminal": "pfi0"},
+    {"action": "daq_stop_logging"},
+    {"action": "daq_wait_analog", "channel": "photodiode", "threshold": 0.1, "condition": "below"},
+    {"action": "daq_write_analog", "channel": "lamp", "voltage": 2.5},
+    {"action": "daq_generate_waveform", "channel": "lamp", "frequency_hz": 10.0, "amplitude_v": 1.0,
+     "offset_v": 1.0, "duration_s": 0.5},
+    {"action": "daq_write_digital", "line": "valve", "state": True},
+    {"action": "daq_pulse_digital", "line": "valve", "duration_s": 0.2},
+    {"action": "daq_wait_digital", "line": "port0/line1"},
+    {"action": "daq_read_digital", "line": "port0/line2"},
+    {"action": "daq_generate_pulses", "counter": "clock", "frequency_hz": 100.0, "count": 10},
+    {"action": "daq_stop_output", "channel": "lamp"},
+]
+
+
+def test_every_daq_action_has_a_schema_and_is_exercised_here():
+    assert {s["action"] for s in EVERY_STEP} == DAQ_ACTIONS == set(DAQ_ACTION_NAMES)
+    workflow = ExperimentWorkflow(name="all", description="", steps=EVERY_STEP)
+    assert len(workflow.steps) == len(EVERY_STEP)
+    assert workflow.steps[0].v_range is None and workflow.steps[0].terminal is None
+
+
+@pytest.mark.parametrize("step", [
+    {"action": "daq_acquire", "channels": []},
+    {"action": "daq_acquire", "channels": ["ai0", "ai0"]},
+    {"action": "daq_acquire", "channels": ["ai0", "ai1"], "rate_hz": 600000.0, "duration_s": 0.1},
+    {"action": "daq_acquire", "channels": ["ai0"], "rate_hz": 1000000.0, "duration_s": 3.0},
+    {"action": "daq_acquire", "channels": ["ai0"], "rate_hz": 1.0, "duration_s": 0.5},
+    {"action": "daq_acquire", "channels": ["ao0"]},
+    {"action": "daq_acquire", "channels": ["ai0"], "trigger": "ai1"},
+    {"action": "daq_acquire", "channels": ["ai0"], "trigger_edge": "both"},
+    {"action": "daq_start_logging", "channels": ["ai0"], "rate_hz": 20000.0},
+    {"action": "daq_stop_logging", "channel": "ai0"},
+    {"action": "daq_wait_analog", "channel": "ai0"},                          # threshold required
+    {"action": "daq_wait_analog", "channel": "ai0", "threshold": 1.0, "condition": "equal"},
+    {"action": "daq_generate_waveform", "channel": "ao0", "frequency_hz": 10.0},   # amplitude
+    {"action": "daq_generate_waveform", "channel": "ao0", "frequency_hz": 0, "amplitude_v": 1.0},
+    {"action": "daq_generate_waveform", "channel": "ao0", "frequency_hz": 10.0, "amplitude_v": 1.0,
+     "waveform": "noise"},
+    {"action": "daq_generate_waveform", "channel": "port0/line0", "frequency_hz": 10.0,
+     "amplitude_v": 1.0},
+    {"action": "daq_stop_output", "channel": "ai0"},
+    {"action": "daq_stop_output", "channel": "pfi0"},
+    {"action": "daq_pulse_digital", "line": "port0/line0"},                   # duration required
+    {"action": "daq_pulse_digital", "line": "port0/line0", "duration_s": 0},
+    {"action": "daq_wait_digital", "line": "ctr0"},
+    {"action": "daq_count_edges", "terminal": "port0/line0"},
+    {"action": "daq_count_edges", "terminal": "pfi0", "counter": "pfi1"},
+    {"action": "daq_measure_frequency", "terminal": "pfi0", "min_hz": 100.0, "max_hz": 10.0},
+    {"action": "daq_generate_pulses", "counter": "ctr0"},                     # frequency required
+    {"action": "daq_generate_pulses", "counter": "ctr0", "frequency_hz": 10.0, "duty_cycle": 1.0},
+    {"action": "daq_generate_pulses", "counter": "ctr0", "frequency_hz": 10.0, "count": 5,
+     "duration_s": 1.0},
+    {"action": "daq_generate_pulses", "counter": "ao0", "frequency_hz": 10.0},
+    {"action": "daq_read_analog", "channel": "my signal"},
+    {"action": "daq_read_analog", "channel": "ai0", "robot_id": 1},
+])
+def test_schema_rejects_extended(step):
+    with pytest.raises(ValidationError):
+        _wf(step)
+
+
+def test_executor_runs_every_daq_action_on_the_mock(tmp_path):
+    mock = MockSharedDevices(use_daq=True, **ENABLED)
+
+    async def scenario():
+        results = []
+        for i, step in enumerate(EVERY_STEP):
+            if step["action"] in DAQ_DATA_ACTIONS:
+                step = {**step, "file_path": str(tmp_path / f"{i}.csv")}
+            results.append(await execute_step(step, {}, mock))
+        await mock.cleanup()
+        return results
+
+    results = asyncio.run(scenario())
+    assert all(isinstance(r, dict) and r.get("daq_channel") for r in results)
+    assert results[0] == {"voltage": 1.234, "daq_channel": "photodiode:ai2",
+                          "daq_value": pytest.approx(2.968), "daq_unit": "mW"}
+    assert os.path.exists(results[1]["data_path"]) and os.path.exists(results[5]["data_path"])
+    assert mock.daq_analog_outputs == {"ao0": 0.0} and mock.daq.pulse_trains == {}
+
+
+def test_executor_passes_only_what_the_step_states():
+    """A pydantic step must not push its defaults over the signal's wiring."""
+    mock = MockSharedDevices(use_daq=True, **ENABLED)
+    seen = []
+    mock.daq.read_analog = lambda *a: seen.append(a) or 1.0
+    model = _wf({"action": "daq_read_analog", "channel": "photodiode"}).steps[0]
+    asyncio.run(execute_step(model, {}, mock))
+    asyncio.run(execute_step(model.model_dump(), {}, mock))             # None values are dropped
+    asyncio.run(execute_step({"action": "daq_read_analog", "channel": "photodiode",
+                              "terminal": "rse", "_iteration": 2}, {}, mock))
+    assert seen == [("ai2", 100, 1000.0, 1.0, "diff"), ("ai2", 100, 1000.0, 1.0, "diff"),
+                    ("ai2", 100, 1000.0, 1.0, "rse")]
+
+
+def test_logger_writes_the_value_and_data_columns(tmp_path):
+    src = tmp_path / "f.json"
+    src.write_text("{}", encoding="utf-8")
+    log = ExperimentLogger("d", "", str(src), base_dir=str(tmp_path / "logs"), mode="mock")
+    data_path = log.next_data_path(2, tag="acquire")
+    assert os.path.dirname(data_path) == os.path.join(log.dir, "data") and os.path.isdir(
+        os.path.dirname(data_path))
+    assert os.path.basename(data_path).startswith("step002_acquire_")
+    log.record_step(1, 4, "daq_read_analog", None, None, "ok", 0.1,
+                    result={"voltage": 1.0, "daq_channel": "photodiode:ai2", "daq_value": 2.5,
+                            "daq_unit": "mW"})
+    log.record_step(2, 4, "daq_acquire", None, None, "ok", 0.1,
+                    result={"daq_channel": "ai0+ai1", "data_path": data_path})
+    log.record_step(3, 4, "daq_count_edges", None, None, "ok", 0.1,
+                    result={"daq_channel": "pfi0", "daq_value": 1234, "daq_unit": "count"})
+    log.record_step(4, 4, "daq_stop_logging", None, None, "ok", 0.1,
+                    result={"daq_channel": "ai0", "data_path": data_path, "daq_value": 500,
+                            "daq_unit": "samples"})
+    log.finalize("completed")
+    rows = _rows(log.dir)
+    assert (rows[0]["voltage_v"], rows[0]["daq_value"], rows[0]["daq_unit"]) == ("1.000000", "2.5", "mW")
+    assert (rows[1]["data_path"], rows[1]["daq_value"]) == (data_path, "")
+    assert (rows[2]["daq_value"], rows[2]["daq_unit"]) == ("1234", "count")
+    assert (rows[3]["daq_value"], rows[3]["daq_unit"]) == ("500", "samples")
+    with open(os.path.join(log.dir, "summary.md"), encoding="utf-8") as f:
+        summary = f.read()
+    assert "photodiode:ai2 +1.00000 V = 2.5 mW" in summary and "pfi0 1234 count" in summary
+    assert summary.count("📈 データ") == 1                 # the stop row repeats the same file
+    with open(os.path.join(log.dir, "metadata.json"), encoding="utf-8") as f:
+        import json
+        assert json.load(f)["output_files"]["data_dir"] == "data"
+
+
+def test_input_only_example_mock_run_keeps_its_data_in_the_run_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_flow, "LOGS_DIR", str(tmp_path / "logs"))
+    flow = os.path.join(REPO_ROOT, "examples", "daq", "acquire_and_count.json")
+    assert run_flow.main([flow, "--validate-only"]) == 0
+    assert run_flow.main([flow, "--mock"]) == 0
+    run_dir = _latest_run_dir(str(tmp_path / "logs"))
+    rows = _rows(run_dir)
+    assert [r["action"] for r in rows] == ["daq_acquire", "daq_start_logging", "daq_count_edges",
+                                           "daq_measure_frequency", "daq_read_digital",
+                                           "daq_stop_logging"]
+    assert all(r["status"] == "ok" and r["robot_id"] == "" for r in rows)
+    for row in (rows[0], rows[1]):
+        assert os.path.dirname(row["data_path"]) == os.path.join(run_dir, "data")
+        assert os.path.exists(row["data_path"])
+    assert rows[5]["data_path"] == rows[1]["data_path"] and int(rows[5]["daq_value"]) >= 1
+    assert len(_csv(rows[0]["data_path"])) == 5001          # header + 0.5 s at 10 kHz
+    assert (rows[2]["daq_value"], rows[2]["daq_unit"]) == ("1000", "count")
+
+
+def test_template_flow_needs_the_wiring_from_the_configuration(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_flow, "LOGS_DIR", str(tmp_path / "logs"))
+    flow = os.path.join(REPO_ROOT, "examples", "daq", "stimulus_response_template.json")
+    assert run_flow.main([flow, "--validate-only"]) == 0
+
+    def use(extra):
+        shared = dict(run_flow.lab_config.get_shared_devices(), daq_signals={},
+                      daq_ao_channels=[], daq_do_lines=[], daq_co_counters=[])
+        shared.update(extra)
+        monkeypatch.setattr(run_flow.lab_config, "get_shared_devices", lambda: dict(shared))
+
+    use({})                                                 # as shipped: the names mean nothing
+    assert run_flow.main([flow, "--mock"]) == 1
+    assert "daq_signals" in _rows(_latest_run_dir(str(tmp_path / "logs")))[0]["error"]
+
+    wiring = {"daq_signals": {"lamp": "ao0", "excitation": "ao1", "ready": "port0/line1",
+                              "photodiode": {"channel": "ai0", "scale": 2.0, "unit": "mW"},
+                              "valve": "port0/line0", "stirrer_clock": "ctr0"}}
+    use(wiring)                                             # named but not enabled: still refused
+    assert run_flow.main([flow, "--mock"]) == 1
+    assert "daq_ao_channels" in _rows(_latest_run_dir(str(tmp_path / "logs")))[0]["error"]
+
+    use({**wiring, "daq_ao_channels": ["ao0", "ao1"], "daq_do_lines": ["port0/line0"],
+         "daq_co_counters": ["ctr0"], "daq_ao_max_v": 5.0, "daq_co_max_hz": 1000.0})
+    assert run_flow.main([flow, "--mock"]) == 0
+    rows = _rows(_latest_run_dir(str(tmp_path / "logs")))
+    assert all(r["status"] == "ok" for r in rows) and len(rows) == 9
+    assert rows[3]["daq_channel"] == "photodiode:ai0" and rows[3]["daq_unit"] == "mW"
+
+
+def test_session_passes_signals_and_counter_settings_to_the_mock():
+    config = {"scale_port": "", "camera_index": 0, "daq_device": "Dev1", **ENABLED}
+
+    async def go():
+        session = ExperimentSession(mock=True, shared_config=config)
+        return await session.add_shared(use_daq=True)
+
+    shared = asyncio.run(go())
+    assert shared.daq_service.signals.names() == sorted(SIGNALS)
+    assert shared.daq_policy.co_counters == {"ctr1"} and shared.daq_policy.co_max_hz == 500.0
+
+
+def test_gui_palette_and_agent_prompt_cover_every_daq_action():
+    import ast
+    with open(os.path.join(REPO_ROOT, "src", "gui", "app.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    values = {t.id: n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+              for t in n.targets if isinstance(t, ast.Name)}
+    config = ast.literal_eval(values["ACTION_CONFIG"])
+    categories = ast.literal_eval(values["CATEGORIES"])
+    assert set(categories["daq"][1]) == DAQ_ACTIONS
+    for action in DAQ_ACTIONS:
+        # a block dropped from the palette is a valid step as it stands
+        _wf({"action": action, **config[action]["defaults"]})
+    from src.agent import llm_service
+    for action in DAQ_ACTIONS:
+        assert f'"action": "{action}"' in llm_service.SYSTEM_PROMPT
+
+
+# ----------------------------------------------------------------------
+# Review fixes: shutdown races, failed transitions, shared pins, timing
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("make", [NIDaq, MockNIDaq])
+def test_no_output_can_be_driven_after_close(bench, make):
+    """A worker thread that outlives a cancelled step must not drive anything behind close()."""
+    daq = make()
+    daq.write_analog("ao0", 1.0)
+    assert daq.close() == []
+    for call in (lambda: daq.write_analog("ao0", 1.0),
+                 lambda: daq.write_digital("port0/line0", True),
+                 lambda: daq.start_waveform("ao0", [0.0, 1.0], 100.0),
+                 lambda: daq.start_pulses("ctr0", 10.0)):
+        with pytest.raises(RuntimeError, match="closed"):
+            call()
+    if make is NIDaq:
+        assert daq.stop_output("ao0") is False              # harmless, sends nothing
+    assert daq.connect() is True
+    assert daq.write_analog("ao0", 1.0) == 1.0              # a new connection drives again
+
+
+def test_close_waits_for_an_output_call_still_running_in_another_thread(bench):
+    import threading
+    daq = NIDaq()
+    daq.write_analog("ao0", 1.0)
+    entered, release, order = threading.Event(), threading.Event(), []
+    task = daq._ao_tasks["ao0"]
+    original = task.write
+
+    def slow_write(data, auto_start=None):
+        if data == 2.0:
+            entered.set()
+            release.wait(5.0)
+            order.append("write 2.0 done")
+        original(data, auto_start=auto_start)
+
+    task.write = slow_write
+    worker = threading.Thread(target=daq.write_analog, args=("ao0", 2.0))
+    worker.start()
+    assert entered.wait(5.0)
+    closer = threading.Thread(target=lambda: order.append(("closed", daq.close())))
+    closer.start()
+    closer.join(0.2)
+    assert closer.is_alive()                                # close() is waiting for the write
+    release.set()
+    worker.join(5.0)
+    closer.join(5.0)
+    assert order == ["write 2.0 done", ("closed", [])]
+    assert bench.outputs["Dev1/ao0"] == 0.0                 # the reset came last
+
+
+def test_a_failed_waveform_start_does_not_make_close_forget_the_channel(bench):
+    daq = NIDaq()
+    daq.write_analog("ao0", 3.0)
+    bench.fail_start.add("Dev1/ao0")
+    with pytest.raises(RuntimeError, match="start failed"):
+        daq.start_waveform("ao0", [0.0, 1.0], 100.0)        # the DC task is gone, 3 V is held
+    assert "ao0" not in daq._ao_tasks and bench.outputs["Dev1/ao0"] != 0.0
+    assert daq.stop_output("ao0") is True                   # still known as driven
+    assert bench.outputs["Dev1/ao0"] == 0.0
+    daq.write_analog("ao0", 3.0)
+    with pytest.raises(RuntimeError, match="start failed"):
+        daq.start_waveform("ao0", [0.0, 1.0], 100.0)
+    assert daq.close() == [] and bench.outputs["Dev1/ao0"] == 0.0 and bench.open_tasks == 0
+
+
+def test_an_interrupted_pulse_start_leaves_no_task_behind(bench):
+    daq = NIDaq()
+    bench.fail_start.add("Dev1/ctr0")
+    with pytest.raises(RuntimeError, match="start failed"):
+        daq.start_pulses("ctr0", 10.0)
+    assert daq._co_tasks == {} and bench.open_tasks == 0
+
+
+@pytest.mark.parametrize("make", [NIDaq, MockNIDaq])
+def test_only_one_waveform_at_a_time(bench, make):
+    daq = make()
+    daq.start_waveform("ao0", [0.0, 1.0], 100.0)
+    with pytest.raises(RuntimeError, match="ao0 is generating a waveform"):
+        daq.start_waveform("ao1", [0.0, 1.0], 100.0)
+    daq.start_waveform("ao0", [0.0, 2.0], 100.0)            # replacing the same channel is fine
+    daq.write_analog("ao0", 0.0)                            # ends the waveform
+    daq.start_waveform("ao1", [0.0, 1.0], 100.0)
+    assert daq.close() == []
+
+
+@pytest.mark.parametrize("make", [NIDaq, MockNIDaq])
+def test_a_counter_output_pin_is_not_also_used_as_a_digital_line(bench, make):
+    daq = make()
+    daq.start_pulses("ctr0", 10.0)                          # comes out on PFI12 = port2/line4
+    with pytest.raises(RuntimeError, match="output pin of ctr0"):
+        daq.write_digital("port2/line4", True)
+    with pytest.raises(RuntimeError, match="output pin of ctr0"):
+        daq.read_digital("port2/line4")
+    daq.read_digital("port2/line5")
+    daq.stop_output("ctr0")
+    daq.write_digital("port2/line4", True)
+    with pytest.raises(RuntimeError, match="driven as a digital line"):
+        daq.start_pulses("ctr0", 10.0)
+    daq.start_pulses("ctr1", 10.0)
+    assert daq.close() == []
+
+
+def test_count_edges_follows_the_32_bit_counter_through_a_wrap(bench, monkeypatch):
+    daq = NIDaq()
+    readings = iter([4_000_000_000, 3_705_032_704, 3_410_065_408])   # +4e9 each, modulo 2**32
+    slept = []
+    import nidaqmx
+    monkeypatch.setattr(nidaqmx.Task, "read", lambda self, **kw: next(readings))
+    assert daq.count_edges("20mhztimebase", 25.0, sleep=slept.append) == 12_000_000_000
+    assert slept == [10.0, 10.0, 5.0]
+
+
+def test_the_time_axis_uses_the_rate_the_device_really_set(bench, tmp_path):
+    bench.coerced_rate = 3000.03
+    bench.inputs["Dev1/ai0"] = [0.0, 1.0, 2.0]
+    service = DaqService(NIDaq(), ENABLED)
+    path = str(tmp_path / "w.csv")
+    _go(service, "daq_acquire", channels=["ai0"], rate_hz=3000.0, duration_s=0.001, file_path=path)
+    rows = _csv(path)
+    assert [r[0] for r in rows[1:]] == ["0.000000", "0.000333", "0.000667"]
+    assert float(rows[2][0]) == pytest.approx(1 / 3000.03, abs=1e-6)
+    # the frequency on record is the one generated
+    bench.coerced_rate = 990.0
+    assert _go(service, "daq_generate_waveform", channel="ao0", frequency_hz=1.0,
+               amplitude_v=1.0, offset_v=1.0)["daq_value"] == pytest.approx(0.99)
+    assert service.close() == []
+
+
+def test_fast_waveforms_keep_distinct_times(tmp_path):
+    service, backend = _service()
+    path = str(tmp_path / "fast.csv")
+    _go(service, "daq_acquire", channels=["ai0"], rate_hz=1.25e6, duration_s=0.00001, file_path=path)
+    times = [r[0] for r in _csv(path)[1:]]
+    assert len(times) == len(set(times)) and times[1] == "0.000000800"
+
+
+def test_an_interrupted_low_pulse_ends_low_not_high():
+    service, backend = _service()
+
+    async def interrupted():
+        async def boom(seconds):
+            raise asyncio.CancelledError()
+        service._sleep = boom
+        await service.run("daq_pulse_digital", line="valve", duration_s=1.0, state=False)
+
+    backend.write_digital("port0/line3", True)              # the line idles high before the pulse
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(interrupted())
+    assert backend.digital_outputs == {"port0/line3": False}
+
+
+def test_service_close_resets_outputs_before_and_whatever_the_recording_does(tmp_path):
+    service, backend = _service()
+    _go(service, "daq_start_logging", channels=["ai0"], file_path=str(tmp_path / "l.csv"))
+    _go(service, "daq_write_analog", channel="lamp", voltage=2.0)
+    seen = {}
+
+    def broken_finish():
+        seen["lamp at the time"] = backend.analog_outputs["ao0"]
+        service._logging.stop.set()
+        raise RuntimeError("join failed")
+
+    service._finish_logging = broken_finish
+    assert service.close() == []
+    assert seen == {"lamp at the time": 0.0} and backend.analog_outputs == {"ao0": 0.0}
+
+
+def test_a_logging_thread_that_cannot_start_releases_the_inputs(tmp_path, monkeypatch):
+    import threading
+    service, backend = _service()
+    monkeypatch.setattr(threading.Thread, "start",
+                        lambda self: (_ for _ in ()).throw(RuntimeError("can't start new thread")))
+    with pytest.raises(RuntimeError, match="can't start"):
+        _go(service, "daq_start_logging", channels=["ai0"], file_path=str(tmp_path / "l.csv"))
+    monkeypatch.undo()
+    assert service._logging is None
+    assert _go(service, "daq_read_analog", channel="ai0")["voltage"] == 1.234   # inputs are free
+    assert service.close() == []
+
+
+def test_non_finite_calibration_and_thresholds_are_refused():
+    for spec in ({"channel": "ai0", "offset": float("inf")}, {"channel": "ai0", "scale": float("-inf")}):
+        with pytest.raises(DaqPolicyError, match="finite"):
+            DaqSignals.from_config({"daq_signals": {"sensor": spec}})
+    service, backend = _service(mock=False)
+    with pytest.raises(ValueError, match="finite"):
+        _go(service, "daq_wait_analog", channel="ai0", threshold=float("nan"))
+    backend.read_analog = lambda *a: float("inf")
+    with pytest.raises(RuntimeError, match="not a finite number"):
+        _go(service, "daq_wait_analog", channel="ai0", threshold=1.0, timeout_s=0.1)

@@ -16,13 +16,15 @@ logging.basicConfig(
 )
 _default_logger = logging.getLogger(__name__)
 
+# NI の DAQ デバイス（USB-6351）が要るアクション（一覧は DaqService と共有）
+from src.devices.nidaq.service import ACTIONS as _DAQ_ACTION_NAMES
+
+DAQ_ACTIONS = set(_DAQ_ACTION_NAMES)
 # 共有デバイス用アクション（robot_idに依存しない）
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
-                         "capture_microscope", "microscope_led", "microscope_focus",
-                         "daq_read_analog", "daq_write_analog",
-                         "daq_read_digital", "daq_write_digital"}
-# NI の DAQ デバイス（USB-6351）が要るアクション
-DAQ_ACTIONS = {"daq_read_analog", "daq_write_analog", "daq_read_digital", "daq_write_digital"}
+                         "capture_microscope", "microscope_led", "microscope_focus"} | DAQ_ACTIONS
+# CSV（波形・連続記録）を保存する DAQ アクション。保存先は実行フォルダに束ねる
+DAQ_DATA_ACTIONS = {"daq_acquire": "acquire", "daq_start_logging": "logging"}
 MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
 # 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
 MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}
@@ -184,29 +186,26 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
 
     # ===== DAQ（NI USB-6351）操作 =====
     elif action in DAQ_ACTIONS:
-        def param(name, default=None):
-            value = step.get(name) if isinstance(step, dict) else getattr(step, name, None)
-            return default if value is None else value
-
-        if action == "daq_read_analog":
-            channel = param("channel")
-            volts = await shared_devices.daq_read_analog(
-                channel, param("samples", 100), param("rate_hz", 1000.0),
-                param("v_range", 10.0), param("terminal", "default"))
-            logger.info(f"  測定結果: {channel} = {volts:+.5f} V")
-            return {"voltage": volts, "daq_channel": channel}
-        if action == "daq_write_analog":
-            channel = param("channel")
-            volts = await shared_devices.daq_write_analog(channel, param("voltage"))
-            return {"voltage": volts, "daq_channel": channel}
-        if action == "daq_read_digital":
-            line = param("line")
-            state = await shared_devices.daq_read_digital(line)
-            logger.info(f"  測定結果: {line} = {'High' if state else 'Low'}")
-            return {"digital_state": bool(state), "daq_channel": line}
-        line = param("line")
-        state = await shared_devices.daq_write_digital(line, param("state"))
-        return {"digital_state": bool(state), "daq_channel": line}
+        # ステップに書かれたフィールドだけを渡す（省略された v_range / terminal は
+        # config.yaml の信号の設定、無ければ既定値を DaqService が使う）
+        if isinstance(step, dict):
+            params = {k: v for k, v in step.items()
+                      if k != "action" and not k.startswith("_") and v is not None}
+        else:
+            params = {k: v for k, v in step.model_dump(exclude_unset=True).items()
+                      if k != "action" and v is not None}
+        if not hasattr(shared_devices, "daq_step"):
+            raise RuntimeError("この SharedDevices は DAQ（daq_step）に対応していません")
+        result = await shared_devices.daq_step(action, **params)
+        if "voltage" in result and action in ("daq_read_analog", "daq_wait_analog"):
+            logger.info(f"  測定結果: {result['daq_channel']} = {result['voltage']:+.5f} V")
+        elif "digital_state" in result and action == "daq_read_digital":
+            logger.info(f"  測定結果: {result['daq_channel']} = "
+                        f"{'High' if result['digital_state'] else 'Low'}")
+        elif "daq_value" in result:
+            logger.info(f"  結果: {result['daq_channel']} = {result['daq_value']:g} "
+                        f"{result.get('daq_unit', '')}")
+        return result
 
     else:
         # 未知のアクションを警告だけで読み飛ばすと、後続ステップが想定外の

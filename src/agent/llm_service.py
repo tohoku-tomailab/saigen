@@ -98,10 +98,22 @@ SYSTEM_PROMPT = """
 - tare_scale: {"action": "tare_scale", "delay": 1.0} (風袋引き)
 
 ### DAQ 操作（NI USB-6351）※共有デバイスのためrobot_id不要。ユーザーが明示的に求めたときだけ使う
-- daq_read_analog: {"action": "daq_read_analog", "channel": "ai0", "samples": 100, "rate_hz": 1000.0, "v_range": 10.0, "terminal": "default"} (アナログ入力の電圧を samples 回平均で測定。channel: ai0-ai15, v_range: ±V で 0.1/0.2/0.5/1/2/5/10, terminal: "default"/"rse"/"nrse"/"diff")
-- daq_write_analog: {"action": "daq_write_analog", "channel": "ao0", "voltage": 2.5} (アナログ出力を DC 電圧に設定して保持。channel: ao0-ao1。config.yaml で許可されたチャンネル・電圧範囲のみ。実行終了時に 0 V に戻る)
+チャンネルは config.yaml の daq_signals で定義された信号名（ユーザーが名前を示した場合）か、物理名（ai0-ai15 / ao0-ao1 / port0/line0 / ctr0-ctr3 / pfi0-pfi15）。出力は config.yaml で許可されたものだけが実行でき、実行終了時に 0 V / Low / 停止 に戻る
+- daq_read_analog: {"action": "daq_read_analog", "channel": "ai0", "samples": 100, "rate_hz": 1000.0} (電圧を samples 回平均で測定。任意: "v_range": 0.1/0.2/0.5/1/2/5/10, "terminal": "default"/"rse"/"nrse"/"diff")
+- daq_acquire: {"action": "daq_acquire", "channels": ["ai0", "ai1"], "rate_hz": 1000.0, "duration_s": 1.0} (波形を取り込んで CSV に保存。任意: "trigger": "pfi0", "trigger_edge": "rising"/"falling", "timeout_s": 10.0)
+- daq_start_logging: {"action": "daq_start_logging", "channels": ["ai0"], "rate_hz": 100.0} (連続記録を開始。他のステップの実行中も記録が続く。記録中は他のアナログ入力ステップは使えない)
+- daq_stop_logging: {"action": "daq_stop_logging"} (連続記録を終了)
+- daq_wait_analog: {"action": "daq_wait_analog", "channel": "ai0", "condition": "above", "threshold": 1.0, "timeout_s": 60.0} (しきい値を超える/下回るまで待つ。condition: "above"/"below"。時間切れでフローは止まる)
+- daq_write_analog: {"action": "daq_write_analog", "channel": "ao0", "voltage": 2.5} (アナログ出力を DC 電圧に設定して保持)
+- daq_generate_waveform: {"action": "daq_generate_waveform", "channel": "ao0", "waveform": "sine", "frequency_hz": 10.0, "amplitude_v": 1.0, "offset_v": 1.0, "duration_s": 5.0} (周期波形を出力。waveform: "sine"/"square"/"triangle"/"sawtooth"。出力は offset_v ± amplitude_v。duration_s を省くと daq_stop_output まで継続)
+- daq_stop_output: {"action": "daq_stop_output", "channel": "ao0"} (出力を 0 V / Low / 停止 に戻す。channel は ao・デジタルライン・カウンタ)
 - daq_read_digital: {"action": "daq_read_digital", "line": "port0/line0"} (デジタル入力を読む)
-- daq_write_digital: {"action": "daq_write_digital", "line": "port0/line0", "state": true} (デジタル出力。state: true=High/false=Low。config.yaml で許可されたラインのみ。実行終了時に Low に戻る)
+- daq_write_digital: {"action": "daq_write_digital", "line": "port0/line0", "state": true} (デジタル出力。state: true=High/false=Low)
+- daq_pulse_digital: {"action": "daq_pulse_digital", "line": "port0/line0", "duration_s": 0.5} (duration_s 秒だけ High にして Low に戻す)
+- daq_wait_digital: {"action": "daq_wait_digital", "line": "port0/line1", "state": true, "timeout_s": 60.0} (ラインが指定レベルになるまで待つ。時間切れでフローは止まる)
+- daq_count_edges: {"action": "daq_count_edges", "terminal": "pfi0", "duration_s": 1.0} (duration_s 秒間のパルス数を数える。任意: "edge": "rising"/"falling")
+- daq_measure_frequency: {"action": "daq_measure_frequency", "terminal": "pfi0", "min_hz": 1.0, "max_hz": 100000.0} (周波数を測定)
+- daq_generate_pulses: {"action": "daq_generate_pulses", "counter": "ctr0", "frequency_hz": 100.0, "duty_cycle": 0.5, "duration_s": 2.0} (パルス列/PWM を出力。"count": パルス数 か "duration_s": 秒 のどちらか。両方省くと daq_stop_output まで継続)
 
 ### ユーティリティ
 - wait: {"action": "wait", "robot_id": 1, "seconds": 2.0}

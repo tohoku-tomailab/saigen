@@ -190,6 +190,8 @@ class ExperimentLogger:
         focus_converged = result.get("focus_converged")
         voltage = result.get("voltage")
         digital_state = result.get("digital_state")
+        daq_value = result.get("daq_value")
+        data_path = result.get("data_path")
         # 撮影ステップが「画像なし」で成功扱いになるのを防ぐ（executor も例外に
         # するが、戻り値だけを渡す呼び出し側があっても記録を誤らせない）
         if status == "ok" and "image_path" in result and not image_path:
@@ -217,6 +219,12 @@ class ExperimentLogger:
             "voltage_v": (f"{voltage:.6f}" if isinstance(voltage, (int, float))
                           and not isinstance(voltage, bool) else ""),
             "digital_state": "" if digital_state is None else ("1" if digital_state else "0"),
+            # 換算値（信号の単位）・カウント・周波数など。単位は daq_unit
+            "daq_value": (f"{daq_value:.9g}" if isinstance(daq_value, (int, float))
+                          and not isinstance(daq_value, bool) else ""),
+            "daq_unit": (result.get("daq_unit") or "") if daq_value is not None else "",
+            # 波形・連続記録の CSV
+            "data_path": data_path or "",
             "error": error or "",
         }
         self.records.append(record)
@@ -234,6 +242,12 @@ class ExperimentLogger:
                 "kind": "image", "detail": image_path,
                 "step_index": index, "iteration": record["iteration"],
             })
+        if data_path and action != "daq_stop_logging":   # 開始時に同じファイルを載せている
+            self.events.append({
+                "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
+                "kind": "data", "detail": data_path,
+                "step_index": index, "iteration": record["iteration"],
+            })
 
     def next_image_path(self, index, tag: str = ""):
         """capture_and_save / capture_microscope 用の保存先パスを払い出す
@@ -243,6 +257,14 @@ class ExperimentLogger:
         middle = f"_{tag}" if tag else ""
         filename = f"step{index:03d}{middle}_{ts}.jpg"
         return os.path.join(self.images_dir, filename)
+
+    def next_data_path(self, index, tag: str = "daq"):
+        """daq_acquire / daq_start_logging 用の保存先パスを払い出す（実行フォルダの
+        data/ に束ねる。フォルダは最初の払い出しで作る）。"""
+        data_dir = os.path.join(self.dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        ts = datetime.now().strftime("%H%M%S")
+        return os.path.join(data_dir, f"step{index:03d}_{tag}_{ts}.csv")
 
     # ------------------------------------------------------------------
     # 終了処理
@@ -271,7 +293,8 @@ class ExperimentLogger:
         fields = ["timestamp", "mode", "elapsed_s", "step_index", "total_steps",
                   "iteration", "action", "robot_id", "status", "duration_s",
                   "weight_g", "nominal_time_s", "image_path", "focus_position",
-                  "focus_converged", "daq_channel", "voltage_v", "digital_state", "error"]
+                  "focus_converged", "daq_channel", "voltage_v", "digital_state",
+                  "daq_value", "daq_unit", "data_path", "error"]
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -308,6 +331,7 @@ class ExperimentLogger:
                 "measurements_csv": os.path.basename(self.csv_path),
                 "summary": os.path.basename(self.summary_path),
                 "images_dir": "images",
+                "data_dir": "data" if os.path.isdir(os.path.join(self.dir, "data")) else None,
             },
         }
         with open(self.metadata_path, "w", encoding="utf-8") as f:
@@ -360,9 +384,9 @@ class ExperimentLogger:
             lines.append("| 経過(s) | 時刻 | 種別 | ステップ | 反復 | 内容 |")
             lines.append("|--------:|------|------|---------:|------|------|")
             for e in self.events:
-                kind = "⚖️ 重量" if e["kind"] == "weight" else "📷 画像"
+                kind = {"weight": "⚖️ 重量", "image": "📷 画像", "data": "📈 データ"}[e["kind"]]
                 detail = e["detail"]
-                if e["kind"] == "image":
+                if e["kind"] in ("image", "data"):
                     rel = os.path.relpath(detail, self.dir) if os.path.isabs(detail) else detail
                     detail = f"[{os.path.basename(detail)}]({rel.replace(os.sep, '/')})"
                 lines.append(f"| {e['elapsed_s']:.1f} | {e['timestamp'].split(' ')[1]} "
@@ -397,8 +421,16 @@ class ExperimentLogger:
                 note = f"lens {r['focus_position']}"
                 if r.get("focus_converged") == "False":
                     note += " (not converged)"
+            elif r.get("data_path"):
+                note = f"{r['daq_channel']} -> {os.path.basename(r['data_path'])}"
+                if r.get("daq_value"):
+                    note += f" ({r['daq_value']} {r['daq_unit']})"
             elif r.get("voltage_v"):
                 note = f"{r['daq_channel']} {float(r['voltage_v']):+.5f} V"
+                if r.get("daq_value"):
+                    note += f" = {r['daq_value']} {r['daq_unit']}"
+            elif r.get("daq_value"):
+                note = f"{r['daq_channel']} {r['daq_value']} {r['daq_unit']}"
             elif r.get("digital_state"):
                 note = f"{r['daq_channel']} {'High' if r['digital_state'] == '1' else 'Low'}"
             elif r["error"]:

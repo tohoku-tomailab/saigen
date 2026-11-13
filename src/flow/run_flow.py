@@ -60,7 +60,7 @@ from pydantic import ValidationError
 from src import config as lab_config
 from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import (execute_step, expand_loops, SHARED_DEVICE_ACTIONS, DAQ_ACTIONS,
+from src.flow.executor import (execute_step, expand_loops, SHARED_DEVICE_ACTIONS, DAQ_ACTIONS, DAQ_DATA_ACTIONS,
                                MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS)
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, robot_type, validator_for_robot
@@ -769,6 +769,10 @@ async def run(args) -> int:
                 step = {**step, "file_path": exp_logger.next_image_path(i)}
             elif action == "capture_microscope" and not step.get("file_path"):
                 step = {**step, "file_path": exp_logger.next_image_path(i, tag="microscope")}
+            elif action in DAQ_DATA_ACTIONS and not step.get("file_path"):
+                # DAQ の波形・連続記録も実験フォルダ内（data/）に束ねる
+                step = {**step, "file_path": exp_logger.next_data_path(
+                    i, tag=DAQ_DATA_ACTIONS[action])}
 
             iteration = step.get("_iteration")
             t_start = time.monotonic()
