@@ -47,7 +47,8 @@ configuration and flow files, not in the driver code.
 | `examples/keithley2002/` | DMM-only flow for the Keithley 2002 (`measure_dmm`). |
 | `examples/li5640/` | Lock-in-only flow for the NF LI5640 (`measure_lockin`); `oscillator/` holds an oscillator sweep read on the oscilloscope (`set_lockin_oscillator`, refused unless `config.yaml` enables it). |
 | `examples/dso1000/` | Oscilloscope-only flow for the Agilent 1000 series (`measure_scope`). |
-| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument, MaxArm commissioning notes (`maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery), Keithley 2002 commissioning notes (`keithley2002-commissioning.md`: order of work, what the firmware accepted, open observations, interruption rules), NF LI5640 commissioning notes (`li5640-commissioning.md`: read-only scope, what the firmware answered, defects found by review, open points, the internal-oscillator bench test), Agilent DSO1014A commissioning notes (`dso1000-commissioning.md`: reply forms, GTL hang over USB, defects found by review, open points), Dobot MG400 notes (`mg400-commissioning.md`: replies seen, the refused GetPose form, the record under OneDrive, the dropped first Dashboard connection, the order of work for the jog tool and the flow bench stages C1 to D, open points, what Ctrl+C does in each tool and in a flow). |
+| `docs/` | Bill of materials, setup guide, flow format reference, spreadsheet guide, guide to adding an instrument. |
+| `knowledge/` | Knowledge base, index in `knowledge/README.md`: MaxArm commissioning notes (`knowledge/maxarm-commissioning.md`: what the bench taught, numbers, reachable envelope, recovery), Keithley 2002 commissioning notes (`knowledge/keithley2002-commissioning.md`: order of work, what the firmware accepted, open observations, interruption rules), NF LI5640 commissioning notes (`knowledge/li5640-commissioning.md`: read-only scope, what the firmware answered, defects found by review, open points, the internal-oscillator bench test), Agilent DSO1014A commissioning notes (`knowledge/dso1000-commissioning.md`: reply forms, GTL hang over USB, defects found by review, open points), Dobot MG400 notes (`knowledge/mg400-commissioning.md`: replies seen, the refused GetPose form, the record under OneDrive, the dropped first Dashboard connection, the order of work for the jog tool and the flow bench stages C1 to D, open points, what Ctrl+C does in each tool and in a flow). A new instrument gets its own note here (`knowledge/README.md`, "Adding a note"). |
 | `tests/`, `src/monitoring/tests/`, `src/imaging/tests/` | Unit tests; none need hardware. |
 
 ## How to verify a change (no hardware needed)
@@ -168,7 +169,7 @@ never a silent fallback to the built-in defaults. The CI workflow in
   fake). Start from `examples/mg400/z_hop.json`;
   `--validate-only`, then `--mock`, and stop there: the real run asks the
   human for Enter on the terminal (`docs/setup.md` §13), and the bench stages
-  C1 to D (`docs/mg400-commissioning.md` §2) run only when the human asks.
+  C1 to D (`knowledge/mg400-commissioning.md` §2) run only when the human asks.
   The MG400 accepts only `move_xyz`, `move_z`, `go_home` and `wait`; a move
   refused by its six validation steps is reported with the step and the
   value, never worked around (rule 2: `joint_limits` only tighten,

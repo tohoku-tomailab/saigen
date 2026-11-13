@@ -3,7 +3,7 @@
 - `z_hop.json`: robot 5 goes to its configured `home_position`, lifts the flange by 5 mm,
   waits one second, lowers it by 5 mm and returns home (which then sends nothing: the arm
   is already within 1 mm of home). Every move is one straight `MovL` inside the robot's own
-  workspace box. It is the flow of bench stage C2 (`docs/mg400-commissioning.md` §2).
+  workspace box. It is the flow of bench stage C2 (`knowledge/mg400-commissioning.md` §2).
 - `config.mg400.yaml`: a complete `config.yaml` with the MG400 as robot 5. Copy it to the
   repository root as `config.yaml` (or merge its `robots.5` entry into yours) and edit it.
   Every key of the entry is required and nothing is inherited; the numbers are **not**

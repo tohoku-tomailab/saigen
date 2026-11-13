@@ -9,7 +9,7 @@
 # small volume around the fake controller's start pose, the home is inside it, the
 # joint limits are the published ranges. Measure your arm's rest pose and the clear
 # volume around it (DobotStudio Pro shows the pose), then tighten every value before
-# the first real run (docs/mg400-commissioning.md, stage C2). An agent never widens
+# the first real run (knowledge/mg400-commissioning.md, stage C2). An agent never widens
 # them.
 # ===================================================================
 

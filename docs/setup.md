@@ -309,7 +309,7 @@ coordinates of your vials and rests, jog the arm with
 this tool (see `CLAUDE.md`, rule 1). Details, the wire protocol and the
 restore-to-factory notes are in [`src/devices/maxarm/README.md`](../src/devices/maxarm/README.md);
 the order of work that proved safe, the numbers measured on a real arm and the
-recovery steps are in [`maxarm-commissioning.md`](maxarm-commissioning.md).
+recovery steps are in [`knowledge/maxarm-commissioning.md`](../knowledge/maxarm-commissioning.md).
 
 **Configuration.** Set the port in `config.yaml` (or `--robot4-maxarm COM11` /
 `ROBOT4_MAXARM_PORT`):
@@ -474,7 +474,7 @@ current.
 
 What commissioning the first unit taught (order of work, what the firmware
 accepted, an unexplained line-sync observation, things not to do) is in
-[`keithley2002-commissioning.md`](keithley2002-commissioning.md).
+[`knowledge/keithley2002-commissioning.md`](../knowledge/keithley2002-commissioning.md).
 
 ## 11. NF LI5640 lock-in amplifier (optional, read-only)
 
@@ -579,7 +579,7 @@ sweeps the amplitude and frequency and reads OSC OUT on the oscilloscope of §12
 
 What commissioning the first unit taught (what firmware 1.60 answered, the
 defects review found before the bench, open points, things not to do) is in
-[`li5640-commissioning.md`](li5640-commissioning.md).
+[`knowledge/li5640-commissioning.md`](../knowledge/li5640-commissioning.md).
 
 ## 12. Agilent 1000 series oscilloscope (optional, read-only)
 
@@ -641,7 +641,7 @@ both forms are accepted); accuracy against a known reference was not checked.
 
 What commissioning the first unit taught (what firmware 00.04.04 answered, the
 defects found on the bench and by review, open points, things not to do) is in
-[`dso1000-commissioning.md`](dso1000-commissioning.md).
+[`knowledge/dso1000-commissioning.md`](../knowledge/dso1000-commissioning.md).
 
 ## 13. Dobot MG400 robot (optional)
 
@@ -654,7 +654,7 @@ the wrapper `src/devices/safety/mg400_robot.py` is the only code that sends
 control commands to the arm from a flow. The two human-run tools of
 `src/devices/mg400/` (observation and jog) are unchanged; what the bench
 taught before the first flow is in
-[`mg400-commissioning.md`](mg400-commissioning.md).
+[`knowledge/mg400-commissioning.md`](../knowledge/mg400-commissioning.md).
 
 **Configuration.** A complete file is
 [`examples/mg400/config.mg400.yaml`](../examples/mg400/config.mg400.yaml);
@@ -715,7 +715,7 @@ and 0.2° of the target) within a deadline derived from the distance.
 
 **Joint tracking at rest.** `GetAngle()` answers the controller's target angles,
 not the measured ones (stage C1 saw J2 2° below its target with no alarm,
-`docs/mg400-commissioning.md` §3.13). So the robot type also reads the feedback
+`knowledge/mg400-commissioning.md` §3.13). So the robot type also reads the feedback
 port's measured angles (`q_actual`) and compares them, joint by joint, with the
 target (`q_target`). After the Enable, at every pose read while enabled, before
 every `MovL` and at arrival it also compares them with the `GetAngle()` value it
@@ -824,11 +824,11 @@ every measured pose, every move with its validation and arrival, and the `stop`
 section when a stop ran. `metadata.json` carries the summary under
 `robot_reports`. The record is saved with the jog tool's retrying writer; a
 folder synced by OneDrive can still refuse the final rename
-(`mg400-commissioning.md` §3.3), so keep `logs/` outside synced folders when
+(`knowledge/mg400-commissioning.md` §3.3), so keep `logs/` outside synced folders when
 you can.
 
 **Bench order** (each stage only when the human asks, in the session;
-`mg400-commissioning.md` §2): the jog tool's stop sequence on the arm once (C1),
+`knowledge/mg400-commissioning.md` §2): the jog tool's stop sequence on the arm once (C1),
 `z_hop.json` with the measured `config.yaml` (C2), the same flow with a Ctrl+C
 during a move (C3), then the user's own flows at ratio 10 (D). A payload, a
 tool on the flange, R changes and ratios above 10 are later plans.
