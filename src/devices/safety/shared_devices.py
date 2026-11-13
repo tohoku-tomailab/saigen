@@ -46,6 +46,7 @@ class SharedDevices:
                  use_camera: bool = False,
                  use_microscope: bool = False,
                  use_microscope_serial: bool = False,
+                 use_daq: bool = False,
                  **device_configs):
         """
         SharedDevicesを初期化
@@ -65,18 +66,26 @@ class SharedDevices:
                   (UM22 系の CP210x。空なら LED 制御なし、撮影のみ)
                 - microscope_resolution: str (デフォルト: '3840x2160') - 顕微鏡の撮影解像度
                   ("幅x高さ"。データ量を抑えるなら "1280x720" など)
+            use_daq: NI の DAQ デバイス（USB-6351）を使用するか（daq_* アクション）
+                - daq_device: str (デフォルト: '') - NI MAX 上のデバイス名（例: Dev1）
+                - daq_ao_channels / daq_do_lines: list - 出力を許可するチャンネル
+                  （空なら出力はすべて拒否。入力は常に可）
+                - daq_ao_min_v / daq_ao_max_v: float - アナログ出力の許容範囲 (V)
         """
         # デバイス使用フラグ
         self.use_scale = use_scale
         self.use_camera = use_camera
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
+        self.use_daq = use_daq
 
         # デバイスインスタンス（初期化前はNone）
         self.scale = None
         self.camera = None
         self.microscope = None
         self.microscope_serial = None
+        self.daq = None
+        self.daq_policy = None
 
         # デバイス設定
         self.device_configs = device_configs
@@ -113,6 +122,11 @@ class SharedDevices:
                     return False
             if self.use_microscope_serial:
                 if not await self._initialize_microscope_serial():
+                    return False
+
+            # DAQ（NI USB-6351）の初期化: デバイスの存在確認のみ。出力は何も駆動しない
+            if self.use_daq:
+                if not await self._initialize_daq():
                     return False
 
             self._initialized = True
@@ -209,6 +223,33 @@ class SharedDevices:
 
         except Exception as e:
             logger.error(f"デジタル顕微鏡（制御ポート）初期化エラー: {e}")
+            return False
+
+    async def _initialize_daq(self) -> bool:
+        """NI の DAQ デバイスを初期化（存在確認のみ。チャンネルは開かない）"""
+        device = self.device_configs.get('daq_device') or ""
+        if not device:
+            logger.error("DAQ のデバイス名が未設定です "
+                         "(config.yaml の shared_devices.daq_device に NI MAX 上の名前を設定してください)")
+            return False
+        try:
+            logger.info(f"DAQ（{device}）を初期化中...")
+            from src.devices.nidaq import DaqOutputPolicy, NIDaq
+
+            # 出力の許可リストと電圧範囲。設定が不正ならここで止める
+            self.daq_policy = DaqOutputPolicy.from_config(self.device_configs)
+            daq = NIDaq(device=device)
+            if not daq.connect():
+                return False
+            self.daq = daq
+            logger.info(f"✓ DAQ 初期化完了 ({device}, {daq.product_type}) "
+                        f"出力許可: AO {sorted(self.daq_policy.ao_channels) or 'なし'} "
+                        f"[{self.daq_policy.ao_min_v:g}..{self.daq_policy.ao_max_v:g} V], "
+                        f"DO {sorted(self.daq_policy.do_lines) or 'なし'}")
+            return True
+
+        except Exception as e:
+            logger.error(f"DAQ 初期化エラー: {e}")
             return False
 
     @staticmethod
@@ -488,12 +529,104 @@ class SharedDevices:
         return _Pump()
 
     # ========================================
+    # DAQ（NI USB-6351）操作
+    # ========================================
+
+    def _require_daq(self):
+        if not self.use_daq or self.daq is None or self.daq_policy is None:
+            raise RuntimeError("DAQ が初期化されていません "
+                               "(config.yaml の shared_devices.daq_device を設定してください)")
+        return self.daq
+
+    async def daq_read_analog(self, channel: str, samples: int = 100, rate_hz: float = 1000.0,
+                              v_range: float = 10.0, terminal: str = "default") -> float:
+        """
+        アナログ入力 1 チャンネルの電圧（samples 回の平均）を読む
+
+        Args:
+            channel: "ai0" など（デバイス名は付けない）
+            samples: 平均するサンプル数
+            rate_hz: サンプリング周波数 (Hz)
+            v_range: 入力レンジ ±v_range (V)
+            terminal: 配線方式 "default" / "rse" / "nrse" / "diff"
+
+        Returns:
+            float: 平均電圧 (V)
+        """
+        daq = self._require_daq()
+        try:
+            # 取り込みは samples / rate_hz 秒ブロックするので別スレッドで待つ
+            volts = await asyncio.to_thread(daq.read_analog, channel, samples, rate_hz,
+                                            v_range, terminal)
+            logger.info(f"✓ DAQ {channel}: {volts:+.5f} V（{samples} 点平均）")
+            return volts
+        except Exception as e:
+            logger.error(f"DAQ アナログ入力エラー ({channel}): {e}")
+            raise
+
+    async def daq_write_analog(self, channel: str, voltage: float) -> float:
+        """
+        アナログ出力 1 チャンネルを DC 電圧に設定して保持する
+
+        config.yaml の daq_ao_channels に無いチャンネル、daq_ao_min_v..daq_ao_max_v の
+        外の電圧は DaqPolicyError で拒否する（デバイスには何も送らない）。
+        """
+        daq = self._require_daq()
+        name, volts = self.daq_policy.check_analog_output(channel, voltage)
+        try:
+            daq.write_analog(name, volts)
+            logger.info(f"✓ DAQ {name} = {volts:+.4f} V")
+            return volts
+        except Exception as e:
+            logger.error(f"DAQ アナログ出力エラー ({name}): {e}")
+            raise
+
+    async def daq_read_digital(self, line: str) -> bool:
+        """デジタル 1 ラインを入力として読む（True = High）"""
+        daq = self._require_daq()
+        try:
+            state = bool(daq.read_digital(line))
+            logger.info(f"✓ DAQ {line}: {'High' if state else 'Low'}")
+            return state
+        except Exception as e:
+            logger.error(f"DAQ デジタル入力エラー ({line}): {e}")
+            raise
+
+    async def daq_write_digital(self, line: str, state: bool) -> bool:
+        """
+        デジタル 1 ラインを High / Low に駆動して保持する
+
+        config.yaml の daq_do_lines に無いラインは DaqPolicyError で拒否する。
+        """
+        daq = self._require_daq()
+        name = self.daq_policy.check_digital_output(line)
+        try:
+            daq.write_digital(name, bool(state))
+            logger.info(f"✓ DAQ {name} = {'High' if state else 'Low'}")
+            return bool(state)
+        except Exception as e:
+            logger.error(f"DAQ デジタル出力エラー ({name}): {e}")
+            raise
+
+    # ========================================
     # ライフサイクル管理
     # ========================================
 
     async def cleanup(self):
         """全共有デバイスを安全に切断"""
         logger.info("=== SharedDevices 切断開始 ===")
+
+        # DAQ を最初に閉じる: 駆動した出力を 0 V / Low に戻すのを他の後始末より先にする
+        try:
+            if self.daq:
+                failed = self.daq.close()
+                if failed:
+                    logger.error(f"DAQ の出力を安全状態に戻せませんでした: {failed} "
+                                 "（配線先の機器を手で止めてください）")
+                else:
+                    logger.info("✓ DAQ 切断完了（出力は 0 V / Low）")
+        except Exception as e:
+            logger.error(f"DAQ 切断エラー: {e}（出力が残っている可能性があります）")
 
         try:
             if self.scale:

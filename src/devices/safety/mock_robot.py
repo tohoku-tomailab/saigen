@@ -435,9 +435,20 @@ class MockSharedDevices:
     #: measure_weight が返すモック測定値 (g)
     MOCK_WEIGHT = 4.98
 
+    #: daq_read_analog が返すモック電圧 (V)
+    MOCK_VOLTAGE = 1.234
+
     def __init__(self, use_scale: bool = False, use_camera: bool = False,
-                 use_microscope: bool = False, use_microscope_serial: bool = False, **_ignored):
+                 use_microscope: bool = False, use_microscope_serial: bool = False,
+                 use_daq: bool = False, **device_configs):
         self.use_scale = use_scale
+        self.use_daq = use_daq
+        # 出力の許可リスト・電圧範囲は実機と同じクラスで判定する（--mock で通った
+        # フローが実機でこの理由により拒否されないように）
+        from src.devices.nidaq.policy import DaqOutputPolicy
+        self.daq_policy = DaqOutputPolicy.from_config(device_configs) if use_daq else None
+        self.daq_analog_outputs = {}    # {"ao0": 2.5}
+        self.daq_digital_outputs = {}   # {"port0/line0": True}
         self.use_camera = use_camera
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
@@ -505,5 +516,52 @@ class MockSharedDevices:
         logger.info(f"✓ [MOCK] 顕微鏡フォーカス {mode}: レンズ位置 {self.microscope_focus_position}")
         return {"focus_position": self.microscope_focus_position, "focus_converged": True}
 
+    def _require_daq(self):
+        if not self.use_daq or self.daq_policy is None:
+            raise RuntimeError("DAQ が初期化されていません "
+                               "(config.yaml の shared_devices.daq_device を設定してください)")
+
+    async def daq_read_analog(self, channel: str, samples: int = 100, rate_hz: float = 1000.0,
+                              v_range: float = 10.0, terminal: str = "default") -> float:
+        from src.devices.nidaq.policy import normalize_ai
+        self._require_daq()
+        normalize_ai(channel)
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] DAQ {channel}: {self.MOCK_VOLTAGE:+.5f} V（{samples} 点平均）")
+        return self.MOCK_VOLTAGE
+
+    async def daq_write_analog(self, channel: str, voltage: float) -> float:
+        self._require_daq()
+        name, volts = self.daq_policy.check_analog_output(channel, voltage)
+        self.daq_analog_outputs[name] = volts
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] DAQ {name} = {volts:+.4f} V")
+        return volts
+
+    async def daq_read_digital(self, line: str) -> bool:
+        from src.devices.nidaq.policy import normalize_line
+        self._require_daq()
+        name = normalize_line(line)
+        if name in self.daq_digital_outputs:
+            # 実機ドライバと同じ: 出力として駆動中のラインは入力として読めない
+            raise RuntimeError(f"{name} is being driven as an output in this session; "
+                               "reading it as an input would release it")
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] DAQ {name}: Low")
+        return False
+
+    async def daq_write_digital(self, line: str, state: bool) -> bool:
+        self._require_daq()
+        name = self.daq_policy.check_digital_output(line)
+        self.daq_digital_outputs[name] = bool(state)
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] DAQ {name} = {'High' if state else 'Low'}")
+        return bool(state)
+
     async def cleanup(self):
+        # 実機と同じく、駆動した出力は 0 V / Low に戻す
+        for name in self.daq_analog_outputs:
+            self.daq_analog_outputs[name] = 0.0
+        for name in self.daq_digital_outputs:
+            self.daq_digital_outputs[name] = False
         logger.info("✓ [MOCK] 共有デバイスの仮想接続を切断")
