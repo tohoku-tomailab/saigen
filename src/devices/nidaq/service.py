@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import List, Optional, Sequence
 
 from .policy import (AO_MAX_RATE_HZ, EDGES, TERMINALS, V_RANGES, WAVEFORMS, DaqOutputPolicy,
-                     DaqPolicyError, DaqSignals, Signal)
+                     DaqPolicyError, DaqSignals, Signal, check_timed_lines)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,8 @@ DEFAULT_TERMINAL = "default"
 
 #: Upper bound of one daq_acquire (points summed over the channels): the CSV stays usable.
 MAX_ACQUIRE_POINTS = 2_000_000
+#: Longest digital pattern of one step (s).
+MAX_PATTERN_S = 60.0
 #: Points per cycle of a generated waveform (fewer only when the frequency demands it).
 WAVEFORM_POINTS = 1000
 WAVEFORM_MIN_POINTS = 20
@@ -49,7 +51,11 @@ ACTIONS = ("daq_read_analog", "daq_write_analog", "daq_read_digital", "daq_write
            "daq_acquire", "daq_start_logging", "daq_stop_logging",
            "daq_generate_waveform", "daq_stop_output",
            "daq_pulse_digital", "daq_wait_digital", "daq_wait_analog",
-           "daq_count_edges", "daq_measure_frequency", "daq_generate_pulses")
+           "daq_count_edges", "daq_measure_frequency", "daq_generate_pulses",
+           "daq_stimulate_acquire", "daq_acquire_digital", "daq_write_digital_pattern",
+           "daq_wait_digital_change", "daq_measure_pulse_width", "daq_measure_period",
+           "daq_measure_edge_separation", "daq_start_encoder", "daq_read_encoder",
+           "daq_stop_encoder")
 
 
 def waveform_period(waveform: str, amplitude_v: float, offset_v: float, points: int) -> List[float]:
@@ -75,17 +81,23 @@ def waveform_period(waveform: str, amplitude_v: float, offset_v: float, points: 
 def _columns(signals: Sequence[Signal]) -> List[str]:
     header = ["time_s"]
     for sig in signals:
-        header.append(f"{sig.label}_V")
+        if sig.sensor is None:              # a sensor channel has no voltage to show
+            header.append(f"{sig.label}_V")
         if sig.scaled:
             header.append(f"{sig.label}_{sig.unit or 'scaled'}")
     return header
 
 
-def _row(index: int, rate_hz: float, volts: Sequence[float], signals: Sequence[Signal]) -> list:
+def _time(index: int, rate_hz: float) -> str:
     # microseconds are enough up to 100 kHz; above that neighbours would share a time
-    row = [f"{index / rate_hz:.6f}" if rate_hz <= 1e5 else f"{index / rate_hz:.9f}"]
+    return f"{index / rate_hz:.6f}" if rate_hz <= 1e5 else f"{index / rate_hz:.9f}"
+
+
+def _row(index: int, rate_hz: float, volts: Sequence[float], signals: Sequence[Signal]) -> list:
+    row = [_time(index, rate_hz)]
     for sig, v in zip(signals, volts):
-        row.append(f"{v:.6f}")
+        if sig.sensor is None:
+            row.append(f"{v:.6f}")
         if sig.scaled:
             row.append(f"{sig.value(v):.6g}")
     return row
@@ -98,6 +110,7 @@ def _default_path(tag: str) -> str:
 class _LoggingSession:
     def __init__(self, path, signals, rate_hz):
         self.path, self.signals, self.rate_hz = path, signals, rate_hz
+        self.stream = None              # the backend's number of this session's stream
         self.samples = 0
         self.t0 = time.monotonic()      # when the acquisition started
         self.error: Optional[BaseException] = None
@@ -124,6 +137,7 @@ class DaqService:
         self.policy = DaqOutputPolicy.from_config(config or {})
         self.signals = DaqSignals.from_config(config or {})
         self._logging: Optional[_LoggingSession] = None
+        self._encoder_label = "encoder"
         self._tag = "[MOCK] " if mock else ""
 
     # ------------------------------------------------------------------
@@ -160,6 +174,9 @@ class DaqService:
     def _ai(self, name, v_range=None, terminal=None):
         """Resolve an analog input; a value given in the step wins over the signal's."""
         sig = self.signals.resolve(name, "ai")
+        if sig.sensor is not None and v_range is not None:
+            raise ValueError(f"{sig.label} is a {sig.sensor['type']} channel: v_range does not "
+                             "apply (its range is min_c / max_c in config.yaml)")
         v = float(v_range if v_range is not None else (sig.v_range or DEFAULT_V_RANGE))
         t = terminal if terminal is not None else (sig.terminal or DEFAULT_TERMINAL)
         if v not in V_RANGES:
@@ -169,7 +186,25 @@ class DaqService:
         return sig, v, t
 
     @staticmethod
+    def _finite(sig: Signal, reading: float) -> float:
+        """A reading that is not a number (an open sensor, a failed conversion) is an
+        error of the step, not a measurement."""
+        if not (math.isfinite(reading) and math.isfinite(sig.value(reading))):
+            raise RuntimeError(f"{sig.label}: the reading is not a finite number "
+                               f"({reading} {sig.raw_unit})")
+        return reading
+
+    @staticmethod
+    def _spec(sig: Signal, v: float, t: str) -> tuple:
+        """What the backend needs to open the channel."""
+        return (sig.channel, v, t) if sig.sensor is None else (sig.channel, v, t, sig.sensor)
+
+    @staticmethod
     def _with_value(result: dict, sig: Signal, volts: float) -> dict:
+        """Put a reading on record: volts (unless it is a sensor channel, which has
+        none) and the converted value with its unit."""
+        if sig.sensor is not None:
+            result.pop("voltage", None)
         if sig.scaled:
             result["daq_value"] = sig.value(volts)
             result["daq_unit"] = sig.unit
@@ -183,10 +218,20 @@ class DaqService:
         sig, v, t = self._ai(channel, v_range, terminal)
         samples = DEFAULT_SAMPLES if samples is None else int(samples)
         rate = DEFAULT_RATE_HZ if rate_hz is None else float(rate_hz)
-        volts = await self._call(self.backend.read_analog, sig.channel, samples, rate, v, t)
-        extra = f" = {sig.value(volts):.6g} {sig.unit}" if sig.scaled else ""
-        logger.info(f"✓ {self._tag}DAQ {sig.label}: {volts:+.5f} V{extra}（{samples} 点平均）")
+        volts = self._finite(sig, await self._call(
+            self.backend.read_analog, *self._read_args(sig, samples, rate, v, t)))
+        if sig.sensor is not None:
+            logger.info(f"✓ {self._tag}DAQ {sig.label}: {sig.value(volts):.6g} {sig.unit}"
+                        f"（{sig.sensor['type']}、{samples} 点平均）")
+        else:
+            extra = f" = {sig.value(volts):.6g} {sig.unit}" if sig.scaled else ""
+            logger.info(f"✓ {self._tag}DAQ {sig.label}: {volts:+.5f} V{extra}（{samples} 点平均）")
         return self._with_value({"voltage": volts, "daq_channel": sig.label}, sig, volts)
+
+    @staticmethod
+    def _read_args(sig: Signal, samples: int, rate: float, v: float, t: str) -> tuple:
+        args = (sig.channel, samples, rate, v, t)
+        return args if sig.sensor is None else args + (sig.sensor,)
 
     def _ai_group(self, channels, v_range, terminal):
         if isinstance(channels, str):
@@ -197,10 +242,11 @@ class DaqService:
         signals = [r[0] for r in resolved]
         if len({s.channel for s in signals}) != len(signals):
             raise ValueError("channels: the same analog input is listed twice")
-        return signals, [(s.channel, v, t) for s, v, t in resolved]
+        return signals, [self._spec(s, v, t) for s, v, t in resolved]
 
     async def _acquire(self, channels, rate_hz=None, duration_s=1.0, v_range=None, terminal=None,
                        trigger=None, trigger_edge="rising", timeout_s=10.0,
+                       trigger_level=None, pretrigger_s=None, clock=None,
                        file_path=None) -> dict:
         signals, specs = self._ai_group(channels, v_range, terminal)
         rate = DEFAULT_RATE_HZ if rate_hz is None else float(rate_hz)
@@ -212,35 +258,71 @@ class DaqService:
                              f"{MAX_ACQUIRE_POINTS} points per step; shorten it or lower rate_hz")
         if trigger_edge not in EDGES:
             raise ValueError(f"trigger_edge must be one of {EDGES}")
-        trig = self.signals.resolve(trigger, "terminal") if trigger is not None else None
+        extras = {}
+        if trigger_level is not None:
+            # an analog trigger: the first acquired channel crossing a level (in volts)
+            if trigger is None:
+                raise ValueError("trigger_level needs trigger = the analog input to watch")
+            trig = self.signals.resolve(trigger, "ai")
+            if trig.channel != signals[0].channel:
+                raise ValueError(f"an analog trigger must be the first of channels "
+                                 f"({signals[0].label}), got {trig.label}")
+            if trig.sensor is not None:
+                raise ValueError(f"{trig.label} is a sensor channel; trigger on a voltage input")
+            level = float(trigger_level)
+            if not math.isfinite(level) or abs(level) > specs[0][1]:
+                raise ValueError(f"trigger_level = {level:g} V is outside the input range "
+                                 f"±{specs[0][1]:g} V of {trig.label}")
+            extras["trigger_level"] = level
+        else:
+            trig = self.signals.resolve(trigger, "terminal") if trigger is not None else None
+        pre = 0
+        if pretrigger_s is not None:
+            if trig is None:
+                raise ValueError("pretrigger_s needs a trigger")
+            pre = int(round(rate * float(pretrigger_s)))
+            if not (2 <= pre <= samples - 2):
+                raise ValueError("pretrigger_s must leave at least 2 samples before and after "
+                                 "the trigger (0 < pretrigger_s < duration_s)")
+            extras["pretrigger"] = pre
+        if clock is not None:
+            extras["clock"] = self.signals.resolve(clock, "terminal").channel
         if trig is not None:
-            logger.info(f"  {self._tag}DAQ: {trig.label} の {trigger_edge} エッジ待ち"
+            what = (f"{extras['trigger_level']:g} V を {trigger_edge} で横切るの"
+                    if "trigger_level" in extras else f"{trigger_edge} エッジ")
+            logger.info(f"  {self._tag}DAQ: {trig.label} の {what}を待ちます"
                         f"（最大 {float(timeout_s):g} 秒）")
         data = await self._call(self.backend.acquire, specs, rate, samples,
-                                trig.channel if trig else None, trigger_edge, float(timeout_s))
+                                trig.channel if trig else None, trigger_edge, float(timeout_s),
+                                **extras)
         rate = self._actual_ai_rate(rate)
         path = file_path or _default_path("acquire")
-        await self._call(self._write_waveform, path, signals, rate, data)
+        await self._call(self._write_waveform, path, signals, rate, data, -pre)
         for sig, column in zip(signals, data):
             logger.info(f"✓ {self._tag}DAQ {sig.label}: {samples} 点 @ {rate:g} Hz  "
-                        f"mean {statistics.fmean(column):+.5f} V  min {min(column):+.5f}  "
+                        f"mean {statistics.fmean(column):+.5f} {sig.raw_unit}  min {min(column):+.5f}  "
                         f"max {max(column):+.5f}  sd {statistics.pstdev(column):.5f}")
         logger.info(f"  波形を保存: {path}")
         result = {"daq_channel": "+".join(s.label for s in signals), "data_path": path}
         if len(signals) == 1:
-            mean = statistics.fmean(data[0])
+            mean = self._finite(signals[0], statistics.fmean(data[0]))
             result["voltage"] = mean
             self._with_value(result, signals[0], mean)
         return result
 
     @staticmethod
-    def _write_waveform(path, signals, rate_hz, data) -> None:
+    def _write_waveform(path, signals, rate_hz, data, first_index=0, extra=None) -> None:
+        """``first_index`` < 0: that many samples lie before the trigger (time 0).
+        ``extra`` = (header, values): one more column, e.g. the commanded stimulus."""
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(_columns(signals))
+            writer.writerow(_columns(signals) + ([extra[0]] if extra else []))
             for i, volts in enumerate(zip(*data)):
-                writer.writerow(_row(i, rate_hz, volts, signals))
+                row = _row(i + first_index, rate_hz, volts, signals)
+                if extra:
+                    row.append(f"{extra[1][i]:.6f}")
+                writer.writerow(row)
 
     async def _start_logging(self, channels, rate_hz=None, v_range=None, terminal=None,
                              file_path=None) -> dict:
@@ -253,9 +335,10 @@ class DaqService:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as f:
             csv.writer(f).writerow(_columns(signals))
-        await self._call(self.backend.start_stream, specs, rate)
+        stream = await self._call(self.backend.start_stream, specs, rate)
         rate = self._actual_ai_rate(rate)
         session = _LoggingSession(path, signals, rate)   # t0 = now: the stream has just started
+        session.stream = stream
         session.thread = threading.Thread(target=self._log_loop, args=(session,),
                                           name="daq-logging", daemon=True)
         try:
@@ -294,7 +377,7 @@ class DaqService:
     def _drain(self, session: _LoggingSession, writer) -> None:
         if session.abandoned.is_set():      # never touch a stream that is no longer ours
             return
-        data = self.backend.read_stream()
+        data = self.backend.read_stream(session.stream)   # never another session's samples
         for volts in zip(*data):
             writer.writerow(_row(session.samples, session.rate_hz, volts, session.signals))
             session.samples += 1
@@ -340,8 +423,8 @@ class DaqService:
         unit = sig.unit if sig.scaled else "V"
         deadline = time.monotonic() + float(timeout_s)
         while True:
-            volts = await self._call(self.backend.read_analog, sig.channel, int(samples),
-                                     DEFAULT_RATE_HZ, v, t)
+            volts = await self._call(self.backend.read_analog,
+                                     *self._read_args(sig, int(samples), DEFAULT_RATE_HZ, v, t))
             value = sig.value(volts)
             if not math.isfinite(value):
                 raise RuntimeError(f"{sig.label}: the reading is not a finite number ({value})")
@@ -516,6 +599,199 @@ class DaqService:
         return {"daq_channel": sig.label, "daq_value": freq, "daq_unit": "Hz"}
 
     # ------------------------------------------------------------------
+    # stimulus and response
+    # ------------------------------------------------------------------
+    async def _stimulate_acquire(self, channel, frequency_hz, amplitude_v, channels,
+                                 waveform="sine", offset_v=0.0, rate_hz=None, duration_s=1.0,
+                                 v_range=None, terminal=None, file_path=None) -> dict:
+        out = self.signals.resolve(channel, "ao")
+        name, offset, amplitude = self.policy.check_analog_waveform(out.channel, offset_v,
+                                                                    amplitude_v)
+        signals, specs = self._ai_group(channels, v_range, terminal)
+        freq = float(frequency_hz)
+        if not freq > 0.0:
+            raise ValueError("frequency_hz must be > 0")
+        points = min(WAVEFORM_POINTS, int(AO_MAX_RATE_HZ // freq))
+        if points < WAVEFORM_MIN_POINTS:
+            raise ValueError(f"frequency_hz = {freq:g} is too high: fewer than "
+                             f"{WAVEFORM_MIN_POINTS} points per cycle at {AO_MAX_RATE_HZ:g} points/s")
+        rate = DEFAULT_RATE_HZ if rate_hz is None else float(rate_hz)
+        samples = int(round(rate * float(duration_s)))
+        if samples < 2:
+            raise ValueError("rate_hz * duration_s must give at least 2 samples")
+        if samples * len(signals) > MAX_ACQUIRE_POINTS:
+            raise ValueError(f"{samples} samples x {len(signals)} channel(s) exceeds "
+                             f"{MAX_ACQUIRE_POINTS} points per step; shorten it or lower rate_hz")
+        period = waveform_period(waveform, amplitude, offset, points)
+        data, ao_rate = await self._call(self.backend.stimulate_acquire, name, period,
+                                         freq * points, specs, rate, samples)
+        rate = self._actual_ai_rate(rate)
+        ao_rate = float(ao_rate or freq * points)
+        freq = ao_rate / points
+        path = file_path or _default_path("stimulate")
+        # the stimulus as it was commanded, at the nominal acquisition times: both tasks
+        # start on one trigger, but their clocks are separate, so the real alignment is
+        # good to about one sample and has to be checked by loop-back
+        # (the small term keeps an exact boundary from rounding down to the point before)
+        stimulus = [period[int(i * ao_rate / rate + 1e-6) % points] for i in range(samples)]
+        await self._call(self._write_waveform, path, signals, rate, data, 0,
+                         (f"{out.label}_set_V", stimulus))
+        for sig, column in zip(signals, data):
+            logger.info(f"✓ {self._tag}DAQ {out.label} -> {sig.label}: {samples} 点 @ {rate:g} Hz  "
+                        f"mean {statistics.fmean(column):+.5f} {sig.raw_unit}  "
+                        f"min {min(column):+.5f}  max {max(column):+.5f}")
+        logger.info(f"  {waveform} {freq:g} Hz, {offset:+.4f} ± {amplitude:.4f} V と同時に取り込み"
+                    f"（出力は 0 V に戻しました）: {path}")
+        return {"daq_channel": f"{out.label}>" + "+".join(s.label for s in signals),
+                "data_path": path, "daq_value": freq, "daq_unit": "Hz"}
+
+    # ------------------------------------------------------------------
+    # hardware-timed digital I/O
+    # ------------------------------------------------------------------
+    def _lines(self, lines) -> List[Signal]:
+        if isinstance(lines, str):
+            lines = [lines]
+        return [self.signals.resolve(line, "line") for line in (lines or [])]
+
+    @staticmethod
+    def _write_digital_csv(path, rate_hz, columns) -> None:
+        """columns = [(header, [states...]), ...]"""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["time_s"] + [header for header, _ in columns])
+            for i, states in enumerate(zip(*[column for _, column in columns])):
+                writer.writerow([_time(i, rate_hz)] + [int(bool(s)) for s in states])
+
+    async def _acquire_digital(self, lines, rate_hz=None, duration_s=1.0, clock=None,
+                               file_path=None) -> dict:
+        signals = self._lines(lines)
+        names = check_timed_lines([s.channel for s in signals])
+        rate = DEFAULT_RATE_HZ if rate_hz is None else float(rate_hz)
+        samples = int(round(rate * float(duration_s)))
+        if samples < 2:
+            raise ValueError("rate_hz * duration_s must give at least 2 samples")
+        if samples * len(names) > MAX_ACQUIRE_POINTS:
+            raise ValueError(f"{samples} samples x {len(names)} line(s) exceeds "
+                             f"{MAX_ACQUIRE_POINTS} points per step; shorten it or lower rate_hz")
+        clk = self.signals.resolve(clock, "terminal") if clock is not None else None
+        data = await self._call(self.backend.acquire_digital, names, rate, samples,
+                                clk.channel if clk else None)
+        rate = float(getattr(self.backend, "di_rate_hz", None) or rate)
+        path = file_path or _default_path("digital")
+        await self._call(self._write_digital_csv, path, rate,
+                         [(s.label, column) for s, column in zip(signals, data)])
+        for sig, column in zip(signals, data):
+            changes = sum(1 for a, b in zip(column, column[1:]) if a != b)
+            logger.info(f"✓ {self._tag}DAQ {sig.label}: {samples} 点 @ {rate:g} Hz  "
+                        f"High {sum(column)} 点, 変化 {changes} 回")
+        logger.info(f"  デジタル波形を保存: {path}")
+        return {"daq_channel": "+".join(s.label for s in signals), "data_path": path}
+
+    async def _write_digital_pattern(self, lines, pattern, rate_hz, record=None,
+                                     file_path=None) -> dict:
+        signals = self._lines(lines)
+        names = self.policy.check_digital_pattern([s.channel for s in signals])
+        rows = []
+        for row in pattern or []:
+            if isinstance(row, str):
+                if set(row) - {"0", "1"}:
+                    raise ValueError(f"pattern row {row!r}: use one '0' or '1' per line")
+                row = [c == "1" for c in row]
+            rows.append([bool(v) for v in row])
+        if len(rows) < 2 or any(len(row) != len(names) for row in rows):
+            raise ValueError(f"pattern: at least 2 rows, each with {len(names)} state(s) "
+                             "(one per line, in the order of lines)")
+        rate = float(rate_hz)
+        if not rate > 0.0 or len(rows) / rate > MAX_PATTERN_S:
+            raise ValueError(f"rate_hz must be > 0 and the pattern at most {MAX_PATTERN_S:g} s long")
+        recorded_signals = self._lines(record) if record else []
+        recorded_names = check_timed_lines([s.channel for s in recorded_signals]) if record else None
+        data = await self._call(self.backend.write_digital_pattern, names, rows, rate,
+                                recorded_names)
+        rate = float(getattr(self.backend, "do_rate_hz", None) or rate)   # the clock really used
+        label = "+".join(s.label for s in signals)
+        logger.info(f"✓ {self._tag}DAQ {label}: {len(rows)} ステップのパターン @ {rate:g} Hz "
+                    f"（{len(rows) / rate:g} 秒）-> Low")
+        result = {"daq_channel": label}
+        if recorded_signals:
+            path = file_path or _default_path("pattern")
+            played = [(f"{s.label}_set", [row[j] for row in rows]) for j, s in enumerate(signals)]
+            await self._call(self._write_digital_csv, path, rate,
+                             played + [(s.label, column)
+                                       for s, column in zip(recorded_signals, data)])
+            logger.info(f"  応答（{', '.join(s.label for s in recorded_signals)}）を保存: {path}")
+            result["daq_channel"] = label + ">" + "+".join(s.label for s in recorded_signals)
+            result["data_path"] = path
+        return result
+
+    async def _wait_digital_change(self, lines, edge="both", timeout_s=60.0) -> dict:
+        signals = self._lines(lines)
+        names = check_timed_lines([s.channel for s in signals])
+        states = await self._call(self.backend.wait_digital_change, names, edge, float(timeout_s))
+        label = "+".join(s.label for s in signals)
+        shown = ", ".join(f"{s.label}={'High' if v else 'Low'}" for s, v in zip(signals, states))
+        logger.info(f"✓ {self._tag}DAQ 変化を検出（{edge}）: {shown}"
+                    + ("（Mock: 変化があったものとして進みます）" if self.mock else ""))
+        result = {"daq_channel": label}
+        if len(states) == 1:
+            result["digital_state"] = bool(states[0])
+        return result
+
+    # ------------------------------------------------------------------
+    # counters: time measurements and the encoder
+    # ------------------------------------------------------------------
+    async def _measure_pulse_width(self, terminal, min_s=1e-6, max_s=1.0, level="high",
+                                   timeout_s=5.0, counter=None) -> dict:
+        sig = self.signals.resolve(terminal, "terminal")
+        width = await self._call(self.backend.measure_pulse_width, sig.channel, float(min_s),
+                                 float(max_s), level, float(timeout_s), self._counter(counter))
+        logger.info(f"✓ {self._tag}DAQ {sig.label}: {level} パルス幅 {width:.6g} s")
+        return {"daq_channel": sig.label, "daq_value": float(width), "daq_unit": "s"}
+
+    async def _measure_period(self, terminal, min_s=1e-6, max_s=1.0, edge="rising",
+                              timeout_s=5.0, counter=None) -> dict:
+        sig = self.signals.resolve(terminal, "terminal")
+        period = await self._call(self.backend.measure_period, sig.channel, float(min_s),
+                                  float(max_s), edge, float(timeout_s), self._counter(counter))
+        logger.info(f"✓ {self._tag}DAQ {sig.label}: 周期 {period:.6g} s（{1.0 / period:.6g} Hz）")
+        return {"daq_channel": sig.label, "daq_value": float(period), "daq_unit": "s"}
+
+    async def _measure_edge_separation(self, first, second, min_s=1e-6, max_s=1.0,
+                                       first_edge="rising", second_edge="rising", timeout_s=5.0,
+                                       counter=None) -> dict:
+        a = self.signals.resolve(first, "terminal")
+        b = self.signals.resolve(second, "terminal")
+        gap = await self._call(self.backend.measure_edge_separation, a.channel, b.channel,
+                               float(min_s), float(max_s), first_edge, second_edge,
+                               float(timeout_s), self._counter(counter))
+        logger.info(f"✓ {self._tag}DAQ {a.label}（{first_edge}）-> {b.label}（{second_edge}）: "
+                    f"{gap:.6g} s")
+        return {"daq_channel": f"{a.label}>{b.label}", "daq_value": float(gap), "daq_unit": "s"}
+
+    async def _start_encoder(self, a, b, pulses_per_rev, decoding="x4", counter=None) -> dict:
+        sig_a = self.signals.resolve(a, "terminal")
+        sig_b = self.signals.resolve(b, "terminal")
+        used = await self._call(self.backend.start_encoder, sig_a.channel, sig_b.channel,
+                                int(pulses_per_rev), decoding, self._counter(counter))
+        self._encoder_label = f"{sig_a.label}/{sig_b.label}"
+        logger.info(f"✓ {self._tag}DAQ エンコーダの追従を開始: A = {sig_a.label}, B = {sig_b.label}, "
+                    f"{int(pulses_per_rev)} パルス/回転, {decoding}（{used}、0° から）")
+        return {"daq_channel": self._encoder_label, "daq_value": 0.0, "daq_unit": "deg"}
+
+    async def _read_encoder(self) -> dict:
+        angle = await self._call(self.backend.read_encoder)
+        logger.info(f"✓ {self._tag}DAQ エンコーダ {self._encoder_label}: {angle:+.3f}°"
+                    f"（{angle / 360.0:+.4f} 回転）")
+        return {"daq_channel": self._encoder_label, "daq_value": float(angle), "daq_unit": "deg"}
+
+    async def _stop_encoder(self) -> dict:
+        angle = await self._call(self.backend.read_encoder)     # raises if none is followed
+        await self._call(self.backend.stop_encoder)
+        logger.info(f"✓ {self._tag}DAQ エンコーダの追従を終了: {angle:+.3f}°")
+        return {"daq_channel": self._encoder_label, "daq_value": float(angle), "daq_unit": "deg"}
+
+    # ------------------------------------------------------------------
     # shutdown
     # ------------------------------------------------------------------
     def close(self) -> List[str]:
@@ -523,20 +799,24 @@ class DaqService:
 
         Returns the outputs that could NOT be returned to the safe state.
         """
-        # Outputs first: nothing stays driven while the recording is being wound up,
-        # and a failure there cannot keep the outputs from being reset.
+        # Outputs first, and from here no output call is accepted any more: nothing stays
+        # or becomes driven while the recording is being wound up, and a failure or a
+        # second Ctrl+C there cannot keep the device from being closed.
         try:
-            self.backend.reset_outputs()
-        except Exception as exc:
-            logger.error(f"DAQ 出力のリセットに失敗しました（close で再試行します）: {exc}")
-        try:
-            session = self._finish_logging()
-            if session is not None:
-                logger.warning(f"DAQ 連続記録は daq_stop_logging なしで終了しました: "
-                               f"{session.samples} 点 -> {session.path}")
-                if session.error is not None:
-                    logger.error(f"DAQ 連続記録は途中で失敗していました（データは不完全です）: "
-                                 f"{session.error}")
-        except Exception as exc:
-            logger.error(f"DAQ 連続記録の終了処理に失敗しました: {exc}")
-        return self.backend.close()
+            try:
+                self.backend.shutdown_outputs()     # close() below tries again
+            except Exception as exc:
+                logger.error(f"DAQ 出力のリセットに失敗しました（close で再試行します）: {exc}")
+            try:
+                session = self._finish_logging()
+                if session is not None:
+                    logger.warning(f"DAQ 連続記録は daq_stop_logging なしで終了しました: "
+                                   f"{session.samples} 点 -> {session.path}")
+                    if session.error is not None:
+                        logger.error(f"DAQ 連続記録は途中で失敗していました（データは不完全です）: "
+                                     f"{session.error}")
+            except Exception as exc:
+                logger.error(f"DAQ 連続記録の終了処理に失敗しました: {exc}")
+        finally:
+            failed = self.backend.close()
+        return failed

@@ -5,14 +5,21 @@ The code addresses channels generically, so other X Series devices should work,
 but the USB-6351 is the only target it was written for and its limits (sample
 rates, 4 counters) are the ones built in.
 
-> Status (2026-11-13, NI-DAQmx 26.8, one USB-6351): **every input function was
-> exercised on the real device** — averaged reading, waveform capture of one and
-> two channels (up to 1 MS/s), continuous recording, digital input, edge counting
-> and frequency measurement on the internal 100 kHz timebase, the timeout of a
-> start trigger that never comes. **No output has been driven on the real device
-> yet** (DC and waveform analog output, digital output and pulse, pulse train):
-> these are unit-tested against a fake `nidaqmx` module only. Check each output on
-> the bench, with nothing hazardous wired, before relying on it.
+> Status (2026-11-14, NI-DAQmx 26.8, one USB-6351): **every input function was
+> exercised on the real device** with nothing wired — averaged reading, waveform
+> capture (up to 1 MS/s), continuous recording, thermocouple and RTD channels,
+> an external sample clock and a pre-trigger acquisition (the internal 100 kHz
+> timebase standing in for the signal), digital input and clocked digital
+> acquisition, edge counting, frequency, period, pulse width and edge separation
+> on that timebase, the encoder (reads 0°), and the timeouts of a digital trigger,
+> an analog trigger and a change detection that never come. What that leaves
+> untested: an analog trigger and a change detection that actually fire, an
+> encoder that turns, a temperature against a reference. **No output has been
+> driven on the real device yet** (DC and waveform analog output, stimulus with
+> acquisition, digital output, pulse and pattern, pulse train): these are
+> unit-tested against a fake `nidaqmx` module only. Run
+> `examples/daq/output_loopback_check.json` on the bench, with nothing else
+> wired, before relying on them.
 
 ## Three layers
 
@@ -31,7 +38,7 @@ signals to other terminals. Physical names (`ai0`, `ao1`, `port0/line3`, `ctr0`,
 | Step | Kind | What it does |
 |---|---|---|
 | `daq_read_analog` | AI | Mean of `samples` readings of one input |
-| `daq_acquire` | AI | Hardware-timed waveform of 1–16 inputs to a CSV; optional digital start trigger on a PFI terminal |
+| `daq_acquire` | AI | Hardware-timed waveform of 1–16 inputs to a CSV; optional digital or analog trigger, pre-trigger samples, external sample clock |
 | `daq_start_logging` / `daq_stop_logging` | AI | Continuous recording to a CSV while the following steps run |
 | `daq_wait_analog` | AI | Wait until an input is above / below a threshold (timeout = the step fails) |
 | `daq_write_analog` | AO | DC voltage, held |
@@ -44,13 +51,21 @@ signals to other terminals. Physical names (`ai0`, `ao1`, `port0/line3`, `ctr0`,
 | `daq_measure_frequency` | counter in | Frequency of the signal on a terminal |
 | `daq_generate_pulses` | counter out | Pulse train / PWM: frequency, duty cycle, a pulse count, a duration, or until stopped |
 | `daq_stop_output` | any output | One output back to 0 V / low / stopped |
+| `daq_stimulate_acquire` | AO + AI | A waveform and an acquisition started by one trigger; response and nominal stimulus in one CSV |
+| `daq_acquire_digital` | DI | Clocked acquisition of lines of port 0 to a CSV |
+| `daq_write_digital_pattern` | DO (+ DI) | Hardware-timed sequence of levels on lines of port 0; optionally records other lines on the same clock |
+| `daq_wait_digital_change` | DI | Wait for a change on lines of port 0 (hardware change detection) |
+| `daq_measure_pulse_width` / `daq_measure_period` / `daq_measure_edge_separation` | counter in | Times, in seconds: one pulse, one cycle, from an edge on one terminal to an edge on another |
+| `daq_start_encoder` / `daq_read_encoder` / `daq_stop_encoder` | counter in | Angle of a quadrature encoder, in degrees |
 
 Parameters and limits are in [`docs/experimental-flow.md`](../../docs/experimental-flow.md).
 
-Not covered: hardware-timed digital patterns (port 0), change detection,
-quadrature encoders and position, pulse-width / two-edge measurements, analog and
-reference (pre-)triggers, external sample clocks, thermocouple / bridge channel
-types, synchronised AI + AO in one task. `NIDaq` is the place to add them.
+Not covered: bridge / strain channel types (**the USB-6351 does not support them**:
+DAQmx refuses the channel; read a bridge amplifier's output as a voltage with a
+scale), linear encoders and the Z index, continuous or repeated digital patterns,
+arbitrary (user-supplied) analog waveforms, an external clock for outputs, and
+buffered counter measurements (many periods in one step). `NIDaq` is the place to
+add them.
 
 ## Files
 
@@ -76,6 +91,8 @@ types, synchronised AI + AO in one task. `NIDaq` is the place to add them.
 daq_device: Dev1        # name shown in NI MAX; "" = no DAQ
 daq_signals:            # name -> wiring; flows use the names
   photodiode: {channel: ai0, terminal: diff, v_range: 1, scale: 2.0, offset: 0.0, unit: mW}
+  furnace: {channel: ai2, sensor: thermocouple, tc_type: K, cjc_c: 25.0, terminal: diff, max_c: 400}
+  bath: {channel: ai3, sensor: rtd, excitation_a: 0.001, terminal: diff}
   valve: {channel: port0/line0}
   flow_meter: {channel: pfi0}
   stepper_clock: {channel: ctr0}
@@ -92,6 +109,19 @@ A signal is `{channel: <physical name>}`. An analog input may add `terminal`
 `value = volts × scale + offset` with a `unit`. A step that gives `v_range` or
 `terminal` itself overrides the signal's. The enabled-output lists always hold
 physical names: naming a signal does not enable it.
+
+**Temperature sensors.** `sensor: thermocouple` needs `tc_type` (B E J K N R S T) and
+`cjc_c`, the temperature of the terminal block in °C: the USB-6351 has no
+cold-junction sensor, so an error in that number is an error of the reading, one
+to one. `sensor: rtd` needs `excitation_a`, the current your external source drives
+through the RTD (the device supplies none), and takes `rtd_type` (default
+`pt3851`), `r0_ohm` (100) and `wires` (2 / 3 / 4, default 4). `min_c` / `max_c`
+(default 0 / 200) is the expected range; it selects the input gain. Every
+analog-input step then returns °C in `daq_value` (no voltage is recorded), and
+`scale` / `offset` / `unit` still apply on top. A thermocouple delivers tens of
+microvolts per kelvin into a ±0.1 V range: wire it differentially, expect a few
+kelvin of noise without filtering, and check it against a reference before
+trusting the numbers.
 
 ## Safety rules built in
 
@@ -121,9 +151,11 @@ physical names: naming a signal does not enable it.
   (that would release the output).
 - `daq_wait_*` steps fail when their timeout passes; the flow stops there and the
   outputs go to the safe state. In `--mock` a wait is taken as met.
-- A power cut or a crash of the PC leaves the outputs to the device's power-up
-  state, not to this software. Anything hazardous needs its own hardware
-  interlock.
+- All of this is software. If the program or the PC dies without running its
+  cleanup (a crash, a kill, a USB cable pulled), the device keeps its last output
+  values and a running waveform or pulse train may go on; only a power cycle of
+  the device brings its power-up state back. Anything hazardous needs its own
+  hardware interlock.
 
 ## Things to know
 
@@ -144,6 +176,21 @@ physical names: naming a signal does not enable it.
 - `100khztimebase` and `20mhztimebase` are accepted as input terminals: the
   board's internal clocks, a wiring-free check that the counters work.
 - A waveform is generated from up to 1000 points per cycle (fewer above 2 kHz).
+- **Hardware-timed digital I/O exists on port 0 only** (`daq_acquire_digital`,
+  `daq_write_digital_pattern`, `daq_wait_digital_change`); ports 1 and 2 (the PFI
+  pins) are static.
+- `daq_stimulate_acquire` starts output and acquisition on one trigger, but each
+  runs on its own sample clock: the `_set_V` column is the commanded waveform at
+  the nominal sample times, and the real alignment (expected within about one
+  sample) is still to be measured by loop-back. The same holds for the recorded
+  lines of `daq_write_digital_pattern`: they are sampled on the pattern's clock
+  edge, so a looped-back line may show each state one row late and miss the last.
+- An analog trigger watches the first channel of the acquisition, in volts.
+  With `pretrigger_s` the CSV's time 0 is the trigger.
+- With an external `clock`, the time column assumes `rate_hz`; it is exact only
+  if the clock really has that frequency.
+- The encoder holds one counter while it is followed; the time measurements and
+  `daq_count_edges` pick another one.
 - **One waveform at a time**: the device has a single analog-output sample clock,
   so a second `daq_generate_waveform` on the other channel is refused while one
   runs. A DC level on one channel together with a waveform on the other (as in
@@ -180,13 +227,15 @@ python -m src.devices.nidaq.nidaq             # list the devices NI-DAQmx knows
 python -m src.devices.nidaq.nidaq Dev1 ai0    # read one analog input
 python -m src.flow.run_flow examples/daq/acquire_and_count.json --mock
 python -m src.flow.run_flow examples/daq/acquire_and_count.json   # real, inputs only
+python -m src.flow.run_flow examples/daq/timing_and_triggers.json # real, inputs only
 ```
 
 `acquire_and_count.json` should report about 100000 edges per second and
 100000 Hz for the internal timebase. A known source makes a voltage checkable: a
 1.5 V cell across AI0 and AI GND (`terminal: rse`).
 
-Outputs, once a channel is enabled and nothing hazardous is wired: loop AO0 back
-to AI0 and compare `daq_write_analog` with `daq_read_analog`; loop PFI12 (ctr0
-out) to PFI0 and compare `daq_generate_pulses` with `daq_measure_frequency`.
-[`examples/daq/README.md`](../../examples/daq/README.md) has a template flow.
+Outputs: `examples/daq/output_loopback_check.json` wires each output straight
+back to an input of the board (AO0–AI0, AO1–AI1, P0.0–P0.1, PFI12–PFI0) and walks
+through every output function. The jumpers, the lines to enable for the check and
+the reading each step should give are in
+[`examples/daq/README.md`](../../examples/daq/README.md).

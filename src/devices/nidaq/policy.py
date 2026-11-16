@@ -25,12 +25,14 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-AI_PATTERN = r"^ai\d{1,2}$"
-AO_PATTERN = r"^ao\d$"
-LINE_PATTERN = r"^port\d/line\d{1,2}$"
-COUNTER_PATTERN = r"^ctr\d$"
+# What the USB-6351 has: ai0-15, ao0-1, three ports of 8 lines, ctr0-3, pfi0-15. A name
+# beyond that is refused here, for the mock as for the device.
+AI_PATTERN = r"^ai(1[0-5]|\d)$"
+AO_PATTERN = r"^ao[01]$"
+LINE_PATTERN = r"^port[0-2]/line[0-7]$"
+COUNTER_PATTERN = r"^ctr[0-3]$"
 #: PFI terminals, and two internal timebases that need no wiring (counter self-test).
-TERMINAL_PATTERN = r"^(pfi\d{1,2}|100khztimebase|20mhztimebase)$"
+TERMINAL_PATTERN = r"^(pfi(1[0-5]|\d)|100khztimebase|20mhztimebase)$"
 #: A signal name defined in config.yaml (daq_signals).
 SIGNAL_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,39}$"
 #: Names that look like a physical channel; a signal may not be called like this.
@@ -45,11 +47,24 @@ AI_MAX_RATE_SINGLE_HZ = 1_250_000.0     # one channel
 AI_MAX_RATE_AGGREGATE_HZ = 1_000_000.0  # several channels, summed over the channels
 AO_MAX_RATE_HZ = 2_000_000.0            # device: 2.86 MS/s on one channel; kept below it
 CO_DEVICE_MAX_HZ = 1_000_000.0          # pulse trains; the 100 MHz timebase goes higher
+DIO_MAX_RATE_HZ = 1_000_000.0           # hardware-timed digital I/O (port 0 only)
+#: Only port 0 has hardware timing (patterns, clocked acquisition, change detection).
+TIMED_PORT = "port0"
 
 TERMINALS = ("default", "rse", "nrse", "diff")
 V_RANGES = (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
 EDGES = ("rising", "falling")
 WAVEFORMS = ("sine", "square", "triangle", "sawtooth")
+ENCODER_DECODINGS = ("x1", "x2", "x4")
+
+#: Sensors an analog input can be configured for (config.yaml, daq_signals.<name>.sensor).
+#: The device has no cold-junction sensor and no excitation source: the cold-junction
+#: temperature is a number the lab gives, the RTD current comes from outside. Bridge
+#: (strain) channels are not supported by the USB-6351; read them as a voltage with a scale.
+SENSORS = ("thermocouple", "rtd")
+TC_TYPES = ("B", "E", "J", "K", "N", "R", "S", "T")
+RTD_TYPES = ("pt3750", "pt3851", "pt3911", "pt3916", "pt3920", "pt3928")
+SENSOR_UNIT = "degC"
 
 KINDS = ("ai", "ao", "line", "counter", "terminal")
 _PATTERNS = {"ai": AI_PATTERN, "ao": AO_PATTERN, "line": LINE_PATTERN,
@@ -111,6 +126,20 @@ def normalize_terminal(name) -> str:
     return _normalize(name, "terminal")
 
 
+def check_timed_lines(lines) -> list:
+    """Lines of a hardware-timed digital step: on port 0, each once."""
+    names = [normalize_line(line) for line in lines]
+    if not names:
+        raise DaqPolicyError("at least one digital line is needed")
+    if len(set(names)) != len(names):
+        raise DaqPolicyError("the same digital line is listed twice")
+    for name in names:
+        if not name.startswith(TIMED_PORT + "/"):
+            raise DaqPolicyError(f"{name}: only {TIMED_PORT} has hardware timing "
+                                 "(patterns, clocked acquisition, change detection)")
+    return names
+
+
 def check_flow_name(name, kinds) -> str:
     """Validate a channel field of a flow step without the configuration.
 
@@ -142,10 +171,18 @@ class Signal:
     scale: float = 1.0              # ai: value = volts * scale + offset
     offset: float = 0.0
     unit: str = ""                  # unit of the scaled value ("" = not scaled)
+    sensor: Optional[dict] = None   # ai: {"type": "thermocouple", ...}; the device then
+    #                                 returns degrees Celsius instead of volts
 
     @property
     def scaled(self) -> bool:
-        return bool(self.unit) or self.scale != 1.0 or self.offset != 0.0
+        return (bool(self.unit) or self.scale != 1.0 or self.offset != 0.0
+                or self.sensor is not None)
+
+    @property
+    def raw_unit(self) -> str:
+        """Unit of what the device returns for this channel."""
+        return SENSOR_UNIT if self.sensor is not None else "V"
 
     def value(self, volts: float) -> float:
         return volts * self.scale + self.offset
@@ -154,7 +191,10 @@ class Signal:
 class DaqSignals:
     """The named signals of ``config.yaml`` (``shared_devices.daq_signals``)."""
 
-    _AI_KEYS = {"terminal", "v_range", "scale", "offset", "unit"}
+    _AI_KEYS = {"terminal", "v_range", "scale", "offset", "unit", "sensor", "tc_type", "cjc_c",
+                "rtd_type", "r0_ohm", "excitation_a", "wires", "min_c", "max_c"}
+    _SENSOR_KEYS = {"thermocouple": {"tc_type", "cjc_c", "min_c", "max_c"},
+                    "rtd": {"rtd_type", "r0_ohm", "excitation_a", "wires", "min_c", "max_c"}}
 
     def __init__(self, signals: Optional[dict] = None):
         self._signals = {}
@@ -199,8 +239,72 @@ class DaqSignals:
         if not (math.isfinite(scale) and math.isfinite(offset)) or scale == 0.0:
             raise DaqPolicyError(f"daq_signals.{name}: scale must be a finite, non-zero number "
                                  "and offset a finite number")
+        sensor = DaqSignals._parse_sensor(name, spec) if kind == "ai" else None
+        unit = str(spec.get("unit") or "")
+        if sensor is not None:
+            if v_range is not None:
+                raise DaqPolicyError(f"daq_signals.{name}: v_range does not apply to a sensor "
+                                     "channel (give min_c / max_c)")
+            unit = unit or SENSOR_UNIT
         return Signal(label=f"{name}:{channel}", kind=kind, channel=channel, terminal=terminal,
-                      v_range=v_range, scale=scale, offset=offset, unit=str(spec.get("unit") or ""))
+                      v_range=v_range, scale=scale, offset=offset, unit=unit, sensor=sensor)
+
+    @staticmethod
+    def _parse_sensor(name: str, spec: dict) -> Optional[dict]:
+        kind = spec.get("sensor")
+        all_keys = set().union(*DaqSignals._SENSOR_KEYS.values())
+        if kind is None:
+            stray = sorted(set(spec) & all_keys)
+            if stray:
+                raise DaqPolicyError(f"daq_signals.{name}: {stray} need sensor: thermocouple or rtd")
+            return None
+        if kind not in SENSORS:
+            raise DaqPolicyError(f"daq_signals.{name}: sensor must be one of {SENSORS}")
+        stray = sorted((set(spec) & all_keys) - DaqSignals._SENSOR_KEYS[kind])
+        if stray:
+            raise DaqPolicyError(f"daq_signals.{name}: {stray} do not apply to a {kind}")
+
+        def number(key, default=None):
+            value = spec.get(key, default)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if isinstance(spec.get(key, default), bool) or not math.isfinite(value):
+                raise DaqPolicyError(f"daq_signals.{name}: {key} must be a number")
+            return value
+
+        low, high = number("min_c", 0.0), number("max_c", 200.0)
+        if not low < high:
+            raise DaqPolicyError(f"daq_signals.{name}: min_c must be below max_c")
+        sensor = {"type": kind, "min_c": low, "max_c": high}
+        if kind == "thermocouple":
+            tc_type = str(spec.get("tc_type") or "").upper()
+            if tc_type not in TC_TYPES:
+                raise DaqPolicyError(f"daq_signals.{name}: tc_type must be one of {TC_TYPES}")
+            if "cjc_c" not in spec:
+                raise DaqPolicyError(
+                    f"daq_signals.{name}: give cjc_c, the temperature of the terminal block "
+                    "(the device has no cold-junction sensor; an error there is an error "
+                    "of the reading)")
+            sensor.update(tc_type=tc_type, cjc_c=number("cjc_c"))
+        else:
+            rtd_type = str(spec.get("rtd_type") or "pt3851").lower()
+            if rtd_type not in RTD_TYPES:
+                raise DaqPolicyError(f"daq_signals.{name}: rtd_type must be one of {RTD_TYPES}")
+            wires = spec.get("wires", 4)
+            if isinstance(wires, bool) or wires not in (2, 3, 4):
+                raise DaqPolicyError(f"daq_signals.{name}: wires must be 2, 3 or 4")
+            if "excitation_a" not in spec:
+                raise DaqPolicyError(
+                    f"daq_signals.{name}: give excitation_a, the current of the external "
+                    "source through the RTD (the device supplies none)")
+            r0, current = number("r0_ohm", 100.0), number("excitation_a")
+            if not (r0 > 0.0 and 0.0 < current <= 0.01):
+                raise DaqPolicyError(f"daq_signals.{name}: r0_ohm must be > 0 and excitation_a "
+                                     "in (0, 0.01] A")
+            sensor.update(rtd_type=rtd_type, r0_ohm=r0, excitation_a=current, wires=int(wires))
+        return sensor
 
     @classmethod
     def from_config(cls, config: dict) -> "DaqSignals":
@@ -313,6 +417,11 @@ class DaqOutputPolicy:
                 f"in config.yaml after checking what is wired to it "
                 f"(enabled: {sorted(self.do_lines) or 'none'})")
         return name
+
+    def check_digital_pattern(self, lines) -> list:
+        """Every line of a hardware-timed pattern must be enabled and on port 0."""
+        names = [self.check_digital_output(line) for line in lines]
+        return check_timed_lines(names)
 
     def check_counter_output(self, counter, frequency_hz, duty_cycle) -> tuple:
         """Return (counter, frequency, duty) normalised, or raise DaqPolicyError."""
