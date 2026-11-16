@@ -1,0 +1,15 @@
+{
+  "name": "daq_timing_and_triggers",
+  "description": "Input-only tour of the timing functions of the NI DAQ; nothing needs to be wired and no output is driven. The board's internal 100 kHz timebase stands in for an external signal: its period, pulse width and edge-to-edge time are measured, it clocks an acquisition and triggers one with pre-trigger samples. Then port 0 is sampled as a digital waveform and an encoder is followed for a moment (it reads 0 degrees with nothing connected).",
+  "steps": [
+    {"action": "daq_measure_period", "terminal": "100khztimebase", "max_s": 0.001},
+    {"action": "daq_measure_pulse_width", "terminal": "100khztimebase", "level": "high", "max_s": 0.001},
+    {"action": "daq_measure_edge_separation", "first": "100khztimebase", "second": "100khztimebase", "second_edge": "falling", "max_s": 0.001},
+    {"action": "daq_acquire", "channels": ["ai0"], "rate_hz": 100000.0, "duration_s": 0.05, "clock": "100khztimebase"},
+    {"action": "daq_acquire", "channels": ["ai0"], "rate_hz": 1000.0, "duration_s": 0.5, "trigger": "100khztimebase", "pretrigger_s": 0.2},
+    {"action": "daq_acquire_digital", "lines": ["port0/line0", "port0/line1"], "rate_hz": 10000.0, "duration_s": 0.1},
+    {"action": "daq_start_encoder", "a": "pfi8", "b": "pfi10", "pulses_per_rev": 360},
+    {"action": "daq_read_encoder"},
+    {"action": "daq_stop_encoder"}
+  ]
+}

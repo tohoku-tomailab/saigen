@@ -24,7 +24,9 @@ DAQ_ACTIONS = set(_DAQ_ACTION_NAMES)
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
                          "capture_microscope", "microscope_led", "microscope_focus"} | DAQ_ACTIONS
 # CSV（波形・連続記録）を保存する DAQ アクション。保存先は実行フォルダに束ねる
-DAQ_DATA_ACTIONS = {"daq_acquire": "acquire", "daq_start_logging": "logging"}
+DAQ_DATA_ACTIONS = {"daq_acquire": "acquire", "daq_start_logging": "logging",
+                    "daq_stimulate_acquire": "stimulate", "daq_acquire_digital": "digital",
+                    "daq_write_digital_pattern": "pattern"}
 MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"}
 # 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
 MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}

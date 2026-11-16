@@ -4,7 +4,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validat
 from typing import Annotated, Literal, Union, List, Optional
 
 # DAQ のチャンネル名の検査（ハードウェアにも nidaqmx にも依存しない）
-from src.devices.nidaq.policy import check_flow_name
+from src.devices.nidaq.policy import check_flow_name, physical_kind
 
 # ==========================================
 # 0. 共通の基底モデル
@@ -609,7 +609,12 @@ class ActionDaqAcquire(_StrictModel):
     DAQ のアナログ入力（複数可）の波形をハードウェアタイミングで取り込み、CSV に保存する
 
     rate_hz × duration_s 点を全チャンネル同時刻で取り込む。trigger を指定すると、
-    その端子のデジタルエッジで取り込みを開始する。保存先は実行フォルダの data/
+    その端子のデジタルエッジで取り込みを開始する。trigger_level も指定すると
+    アナログトリガになり、trigger（channels の先頭のアナログ入力）がその電圧を
+    trigger_edge の向きに横切ったときに始まる。pretrigger_s を指定すると、トリガの
+    前の波形も含めて取り込む（CSV の時刻はトリガが 0、それより前は負）。clock を
+    指定すると、その端子のエッジごとに 1 点取り込む（外部サンプルクロック。rate_hz は
+    そのクロックの最高周波数）。保存先は実行フォルダの data/
     （measurements.csv の data_path 列）。1 チャンネルのときは平均が voltage_v 列にも入る。
 
     Note:
@@ -640,9 +645,26 @@ class ActionDaqAcquire(_StrictModel):
     )
     v_range: DaqVRange = Field(default=None, description=_V_RANGE_DOC)
     terminal: DaqTerminalConfig = Field(default=None, description=_TERMINAL_DOC)
-    trigger: Optional[DaqTerminalName] = Field(
+    trigger: Optional[Annotated[str, _daq_name("terminal", "ai")]] = Field(
         default=None,
-        description="開始トリガの端子（信号名、または pfi0-pfi15）。省略時はすぐ開始"
+        description="開始トリガの端子（信号名、または pfi0-pfi15）。省略時はすぐ開始。"
+                    "trigger_level を指定するときは channels の先頭のアナログ入力"
+    )
+    trigger_level: Optional[float] = Field(
+        default=None,
+        ge=-10.0,
+        le=10.0,
+        description="アナログトリガのレベル (V)。指定すると trigger はアナログ入力になる"
+    )
+    pretrigger_s: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=3600.0,
+        description="duration_s のうちトリガより前に取り込む時間 (秒)。trigger が必要"
+    )
+    clock: Optional[DaqTerminalName] = Field(
+        default=None,
+        description="外部サンプルクロックの端子（信号名、または pfi0-pfi15）。省略時は内部クロック"
     )
     trigger_edge: Literal["rising", "falling"] = Field(
         default="rising",
@@ -673,6 +695,23 @@ class ActionDaqAcquire(_StrictModel):
         if points * n > 2000000:
             raise ValueError("daq_acquire: 1 ステップは合計 200 万点まで（短くするか rate_hz を下げる。"
                              "長時間の記録は daq_start_logging）")
+        if self.trigger_level is not None:
+            if self.trigger is None:
+                raise ValueError("daq_acquire: trigger_level には trigger（channels の先頭の"
+                                 "アナログ入力）が必要です")
+            if self.trigger.strip().lower() != self.channels[0].strip().lower():
+                raise ValueError("daq_acquire: アナログトリガの trigger は channels の先頭と同じに"
+                                 "してください")
+        elif self.trigger is not None and physical_kind(self.trigger) == "ai":
+            raise ValueError("daq_acquire: アナログ入力をトリガにするには trigger_level を指定して"
+                             "ください（デジタルトリガは pfi0 など）")
+        if self.pretrigger_s is not None:
+            if self.trigger is None:
+                raise ValueError("daq_acquire: pretrigger_s には trigger が必要です")
+            before = self.rate_hz * self.pretrigger_s
+            if before < 2 or points - before < 2:
+                raise ValueError("daq_acquire: pretrigger_s は 0 より大きく duration_s 未満で、"
+                                 "前後に 2 点以上残るようにしてください")
         return self
 
 
@@ -1107,6 +1146,396 @@ class ActionDaqGeneratePulses(_StrictModel):
             raise ValueError("daq_generate_pulses: count / frequency_hz は 86400 秒以下にしてください")
         return self
 
+
+class ActionDaqStimulateAcquire(_StrictModel):
+    """
+    DAQ のアナログ出力から波形を出し、同じ瞬間からアナログ入力を取り込む（刺激と応答）
+
+    取り込みは出力の開始トリガで始まる（CSV の 0 秒が波形の開始。出力と入力は別の
+    サンプルクロックで動くため、対応は約 1 サンプル以内で、実機では未測定）。
+    取り込みが終わると出力は 0 V に戻る。CSV には応答のほか、指令した刺激の値
+    （<出力>_set_V 列）も入る。出力の許可と電圧範囲は daq_generate_waveform と同じ。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_stimulate_acquire"] = Field(
+        ...,
+        description="アクション識別子: DAQ 刺激と応答の同時測定"
+    )
+    channel: DaqAoName = Field(
+        ...,
+        description="刺激を出すアナログ出力（信号名、または ao0-ao1）"
+    )
+    waveform: Literal["sine", "square", "triangle", "sawtooth"] = Field(
+        default="sine",
+        description="刺激の波形"
+    )
+    frequency_hz: float = Field(
+        ...,
+        gt=0.0,
+        le=100000.0,
+        description="刺激の周波数 (Hz)"
+    )
+    amplitude_v: float = Field(
+        ...,
+        ge=0.0,
+        le=10.0,
+        description="刺激の振幅 (V、片側)"
+    )
+    offset_v: float = Field(
+        default=0.0,
+        ge=-10.0,
+        le=10.0,
+        description="刺激のオフセット (V)"
+    )
+    channels: List[DaqAiName] = Field(
+        ...,
+        min_length=1,
+        max_length=16,
+        description="応答を取り込むアナログ入力のリスト（信号名、または ai0-ai15）"
+    )
+    rate_hz: float = Field(
+        default=1000.0,
+        gt=0.0,
+        le=1250000.0,
+        description="取り込みのサンプリング周波数 (Hz/ch)"
+    )
+    duration_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=3600.0,
+        description="刺激と取り込みの時間 (秒)"
+    )
+    v_range: DaqVRange = Field(default=None, description=_V_RANGE_DOC)
+    terminal: DaqTerminalConfig = Field(default=None, description=_TERMINAL_DOC)
+    file_path: Optional[str] = Field(
+        default=None,
+        description="保存先 CSV（省略時は実行フォルダの data/ に自動で付ける）"
+    )
+
+    @model_validator(mode="after")
+    def _within_device_limits(self):
+        n = len(self.channels)
+        if len({c.strip().lower() for c in self.channels}) != n:
+            raise ValueError("daq_stimulate_acquire: channels に同じチャンネルが重複しています")
+        if n > 1 and self.rate_hz * n > 1000000.0:
+            raise ValueError("daq_stimulate_acquire: 複数チャンネルでは rate_hz × チャンネル数を "
+                             "1 MHz 以下にしてください")
+        points = self.rate_hz * self.duration_s
+        if points < 2 or points * n > 2000000:
+            raise ValueError("daq_stimulate_acquire: rate_hz × duration_s は 2 点以上、"
+                             "全チャンネル合計 200 万点以下にしてください")
+        return self
+
+
+DaqPort0Line = Annotated[str, _daq_name("line")]
+_PORT0_DOC = "（信号名、または port0/line0-port0/line7。ハードウェアタイミングは port0 のみ）"
+
+
+class ActionDaqAcquireDigital(_StrictModel):
+    """
+    DAQ のデジタルライン（port0）の状態を一定周期で取り込み、CSV に保存する
+
+    rate_hz × duration_s 点。CSV は time_s と、ラインごとの 0 / 1。clock を指定すると
+    その端子のエッジごとに 1 点取り込む（外部クロック）。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_acquire_digital"] = Field(
+        ...,
+        description="アクション識別子: DAQ デジタル波形取り込み"
+    )
+    lines: List[DaqPort0Line] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description="デジタルラインのリスト" + _PORT0_DOC
+    )
+    rate_hz: float = Field(
+        default=1000.0,
+        gt=0.0,
+        le=1000000.0,
+        description="サンプリング周波数 (Hz)"
+    )
+    duration_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=3600.0,
+        description="取り込み時間 (秒)"
+    )
+    clock: Optional[DaqTerminalName] = Field(
+        default=None,
+        description="外部サンプルクロックの端子（信号名、または pfi0-pfi15）。省略時は内部クロック"
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="保存先 CSV（省略時は実行フォルダの data/ に自動で付ける）"
+    )
+
+    @model_validator(mode="after")
+    def _within_limits(self):
+        n = len(self.lines)
+        if len({c.strip().lower() for c in self.lines}) != n:
+            raise ValueError("daq_acquire_digital: lines に同じラインが重複しています")
+        points = self.rate_hz * self.duration_s
+        if points < 2 or points * n > 2000000:
+            raise ValueError("daq_acquire_digital: rate_hz × duration_s は 2 点以上、"
+                             "全ライン合計 200 万点以下にしてください")
+        return self
+
+
+class ActionDaqWriteDigitalPattern(_StrictModel):
+    """
+    DAQ のデジタルライン（port0）に、決めた順序の High / Low をハードウェアタイミングで出す
+
+    pattern は 1 ステップ 1 行。各行は lines の順に 1 文字ずつ "1"（High）/ "0"（Low）
+    （2 ライン・3 ステップなら ["10", "01", "00"]）。1 / rate_hz 秒ごとに次の行へ進み、
+    出し終えるまでステップはブロックする。終わると全ラインが Low に戻る。
+    record を指定すると、同じクロックでそのラインを取り込んで CSV に保存する（応答）。
+    config.yaml の daq_do_lines に無いラインは実行時に拒否される。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_write_digital_pattern"] = Field(
+        ...,
+        description="アクション識別子: DAQ デジタルパターン出力"
+    )
+    lines: List[DaqPort0Line] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description="出力するデジタルラインのリスト" + _PORT0_DOC
+    )
+    pattern: List[str] = Field(
+        ...,
+        min_length=2,
+        max_length=100000,
+        description="1 ステップ 1 行。各行は lines の順の '0' / '1'（例: [\"10\", \"01\", \"00\"]）"
+    )
+    rate_hz: float = Field(
+        ...,
+        gt=0.0,
+        le=1000000.0,
+        description="1 秒あたりのステップ数 (Hz)"
+    )
+    record: Optional[List[DaqPort0Line]] = Field(
+        default=None,
+        max_length=8,
+        description="パターンと同じクロックで取り込むラインのリスト" + _PORT0_DOC
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="record の保存先 CSV（省略時は実行フォルダの data/ に自動で付ける）"
+    )
+
+    @model_validator(mode="after")
+    def _pattern_matches_lines(self):
+        n = len(self.lines)
+        played = {c.strip().lower() for c in self.lines}
+        if len(played) != n:
+            raise ValueError("daq_write_digital_pattern: lines に同じラインが重複しています")
+        for row in self.pattern:
+            if len(row) != n or set(row) - {"0", "1"}:
+                raise ValueError(f"daq_write_digital_pattern: pattern の行 {row!r} は "
+                                 f"'0' / '1' を {n} 文字（lines の数）にしてください")
+        if len(self.pattern) / self.rate_hz > 60.0:
+            raise ValueError("daq_write_digital_pattern: パターンの長さ（行数 / rate_hz）は "
+                             "60 秒以下にしてください")
+        if self.record is not None:
+            recorded = {c.strip().lower() for c in self.record}
+            if not recorded or len(recorded) != len(self.record) or recorded & played:
+                raise ValueError("daq_write_digital_pattern: record は重複なし・1 本以上で、"
+                                 "lines と別のラインにしてください")
+        return self
+
+
+class ActionDaqWaitDigitalChange(_StrictModel):
+    """
+    DAQ のデジタルライン（port0）のどれかが変化するまで待つ（ハードウェアの変化検出）
+
+    ポーリング（daq_wait_digital）では取りこぼす短いパルスも検出する。timeout_s 以内に
+    変化が無ければステップは失敗する。--mock では変化があったものとして進む。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_wait_digital_change"] = Field(
+        ...,
+        description="アクション識別子: DAQ デジタル変化待ち"
+    )
+    lines: List[DaqPort0Line] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description="見張るデジタルラインのリスト" + _PORT0_DOC
+    )
+    edge: Literal["rising", "falling", "both"] = Field(
+        default="both",
+        description="検出する変化: rising = Low→High / falling = High→Low / both"
+    )
+    timeout_s: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=86400.0,
+        description="待つ上限 (秒)"
+    )
+
+
+_TIME_MIN_DOC = "予想される時間の下限 (秒)"
+_TIME_MAX_DOC = "予想される時間の上限 (秒)"
+_COUNTER_DOC = "使うカウンタ（信号名、または ctr0-ctr3）。省略時は空いているものを使う"
+
+
+class _DaqTimeMeasurement(_StrictModel):
+    min_s: float = Field(default=1e-6, gt=0.0, le=1000.0, description=_TIME_MIN_DOC)
+    max_s: float = Field(default=1.0, gt=0.0, le=1000.0, description=_TIME_MAX_DOC)
+    timeout_s: float = Field(default=5.0, gt=0.0, le=3600.0, description="信号を待つ上限 (秒)")
+    counter: Optional[DaqCounterName] = Field(default=None, description=_COUNTER_DOC)
+
+    @model_validator(mode="after")
+    def _range_ordered(self):
+        if not self.min_s < self.max_s:
+            raise ValueError("min_s < max_s にしてください")
+        return self
+
+
+class ActionDaqMeasurePulseWidth(_DaqTimeMeasurement):
+    """
+    DAQ のカウンタで、端子に来るパルス 1 個の幅を測る
+
+    結果は daq_value 列（daq_unit = s）。timeout_s 以内にパルスが来なければ失敗する。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_measure_pulse_width"] = Field(
+        ...,
+        description="アクション識別子: DAQ パルス幅測定"
+    )
+    terminal: DaqTerminalName = Field(
+        ...,
+        description="入力端子（信号名、または pfi0-pfi15）"
+    )
+    level: Literal["high", "low"] = Field(
+        default="high",
+        description="測る部分: high = High の間 / low = Low の間"
+    )
+
+
+class ActionDaqMeasurePeriod(_DaqTimeMeasurement):
+    """
+    DAQ のカウンタで、端子の信号の周期を測る（1 周期）
+
+    結果は daq_value 列（daq_unit = s）。timeout_s 以内に信号が来なければ失敗する。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_measure_period"] = Field(
+        ...,
+        description="アクション識別子: DAQ 周期測定"
+    )
+    terminal: DaqTerminalName = Field(
+        ...,
+        description="入力端子（信号名、または pfi0-pfi15）"
+    )
+    edge: Literal["rising", "falling"] = Field(
+        default="rising",
+        description="周期の基準にするエッジ"
+    )
+
+
+class ActionDaqMeasureEdgeSeparation(_DaqTimeMeasurement):
+    """
+    DAQ のカウンタで、first のエッジから second の次のエッジまでの時間を測る
+
+    2 つの信号の遅れ（応答時間、通過時間）を測るのに使う。結果は daq_value 列
+    （daq_unit = s）。timeout_s 以内にエッジの組が来なければ失敗する。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_measure_edge_separation"] = Field(
+        ...,
+        description="アクション識別子: DAQ 2 エッジ間隔測定"
+    )
+    first: DaqTerminalName = Field(
+        ...,
+        description="最初のエッジの端子（信号名、または pfi0-pfi15）"
+    )
+    second: DaqTerminalName = Field(
+        ...,
+        description="次のエッジの端子（信号名、または pfi0-pfi15。first と同じでもよい）"
+    )
+    first_edge: Literal["rising", "falling"] = Field(default="rising", description="最初のエッジ")
+    second_edge: Literal["rising", "falling"] = Field(default="rising", description="次のエッジ")
+
+
+class ActionDaqStartEncoder(_StrictModel):
+    """
+    DAQ のカウンタで、ロータリーエンコーダ（A / B の 2 相）の追従を始める（0° から）
+
+    以後、daq_read_encoder で回った角度を読む。同時に追従できるのは 1 個。
+    daq_stop_encoder か実行終了まで続く。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_start_encoder"] = Field(
+        ...,
+        description="アクション識別子: DAQ エンコーダ追従開始"
+    )
+    a: DaqTerminalName = Field(..., description="A 相の端子（信号名、または pfi0-pfi15）")
+    b: DaqTerminalName = Field(..., description="B 相の端子（信号名、または pfi0-pfi15）")
+    pulses_per_rev: int = Field(
+        ...,
+        ge=1,
+        le=10000000,
+        description="1 回転あたりのパルス数（エンコーダの仕様値）"
+    )
+    decoding: Literal["x1", "x2", "x4"] = Field(
+        default="x4",
+        description="逓倍（x4 が最も分解能が高い）"
+    )
+    counter: Optional[DaqCounterName] = Field(default=None, description=_COUNTER_DOC)
+
+    @model_validator(mode="after")
+    def _two_terminals(self):
+        if self.a.strip().lower() == self.b.strip().lower():
+            raise ValueError("daq_start_encoder: a と b は別の端子にしてください")
+        return self
+
+
+class ActionDaqReadEncoder(_StrictModel):
+    """
+    追従中のエンコーダの角度を読む（daq_start_encoder からの回転、度。逆回転は負）
+
+    結果は daq_value 列（daq_unit = deg）。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_read_encoder"] = Field(
+        ...,
+        description="アクション識別子: DAQ エンコーダ読み取り"
+    )
+
+
+class ActionDaqStopEncoder(_StrictModel):
+    """
+    エンコーダの追従を終える（最後の角度を daq_value 列に残す）
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["daq_stop_encoder"] = Field(
+        ...,
+        description="アクション識別子: DAQ エンコーダ追従終了"
+    )
+
 # ==========================================
 # 1.8 個別のアクション定義 (ループ制御)
 # ==========================================
@@ -1200,6 +1629,16 @@ LabRobotAction = Union[
     ActionDaqCountEdges,
     ActionDaqMeasureFrequency,
     ActionDaqGeneratePulses,
+    ActionDaqStimulateAcquire,
+    ActionDaqAcquireDigital,
+    ActionDaqWriteDigitalPattern,
+    ActionDaqWaitDigitalChange,
+    ActionDaqMeasurePulseWidth,
+    ActionDaqMeasurePeriod,
+    ActionDaqMeasureEdgeSeparation,
+    ActionDaqStartEncoder,
+    ActionDaqReadEncoder,
+    ActionDaqStopEncoder,
     # ユーティリティ
     ActionWait,
     # ループ制御
