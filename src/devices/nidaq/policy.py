@@ -25,32 +25,29 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-# What the USB-6351 has: ai0-15, ao0-1, three ports of 8 lines, ctr0-3, pfi0-15. A name
-# beyond that is refused here, for the mock as for the device.
-AI_PATTERN = r"^ai(1[0-5]|\d)$"
-AO_PATTERN = r"^ao[01]$"
-LINE_PATTERN = r"^port[0-2]/line[0-7]$"
-COUNTER_PATTERN = r"^ctr[0-3]$"
-#: PFI terminals, and two internal timebases that need no wiring (counter self-test).
-TERMINAL_PATTERN = r"^(pfi(1[0-5]|\d)|100khztimebase|20mhztimebase)$"
+from .profiles import (RTD, THERMOCOUPLE, USB_6351, DaqProfileError, DeviceProfile,
+                       any_kind_of, get_profile)
+
+# Which channels exist depends on the model (profiles.py). A flow is checked against
+# the schema before the model is known: there a name is accepted when some supported
+# model has it; with the configuration (DaqSignals, DaqOutputPolicy) it must exist on
+# the model in use, for the mock as for the device.
 #: A signal name defined in config.yaml (daq_signals).
 SIGNAL_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,39}$"
 #: Names that look like a physical channel; a signal may not be called like this.
 RESERVED_PATTERN = r"^(ai|ao|ctr|pfi|port|line|dev)\d"
 
-#: Voltage span of the analog outputs of the X Series devices (USB-6351: +/-10 V).
-DEVICE_AO_MIN_V = -10.0
-DEVICE_AO_MAX_V = 10.0
+#: Limits of the default model, kept under their old names (the code asks the profile).
+DEVICE_AO_MIN_V = USB_6351.ao_min_v
+DEVICE_AO_MAX_V = USB_6351.ao_max_v
+AI_MAX_RATE_SINGLE_HZ = USB_6351.ai_max_rate_single_hz
+AI_MAX_RATE_AGGREGATE_HZ = USB_6351.ai_max_rate_aggregate_hz
+AO_MAX_RATE_HZ = USB_6351.ao_max_rate_hz
+CO_DEVICE_MAX_HZ = USB_6351.co_max_hz
+DIO_MAX_RATE_HZ = USB_6351.dio_max_rate_hz
+TIMED_PORT = USB_6351.timed_port
 
-#: USB-6351 limits (NI specification; the device reports the same through DAQmx).
-AI_MAX_RATE_SINGLE_HZ = 1_250_000.0     # one channel
-AI_MAX_RATE_AGGREGATE_HZ = 1_000_000.0  # several channels, summed over the channels
-AO_MAX_RATE_HZ = 2_000_000.0            # device: 2.86 MS/s on one channel; kept below it
-CO_DEVICE_MAX_HZ = 1_000_000.0          # pulse trains; the 100 MHz timebase goes higher
-DIO_MAX_RATE_HZ = 1_000_000.0           # hardware-timed digital I/O (port 0 only)
-#: Only port 0 has hardware timing (patterns, clocked acquisition, change detection).
-TIMED_PORT = "port0"
-
+#: Every wiring mode and input range some model has (the schema's choice lists).
 TERMINALS = ("default", "rse", "nrse", "diff")
 V_RANGES = (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
 EDGES = ("rising", "falling")
@@ -67,8 +64,6 @@ RTD_TYPES = ("pt3750", "pt3851", "pt3911", "pt3916", "pt3920", "pt3928")
 SENSOR_UNIT = "degC"
 
 KINDS = ("ai", "ao", "line", "counter", "terminal")
-_PATTERNS = {"ai": AI_PATTERN, "ao": AO_PATTERN, "line": LINE_PATTERN,
-             "counter": COUNTER_PATTERN, "terminal": TERMINAL_PATTERN}
 _KIND_LABEL = {"ai": "analog input", "ao": "analog output", "line": "digital line",
                "counter": "counter", "terminal": "terminal"}
 _EXAMPLES = {"ai": "'ai0'", "ao": "'ao0'", "line": "'port0/line0'", "counter": "'ctr0'",
@@ -85,25 +80,32 @@ def _clean(name) -> str:
 
 #: The pin a counter's pulse train comes out of is also a digital line (USB-6351:
 #: PFI12..15 = port2/line4..7). One pin cannot serve both at the same time.
-COUNTER_OUTPUT_LINES = {"ctr0": "port2/line4", "ctr1": "port2/line5",
-                        "ctr2": "port2/line6", "ctr3": "port2/line7"}
+COUNTER_OUTPUT_LINES = USB_6351.counter_output_lines
 
 
-def physical_kind(name) -> Optional[str]:
-    """The kind of a physical channel name ("ai0" -> "ai"), or None if it is not one."""
+def physical_kind(name, profile: Optional[DeviceProfile] = None) -> Optional[str]:
+    """The kind of a physical channel name ("ai0" -> "ai"), or None if it is not one.
+
+    With a profile: on that model. Without: on any supported model.
+    """
     text = _clean(name)
-    for kind, pattern in _PATTERNS.items():
-        if re.match(pattern, text):
-            return kind
-    return None
+    return any_kind_of(text) if profile is None else profile.kind_of(text)
 
 
 def _normalize(name, kind: str) -> str:
     text = _clean(name)
-    if not re.match(_PATTERNS[kind], text):
+    if any_kind_of(text) != kind:
         raise DaqPolicyError(f"{_KIND_LABEL[kind]} channel name {name!r} is not valid "
                              f"(expected e.g. {_EXAMPLES[kind]}, without the device name)")
     return text
+
+
+def require_on_model(profile: DeviceProfile, kind: str, name: str, where: str = "") -> str:
+    """A channel that is a valid name must also exist on the model in use."""
+    if not profile.has(kind, name):
+        raise DaqPolicyError(f"{where}the {profile.model} has no {_KIND_LABEL[kind]} {name} "
+                             f"(it has {profile.available(kind)})")
+    return name
 
 
 def normalize_ai(name) -> str:
@@ -126,16 +128,20 @@ def normalize_terminal(name) -> str:
     return _normalize(name, "terminal")
 
 
-def check_timed_lines(lines) -> list:
-    """Lines of a hardware-timed digital step: on port 0, each once."""
+def check_timed_lines(lines, profile: Optional[DeviceProfile] = None) -> list:
+    """Lines of a hardware-timed digital step: on the timed port (port 0), each once."""
+    profile = profile or USB_6351
     names = [normalize_line(line) for line in lines]
     if not names:
         raise DaqPolicyError("at least one digital line is needed")
     if len(set(names)) != len(names):
         raise DaqPolicyError("the same digital line is listed twice")
+    if profile.timed_port is None:
+        raise DaqPolicyError(f"the {profile.model} has no hardware-timed digital I/O")
     for name in names:
-        if not name.startswith(TIMED_PORT + "/"):
-            raise DaqPolicyError(f"{name}: only {TIMED_PORT} has hardware timing "
+        require_on_model(profile, "line", name)
+        if not name.startswith(profile.timed_port + "/"):
+            raise DaqPolicyError(f"{name}: only {profile.timed_port} has hardware timing "
                                  "(patterns, clocked acquisition, change detection)")
     return names
 
@@ -188,6 +194,22 @@ class Signal:
         return volts * self.scale + self.offset
 
 
+def check_differential(profile: DeviceProfile, channel: str, where: str = "") -> None:
+    """A differential reading uses two pins; only the first channels can be its + input."""
+    if int(channel[2:]) >= profile.ai_diff_channels:
+        raise DaqPolicyError(
+            f"{where}{channel} cannot be read differentially on the {profile.model} "
+            f"(ai0..ai{profile.ai_diff_channels - 1} can; {channel} is the - input of a pair)")
+
+
+def profile_from_config(config: Optional[dict]) -> DeviceProfile:
+    """The model named in config.yaml (``shared_devices.daq_model``; "" = the default)."""
+    try:
+        return get_profile((config or {}).get("daq_model"))
+    except DaqProfileError as exc:
+        raise DaqPolicyError(f"shared_devices.daq_model: {exc}") from None
+
+
 class DaqSignals:
     """The named signals of ``config.yaml`` (``shared_devices.daq_signals``)."""
 
@@ -196,7 +218,8 @@ class DaqSignals:
     _SENSOR_KEYS = {"thermocouple": {"tc_type", "cjc_c", "min_c", "max_c"},
                     "rtd": {"rtd_type", "r0_ohm", "excitation_a", "wires", "min_c", "max_c"}}
 
-    def __init__(self, signals: Optional[dict] = None):
+    def __init__(self, signals: Optional[dict] = None, profile: Optional[DeviceProfile] = None):
+        self.profile = profile or USB_6351
         self._signals = {}
         for raw_name, spec in (signals or {}).items():
             name = _clean(raw_name)
@@ -206,10 +229,10 @@ class DaqSignals:
                     "digits and '_', starting with a letter, and not shaped like a channel)")
             if name in self._signals:
                 raise DaqPolicyError(f"daq_signals: {raw_name!r} is defined twice")
-            self._signals[name] = self._parse(name, spec)
+            self._signals[name] = self._parse(name, spec, self.profile)
 
     @staticmethod
-    def _parse(name: str, spec) -> Signal:
+    def _parse(name: str, spec, profile: DeviceProfile = USB_6351) -> Signal:
         if isinstance(spec, str):
             spec = {"channel": spec}
         if not isinstance(spec, dict) or not spec.get("channel"):
@@ -219,17 +242,22 @@ class DaqSignals:
         if kind is None:
             raise DaqPolicyError(f"daq_signals.{name}: {spec['channel']!r} is not a channel "
                                  "(ai0, ao0, port0/line0, ctr0, pfi0; without the device name)")
+        require_on_model(profile, kind, channel, f"daq_signals.{name}: ")
         extra = set(spec) - {"channel"} - (DaqSignals._AI_KEYS if kind == "ai" else set())
         if extra:
             raise DaqPolicyError(f"daq_signals.{name}: unknown or unusable key(s) {sorted(extra)} "
                                  f"for a channel of kind {kind!r}")
         terminal = spec.get("terminal")
-        if terminal is not None and terminal not in TERMINALS:
-            raise DaqPolicyError(f"daq_signals.{name}: terminal must be one of {TERMINALS}")
+        if terminal is not None and terminal not in profile.ai_terminals:
+            raise DaqPolicyError(f"daq_signals.{name}: terminal must be one of "
+                                 f"{profile.ai_terminals} on the {profile.model}")
+        if terminal == "diff":
+            check_differential(profile, channel, f"daq_signals.{name}: ")
         v_range = spec.get("v_range")
         if v_range is not None:
-            if isinstance(v_range, bool) or float(v_range) not in V_RANGES:
-                raise DaqPolicyError(f"daq_signals.{name}: v_range must be one of {V_RANGES}")
+            if isinstance(v_range, bool) or float(v_range) not in profile.v_ranges:
+                raise DaqPolicyError(f"daq_signals.{name}: v_range must be one of "
+                                     f"{profile.v_ranges} on the {profile.model}")
             v_range = float(v_range)
         try:
             scale = float(spec.get("scale", 1.0))
@@ -246,6 +274,10 @@ class DaqSignals:
                 raise DaqPolicyError(f"daq_signals.{name}: v_range does not apply to a sensor "
                                      "channel (give min_c / max_c)")
             unit = unit or SENSOR_UNIT
+            try:
+                profile.require(THERMOCOUPLE if sensor["type"] == "thermocouple" else RTD)
+            except DaqProfileError as exc:
+                raise DaqPolicyError(f"daq_signals.{name}: {exc}") from None
         return Signal(label=f"{name}:{channel}", kind=kind, channel=channel, terminal=terminal,
                       v_range=v_range, scale=scale, offset=offset, unit=unit, sensor=sensor)
 
@@ -307,11 +339,11 @@ class DaqSignals:
         return sensor
 
     @classmethod
-    def from_config(cls, config: dict) -> "DaqSignals":
+    def from_config(cls, config: dict, profile: Optional[DeviceProfile] = None) -> "DaqSignals":
         signals = (config or {}).get("daq_signals") or {}
         if not isinstance(signals, dict):
             raise DaqPolicyError("shared_devices.daq_signals must be a mapping of name -> channel")
-        return cls(signals)
+        return cls(signals, profile)
 
     def names(self) -> list:
         return sorted(self._signals)
@@ -322,6 +354,7 @@ class DaqSignals:
         text = _clean(name)
         kind = physical_kind(text)
         if kind is not None:
+            require_on_model(self.profile, kind, text)
             signal = Signal(label=text, kind=kind, channel=text)
         elif text in self._signals:
             signal = self._signals[text]
@@ -342,23 +375,36 @@ class DaqOutputPolicy:
 
     def __init__(self, ao_channels: Iterable = (), do_lines: Iterable = (),
                  ao_min_v: float = 0.0, ao_max_v: float = 5.0,
-                 co_counters: Iterable = (), co_max_hz: float = 1000.0):
-        self.ao_channels = frozenset(normalize_ao(c) for c in (ao_channels or ()))
-        self.do_lines = frozenset(normalize_line(c) for c in (do_lines or ()))
-        self.co_counters = frozenset(normalize_counter(c) for c in (co_counters or ()))
+                 co_counters: Iterable = (), co_max_hz: float = 1000.0,
+                 profile: Optional[DeviceProfile] = None):
+        self.profile = p = profile or USB_6351
+        self.ao_channels = frozenset(
+            require_on_model(p, "ao", normalize_ao(c), "daq_ao_channels: ")
+            for c in (ao_channels or ()))
+        self.do_lines = frozenset(
+            require_on_model(p, "line", normalize_line(c), "daq_do_lines: ")
+            for c in (do_lines or ()))
+        self.co_counters = frozenset(
+            require_on_model(p, "counter", normalize_counter(c), "daq_co_counters: ")
+            for c in (co_counters or ()))
+        if self.co_counters and not p.co_max_hz > 0.0:
+            raise DaqPolicyError(f"daq_co_counters: the {p.model} cannot output pulse trains; "
+                                 "leave the list empty")
         self.ao_min_v = float(ao_min_v)
         self.ao_max_v = float(ao_max_v)
         self.co_max_hz = float(co_max_hz)
-        if not (DEVICE_AO_MIN_V <= self.ao_min_v <= self.ao_max_v <= DEVICE_AO_MAX_V):
+        if not (p.ao_min_v <= self.ao_min_v <= self.ao_max_v <= p.ao_max_v):
             raise DaqPolicyError(
-                f"daq_ao_min_v / daq_ao_max_v must satisfy {DEVICE_AO_MIN_V:g} <= min <= max <= "
-                f"{DEVICE_AO_MAX_V:g} V, got {self.ao_min_v:g} .. {self.ao_max_v:g}")
-        if not (0.0 < self.co_max_hz <= CO_DEVICE_MAX_HZ):
+                f"daq_ao_min_v / daq_ao_max_v must satisfy {p.ao_min_v:g} <= min <= max <= "
+                f"{p.ao_max_v:g} V, got {self.ao_min_v:g} .. {self.ao_max_v:g}")
+        # a model without counter output ignores the frequency limit (nothing can use it)
+        limit = p.co_max_hz if p.co_max_hz > 0.0 else USB_6351.co_max_hz
+        if not (0.0 < self.co_max_hz <= limit):
             raise DaqPolicyError(
-                f"daq_co_max_hz must be in (0, {CO_DEVICE_MAX_HZ:g}] Hz, got {self.co_max_hz:g}")
+                f"daq_co_max_hz must be in (0, {limit:g}] Hz, got {self.co_max_hz:g}")
 
     @classmethod
-    def from_config(cls, config: dict) -> "DaqOutputPolicy":
+    def from_config(cls, config: dict, profile: Optional[DeviceProfile] = None) -> "DaqOutputPolicy":
         config = config or {}
         for key in ("daq_ao_min_v", "daq_ao_max_v", "daq_co_max_hz"):
             if key in config and config[key] is None:
@@ -369,7 +415,8 @@ class DaqOutputPolicy:
                    ao_min_v=config.get("daq_ao_min_v", 0.0),
                    ao_max_v=config.get("daq_ao_max_v", 5.0),
                    co_counters=config.get("daq_co_counters") or (),
-                   co_max_hz=config.get("daq_co_max_hz", 1000.0))
+                   co_max_hz=config.get("daq_co_max_hz", 1000.0),
+                   profile=profile)
 
     def describe(self) -> str:
         return (f"AO {sorted(self.ao_channels) or 'none'} [{self.ao_min_v:g}..{self.ao_max_v:g} V], "
@@ -421,7 +468,7 @@ class DaqOutputPolicy:
     def check_digital_pattern(self, lines) -> list:
         """Every line of a hardware-timed pattern must be enabled and on port 0."""
         names = [self.check_digital_output(line) for line in lines]
-        return check_timed_lines(names)
+        return check_timed_lines(names, self.profile)
 
     def check_counter_output(self, counter, frequency_hz, duty_cycle) -> tuple:
         """Return (counter, frequency, duty) normalised, or raise DaqPolicyError."""

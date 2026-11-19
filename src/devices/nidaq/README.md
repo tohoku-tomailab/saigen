@@ -1,9 +1,12 @@
-# National Instruments DAQ (USB-6351)
+# National Instruments DAQ (USB-6351, USB-6002)
 
 Analog, digital and counter I/O through NI-DAQmx, used by the `daq_*` flow steps.
-The code addresses channels generically, so other X Series devices should work,
-but the USB-6351 is the only target it was written for and its limits (sample
-rates, 4 counters) are the ones built in.
+The driver, the steps and the flows are the same for every model; what a model
+has (channels, rates, which measurements exist) is one table entry in
+`profiles.py`. Two models have an entry: the USB-6351 (X Series, the one the code
+was written on) and the USB-6002 (low-cost, added afterwards as a profile). A
+device of another model is refused until it has a profile: see
+[Adding another model](#adding-another-model).
 
 > Status (2026-11-14, NI-DAQmx 26.8, one USB-6351): **every input function was
 > exercised on the real device** with nothing wired — averaged reading, waveform
@@ -20,6 +23,15 @@ rates, 4 counters) are the ones built in.
 > unit-tested against a fake `nidaqmx` module only. Run
 > `examples/daq/output_loopback_check.json` on the bench, with nothing else
 > wired, before relying on them.
+>
+> USB-6002 (2026-11-16, one device): the inputs it has were exercised on the real
+> device with nothing wired — averaged reading (RSE and differential), waveform
+> capture at its limits (50 kS/s on one channel, 25 kS/s on each of two),
+> continuous recording, digital input on all three ports, edge counting (0 edges),
+> the timeout of a digital trigger that never comes — and what it lacks was asked
+> of the device and refused by it (see the table below). **None of its outputs has
+> been driven**, and its counter and trigger have not seen a signal:
+> `examples/daq/usb6002_loopback_check.json` is the bench check for that.
 
 ## Three layers
 
@@ -32,6 +44,36 @@ rates, 4 counters) are the ones built in.
 A flow written with signal names runs unchanged in a lab that wired the same
 signals to other terminals. Physical names (`ai0`, `ao1`, `port0/line3`, `ctr0`,
 `pfi0`; never with the device name) are accepted too.
+
+## Supported models
+
+| | USB-6351 | USB-6002 |
+|---|---|---|
+| Analog inputs | ai0–15 (ai0–7 differential), ±0.1 … ±10 V, 1.25 MS/s (1 MS/s shared by several channels) | ai0–7 (ai0–3 differential), ±10 V only, 50 kS/s shared by the channels |
+| Input wiring | `rse`, `nrse`, `diff` | `rse`, `diff` |
+| Analog outputs | ao0–1, ±10 V, waveforms up to 2 MS/s | ao0–1, ±10 V, waveforms up to 5 kS/s (a sine of at most 250 Hz) |
+| Digital lines | port0–2, 8 lines each; port 0 hardware-timed | port0 (8), port1 (4), port2 (1); software-timed only |
+| Counters | ctr0–3: edges, frequency, period, pulse width, edge separation, encoder; pulse trains | ctr0: edge counting only (the device accepts PFI0 and PFI1 as its source; no edge has been counted yet); no output |
+| Terminals | pfi0–15 (= port1/line0–7, port2/line0–7), `100khztimebase`, `20mhztimebase` | pfi0 (= port2/line0), pfi1 (= port1/line1) |
+| Triggers for `daq_acquire` | digital, analog, pre-trigger; external sample clock | digital start trigger |
+| Thermocouple / RTD signals | yes | no: one count of its 16 bits over ±10 V is 305 µV, about 7 K of a type K thermocouple. Read an amplified sensor as a voltage with `scale` |
+
+Steps of the table below that a USB-6002 **cannot** run: `daq_measure_frequency`,
+`daq_measure_period`, `daq_measure_pulse_width`, `daq_measure_edge_separation`,
+the three encoder steps, `daq_generate_pulses`, `daq_acquire_digital`,
+`daq_write_digital_pattern`, `daq_wait_digital_change`, and the options
+`trigger_level`, `pretrigger_s` and `clock` of `daq_acquire`. The other fourteen
+steps are the same.
+
+The real driver reads the model from the device. `--mock` imitates the model
+named in `config.yaml` (`daq_model`; empty means USB-6351) with the same table.
+A step or option the model does not have at all stops the flow at `--mock` before
+its first step, with the model's name and one line per step; a channel, range,
+wiring mode or rate the model does not have is refused when its step is reached,
+in `--mock` as on the bench. A real run does not start unless `daq_model` is the
+model that is connected (so a lab with a USB-6002 must write `daq_model:
+USB-6002`; the error says so). A flow written for the USB-6002 runs unchanged on
+the USB-6351.
 
 ## Flow steps
 
@@ -71,6 +113,8 @@ add them.
 
 | File | Role |
 |---|---|
+| `profiles.py` | `DeviceProfile`: what each model has. The only place a model's numbers are written. |
+| `probe.py` | `python -m src.devices.nidaq.probe`: what the connected devices report about themselves (property reads only), compared with their profile. |
 | `policy.py` | Channel names, `DaqSignals` (named signals), `DaqOutputPolicy` (what may be driven). No hardware. |
 | `nidaq.py` | `NIDaq`: the DAQmx tasks. Knows nothing about flows or permissions. |
 | `mock.py` | `MockNIDaq`: same methods, no hardware, records what was driven. |
@@ -199,6 +243,11 @@ trusting the numbers.
 - The device rounds a requested sample rate to what its timebase can divide
   (3000 Hz becomes 3000.03 Hz). The CSV time axis and the reported waveform
   frequency use the rate the device reports; the log says so when they differ.
+- A PFI terminal is the same pin as a digital line (table above). While a run
+  drives that line as a digital output, the PFI is refused as a counter source,
+  trigger or clock, and a line the encoder listens on is refused as an output.
+  To count or trigger on a signal the board itself produces, use another pin and
+  a jumper.
 - A counter's output pin is also a digital line (PFI12–15 = port2/line4–7). While
   a pulse train runs, that line is refused as a digital input or output, and a
   line driven as a digital output in a run is refused as a counter output.
@@ -206,6 +255,64 @@ trusting the numbers.
   signal do not wrap unnoticed.
 - `daq_stop_output` on an output this run never drove sends nothing and records
   no level.
+
+## Adding another model
+
+The USB-6002 was added this way, and it is the pattern for a third model **that
+fits what the driver assumes** (listed at the end of this section). No step, no
+schema entry and no GUI block was added for it; the one-time work was moving the
+USB-6351's numbers out of the code into a profile, and three checks the smaller
+board made necessary (differential pairs, the rate of an averaged reading, a PFI
+whose pin is being driven as a digital output).
+
+1. **Ask the device** (nothing is driven, no task is created):
+   `python -m src.devices.nidaq.probe Dev2` prints channel counts, ranges, rates,
+   ports and counters as DAQmx reports them.
+2. **Write the profile**: one `DeviceProfile(...)` in `profiles.py` with those
+   figures and the specification's. Start with `features=frozenset()`.
+3. **Find out what it really supports.** DAQmx's lists are not reliable (the
+   USB-6351 lists bridge channels and refuses to create one; the USB-6002 lists
+   thermocouples that its resolution makes useless). For each feature in
+   `profiles.py`, create the input task on the device and ask DAQmx to verify it
+   (`task.control(TaskMode.TASK_VERIFY)`), or run it with nothing wired. Add a
+   feature to the profile only when the device accepted it. Input tasks only;
+   outputs are step 6.
+4. **Tests**: the parametrised tests at the end of `tests/test_nidaq.py` take the
+   model's names and limits; add the rows for the new model, and one example flow
+   run under `daq_model: <model>`.
+5. **Input-only run on the device**: a flow of `daq_*` input steps
+   (`examples/daq/usb6002_inputs.json` is the 6002's).
+6. **Loop-back check of the outputs**, run by the human after enabling them for
+   the check (`examples/daq/usb6002_loopback_check.json`). Until then the README
+   says the outputs are untested on that model.
+
+What the driver still assumes of every model, outside the profile: channels,
+lines, counters and PFI numbered from 0 without gaps; the differential inputs
+are the first channels; inputs of at most ±10 V; 32-bit counters; one
+analog-output sample clock (one waveform at a time); 0 V and low as the safe
+state of the outputs; hardware-timed digital I/O and change detection on the
+same single port; the terminal names of the internal timebases and of the
+analog-output start trigger. The choice lists of the flow schema (`terminal`,
+`v_range`) are the union of the models'. A model that differs in one of these
+needs a new profile field or driver code, not only a table entry.
+
+What was learnt from the USB-6002 on the bench:
+
+- The PC receives the first samples of a continuous acquisition about 0.2 s
+  after the start, then in blocks of about 0.2 s. Whether sampling itself starts
+  late was not measured. A recording is reported as an error when fewer than
+  90 % of the samples expected for its duration arrived.
+- An unsupported range is silently coerced by DAQmx (±5 V becomes ±10 V), an
+  unsupported rate or wiring mode is refused. The profile refuses both before
+  the device is asked.
+- Without `terminal`, DAQmx reads ai0–3 differentially and ai4–7
+  single-ended (RSE) on this model. Give `terminal: rse` for a signal referenced
+  to the device ground.
+- A flow can name no internal signal on this model (no timebase terminal), so
+  its counter and its PFI trigger can only be checked with a wire (the loop-back
+  flow uses its own analog output as a 0–5 V square wave).
+- DAQmx refuses a padded channel number (`ai00`, `port0/line00`); so does the
+  profile.
 
 ## Electrical limits to respect (check the NI specification before wiring)
 
@@ -223,12 +330,17 @@ trusting the numbers.
 Reads only, drives nothing:
 
 ```bash
+python -m src.devices.nidaq.probe             # what each device has, against its profile
 python -m src.devices.nidaq.nidaq             # list the devices NI-DAQmx knows
 python -m src.devices.nidaq.nidaq Dev1 ai0    # read one analog input
 python -m src.flow.run_flow examples/daq/acquire_and_count.json --mock
 python -m src.flow.run_flow examples/daq/acquire_and_count.json   # real, inputs only
 python -m src.flow.run_flow examples/daq/timing_and_triggers.json # real, inputs only
 ```
+
+On a USB-6002 the input-only flow is `examples/daq/usb6002_inputs.json` (the two
+flows above use the internal timebase and the counter measurements of the
+USB-6351), and the output check is `examples/daq/usb6002_loopback_check.json`.
 
 `acquire_and_count.json` should report about 100000 edges per second and
 100000 Hz for the internal timebase. A known source makes a voltage checkable: a

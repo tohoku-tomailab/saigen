@@ -10,9 +10,10 @@ from typing import Dict, List, Optional, Sequence
 
 import threading
 
-from .nidaq import COUNTERS, _locked, check_ai_rate
-from .policy import (AO_MAX_RATE_HZ, COUNTER_OUTPUT_LINES, DIO_MAX_RATE_HZ, ENCODER_DECODINGS,
-                     check_timed_lines, DEVICE_AO_MAX_V, DEVICE_AO_MIN_V, EDGES, TERMINALS,
+from .nidaq import _locked, check_ai_rate
+from .profiles import get_profile
+from .policy import (ENCODER_DECODINGS,
+                     check_timed_lines, EDGES, TERMINALS,
                      normalize_ai, normalize_ao, normalize_counter, normalize_line,
                      normalize_terminal, physical_kind)
 
@@ -27,9 +28,11 @@ class MockNIDaq:
     #: What the encoder reads (degrees).
     MOCK_ANGLE_DEG = 90.0
 
-    def __init__(self, device: str = "MockDev"):
+    def __init__(self, device: str = "MockDev", model: Optional[str] = None):
+        """``model``: the NI model to imitate ("USB-6002"); None = the default model."""
         self.device = device
-        self.product_type = "USB-6351 (mock)"
+        self.profile = get_profile(model)
+        self.product_type = f"{self.profile.model} (mock)"
         self.analog_outputs: Dict[str, float] = {}      # {"ao0": 2.5}; 0.0 after a stop
         self.digital_outputs: Dict[str, bool] = {}      # {"port0/line0": True}
         self.waveforms: Dict[str, dict] = {}            # running: {"ao0": {"points":.., "rate_hz":..}}
@@ -50,10 +53,23 @@ class MockNIDaq:
             raise RuntimeError("the DAQ has been closed (the run is over); no output is driven")
 
     def _require_pin_free(self, name: str) -> None:
-        for counter, pin in COUNTER_OUTPUT_LINES.items():
+        for counter, pin in self.profile.counter_output_lines.items():
             if pin == name and counter in self.pulse_trains:
                 raise RuntimeError(f"{name} is the output pin of {counter}, which is generating "
                                    "a pulse train; stop it first")
+        if self.encoder is not None and name in (self.profile.pfi_lines.get(self.encoder["a"]),
+                                                 self.profile.pfi_lines.get(self.encoder["b"])):
+            raise RuntimeError(f"{name} is the pin of a terminal the encoder is being "
+                               "followed on; stop the encoder first")
+
+    def _terminal(self, terminal: str) -> str:
+        """Same rule as the real driver: a PFI whose pin this run drives is no input."""
+        name = normalize_terminal(terminal)
+        line = self.profile.pfi_lines.get(name)
+        if line is not None and line in self.digital_outputs:
+            raise RuntimeError(f"{name} is the pin of {line}, which this run is driving as "
+                               "a digital output; stop that output first")
+        return name
 
     def list_devices(self) -> List[str]:
         return [self.device]
@@ -97,6 +113,8 @@ class MockNIDaq:
                     sensor: Optional[dict] = None) -> float:
         if int(samples) < 1:
             raise ValueError("samples must be >= 1")
+        if int(samples) > 1:
+            check_ai_rate(1, rate_hz, self.profile)
         spec = (channel, v_range, terminal, sensor)
         self._check_ai([spec])
         self._require_ai_free()
@@ -109,7 +127,7 @@ class MockNIDaq:
         samples = int(samples)
         if samples < 2:
             raise ValueError("samples must be >= 2")
-        check_ai_rate(len(specs), rate_hz)
+        check_ai_rate(len(specs), rate_hz, self.profile)
         pretrigger = int(pretrigger)
         if pretrigger and trigger is None:
             raise ValueError("pretrigger samples need a trigger")
@@ -128,15 +146,15 @@ class MockNIDaq:
                     raise ValueError("an analog trigger must be the first channel acquired "
                                      f"({names[0]}), got {trigger}")
             else:
-                normalize_terminal(trigger)
+                self._terminal(trigger)
         if clock is not None:
-            normalize_terminal(clock)
+            self._terminal(clock)
         self.ai_rate_hz = float(rate_hz)
         return [[self._reading(spec)] * samples for spec in specs]
 
     @_locked
     def start_stream(self, specs: Sequence, rate_hz: float) -> int:
-        check_ai_rate(len(specs), rate_hz)
+        check_ai_rate(len(specs), rate_hz, self.profile)
         self._require_open()
         specs = list(specs)
         names = self._check_ai(specs)
@@ -175,9 +193,9 @@ class MockNIDaq:
     def _set_ao(self, channel: str, voltage: float) -> float:
         name = normalize_ao(channel)
         volts = float(voltage)
-        if not (DEVICE_AO_MIN_V <= volts <= DEVICE_AO_MAX_V):
+        if not (self.profile.ao_min_v <= volts <= self.profile.ao_max_v):
             raise ValueError(f"{name}: {volts:g} V is outside the device span "
-                             f"{DEVICE_AO_MIN_V:g} .. {DEVICE_AO_MAX_V:g} V")
+                             f"{self.profile.ao_min_v:g} .. {self.profile.ao_max_v:g} V")
         self.waveforms.pop(name, None)
         self.analog_outputs[name] = volts
         return volts
@@ -188,11 +206,11 @@ class MockNIDaq:
         points = [float(v) for v in period]
         if len(points) < 2:
             raise ValueError("a waveform needs at least 2 points")
-        if any(v != v or not (DEVICE_AO_MIN_V <= v <= DEVICE_AO_MAX_V) for v in points):
+        if any(v != v or not (self.profile.ao_min_v <= v <= self.profile.ao_max_v) for v in points):
             raise ValueError(f"{name}: the waveform leaves the device span "
-                             f"{DEVICE_AO_MIN_V:g} .. {DEVICE_AO_MAX_V:g} V")
-        if not (0.0 < float(rate_hz) <= AO_MAX_RATE_HZ):
-            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {AO_MAX_RATE_HZ:g} Hz")
+                             f"{self.profile.ao_min_v:g} .. {self.profile.ao_max_v:g} V")
+        if not (0.0 < float(rate_hz) <= self.profile.ao_max_rate_hz):
+            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {self.profile.ao_max_rate_hz:g} Hz")
         self._require_open()
         others = sorted(set(self.waveforms) - {name})
         if others:
@@ -224,8 +242,8 @@ class MockNIDaq:
     def _input_counter(self, counter: Optional[str]) -> str:
         if counter is not None:
             name = normalize_counter(counter)
-            if name not in COUNTERS:
-                raise ValueError(f"{name}: the device has {COUNTERS}")
+            if name not in self.profile.counter_names:
+                raise ValueError(f"{name}: the device has {self.profile.counter_names}")
             if name in self.pulse_trains:
                 raise RuntimeError(f"{name} is generating a pulse train; stop it first "
                                    "or use another counter")
@@ -233,7 +251,7 @@ class MockNIDaq:
                 raise RuntimeError(f"{name} is following the encoder; use another counter")
             return name
         busy = set(self.pulse_trains) | ({self.encoder["counter"]} if self.encoder else set())
-        for name in reversed(COUNTERS):
+        for name in reversed(self.profile.counter_names):
             if name not in busy:
                 return name
         raise RuntimeError("all four counters are in use")
@@ -244,7 +262,7 @@ class MockNIDaq:
             raise ValueError("duration_s must be > 0")
         if edge not in EDGES:
             raise ValueError(f"edge must be one of {EDGES}, got {edge!r}")
-        normalize_terminal(terminal)
+        self._terminal(terminal)
         self._input_counter(counter)
         return int(round(float(duration_s) * self.MOCK_FREQUENCY_HZ))
 
@@ -255,7 +273,7 @@ class MockNIDaq:
             raise ValueError("min_hz and max_hz must satisfy 0 < min_hz < max_hz")
         if edge not in EDGES:
             raise ValueError(f"edge must be one of {EDGES}, got {edge!r}")
-        normalize_terminal(terminal)
+        self._terminal(terminal)
         self._input_counter(counter)
         return min(max(self.MOCK_FREQUENCY_HZ, float(min_hz)), float(max_hz))
 
@@ -263,8 +281,8 @@ class MockNIDaq:
     def start_pulses(self, counter: str, frequency_hz: float, duty_cycle: float = 0.5,
                      count: Optional[int] = None) -> None:
         name = normalize_counter(counter)
-        if name not in COUNTERS:
-            raise ValueError(f"{name}: the device has {COUNTERS}")
+        if name not in self.profile.counter_names:
+            raise ValueError(f"{name}: the device has {self.profile.counter_names}")
         if not float(frequency_hz) > 0.0 or not (0.0 < float(duty_cycle) < 1.0):
             raise ValueError("frequency_hz must be > 0 and duty_cycle between 0 and 1")
         if count is not None and int(count) < 1:
@@ -272,8 +290,8 @@ class MockNIDaq:
         self._require_open()
         if self.encoder is not None and self.encoder["counter"] == name:
             raise RuntimeError(f"{name} is following the encoder; use another counter")
-        if COUNTER_OUTPUT_LINES[name] in self.digital_outputs:
-            raise RuntimeError(f"the output pin of {name} ({COUNTER_OUTPUT_LINES[name]}) has "
+        if self.profile.counter_output_lines.get(name) in self.digital_outputs:
+            raise RuntimeError(f"the output pin of {name} ({self.profile.counter_output_lines.get(name)}) has "
                                "been driven as a digital line in this run; use another counter")
         self.pulse_trains[name] = {"frequency_hz": float(frequency_hz),
                                    "duty_cycle": float(duty_cycle), "count": count}
@@ -286,7 +304,7 @@ class MockNIDaq:
                           specs: Sequence, rate_hz: float, samples: int):
         if int(samples) < 2:
             raise ValueError("samples must be >= 2")
-        check_ai_rate(len(specs), rate_hz)
+        check_ai_rate(len(specs), rate_hz, self.profile)
         self._require_ai_free()
         self._require_open()
         specs = list(specs)
@@ -300,7 +318,7 @@ class MockNIDaq:
 
     # -- hardware-timed digital I/O ---------------------------------------
     def _check_di(self, lines) -> List[str]:
-        names = check_timed_lines(lines)
+        names = check_timed_lines(lines, self.profile)
         for name in names:
             if name in self.digital_outputs:
                 raise RuntimeError(f"{name} is being driven as an output in this session; "
@@ -311,11 +329,11 @@ class MockNIDaq:
                         clock: Optional[str] = None) -> List[List[bool]]:
         if int(samples) < 2:
             raise ValueError("samples must be >= 2")
-        if not (0.0 < float(rate_hz) <= DIO_MAX_RATE_HZ):
-            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {DIO_MAX_RATE_HZ:g} Hz")
+        if not (0.0 < float(rate_hz) <= self.profile.dio_max_rate_hz):
+            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {self.profile.dio_max_rate_hz:g} Hz")
         names = self._check_di(lines)
         if clock is not None:
-            normalize_terminal(clock)
+            self._terminal(clock)
         self.di_rate_hz = float(rate_hz)
         return [[False] * int(samples) for _ in names]
 
@@ -330,18 +348,18 @@ class MockNIDaq:
     def write_digital_pattern(self, lines: Sequence[str], rows: Sequence[Sequence[bool]],
                               rate_hz: float,
                               record: Optional[Sequence[str]] = None) -> Optional[List[List[bool]]]:
-        names = check_timed_lines(lines)
+        names = check_timed_lines(lines, self.profile)
         steps = [[bool(v) for v in row] for row in rows]
         if len(steps) < 2 or any(len(row) != len(names) for row in steps):
             raise ValueError("a pattern needs at least 2 rows, each with one state per line")
-        if not (0.0 < float(rate_hz) <= DIO_MAX_RATE_HZ):
-            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {DIO_MAX_RATE_HZ:g} Hz")
+        if not (0.0 < float(rate_hz) <= self.profile.dio_max_rate_hz):
+            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {self.profile.dio_max_rate_hz:g} Hz")
         self._require_open()
         for name in names:
             self._require_pin_free(name)
         record_names = None
         if record:
-            record_names = [n for n in check_timed_lines(record)]
+            record_names = [n for n in check_timed_lines(record, self.profile)]
             if set(record_names) & set(names):
                 raise ValueError("a line cannot be played and recorded at the same time")
             for name in record_names:
@@ -364,7 +382,7 @@ class MockNIDaq:
             if edge not in EDGES:
                 raise ValueError(f"edge must be one of {EDGES}, got {edge!r}")
         for terminal in terminals:
-            normalize_terminal(terminal)
+            self._terminal(terminal)
         self._input_counter(counter)
         return float(min_s), float(max_s)
 
@@ -399,10 +417,10 @@ class MockNIDaq:
         if self.encoder is not None:
             raise RuntimeError("an encoder is already being followed; stop it first")
         self._require_open()
-        if normalize_terminal(a) == normalize_terminal(b):
+        if self._terminal(a) == self._terminal(b):
             raise ValueError("the encoder's A and B signals need two different terminals")
         name = self._input_counter(counter)
-        self.encoder = {"counter": name, "a": normalize_terminal(a), "b": normalize_terminal(b),
+        self.encoder = {"counter": name, "a": self._terminal(a), "b": self._terminal(b),
                         "pulses_per_rev": int(pulses_per_rev), "decoding": decoding}
         return name
 

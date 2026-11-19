@@ -24,8 +24,9 @@ import time
 from datetime import datetime
 from typing import List, Optional, Sequence
 
-from .policy import (AO_MAX_RATE_HZ, EDGES, TERMINALS, V_RANGES, WAVEFORMS, DaqOutputPolicy,
-                     DaqPolicyError, DaqSignals, Signal, check_timed_lines)
+from .policy import (EDGES, WAVEFORMS, DaqOutputPolicy, DaqPolicyError, DaqSignals, Signal,
+                     check_differential, check_timed_lines, profile_from_config)
+from .profiles import USB_6351, DaqProfileError, DeviceProfile
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +135,20 @@ class DaqService:
         """
         self.backend = backend
         self.mock = mock
-        self.policy = DaqOutputPolicy.from_config(config or {})
-        self.signals = DaqSignals.from_config(config or {})
+        #: What the model in use has. The backend knows it: the real driver from the
+        #: device (after connect), the mock from config.yaml (daq_model).
+        self.profile: DeviceProfile = getattr(backend, "profile", None) or USB_6351
+        # config.yaml must name the model in use ("" = the default model): --mock imitates
+        # what it names, so a difference would let a flow pass --mock and fail on the bench.
+        named = profile_from_config(config)
+        if named is not self.profile:
+            raise DaqPolicyError(
+                f"shared_devices.daq_model is {(config or {}).get('daq_model') or '(empty)'}, "
+                f"which means {named.model}, but the device is a {self.profile.model}; set "
+                f"daq_model: {self.profile.model} in config.yaml so that --mock imitates the "
+                "device that is connected")
+        self.policy = DaqOutputPolicy.from_config(config or {}, self.profile)
+        self.signals = DaqSignals.from_config(config or {}, self.profile)
         self._logging: Optional[_LoggingSession] = None
         self._encoder_label = "encoder"
         self._tag = "[MOCK] " if mock else ""
@@ -148,6 +161,7 @@ class DaqService:
         if action not in ACTIONS:
             raise ValueError(f"unknown DAQ action: {action!r}")
         handler = getattr(self, "_" + action[len("daq_"):])
+        self.check_step(action, params)
         try:
             return await handler(**params)
         except DaqPolicyError:
@@ -155,6 +169,28 @@ class DaqService:
         except Exception as exc:
             logger.error(f"DAQ {action} failed: {exc}")
             raise
+
+    def check_step(self, action: str, params: Optional[dict] = None) -> None:
+        """Refuse a step the model in use cannot run (nothing is sent to the device)."""
+        try:
+            self.profile.check_step(action, params)
+        except DaqProfileError as exc:
+            raise DaqPolicyError(str(exc)) from None
+
+    def unsupported_steps(self, steps) -> List[str]:
+        """Steps and options of a flow that the model does not have at all, one line per
+        step (1-based). Channel names, ranges and rates are checked when the step runs."""
+        problems = []
+        for index, step in enumerate(steps, start=1):
+            action = step.get("action") if isinstance(step, dict) else getattr(step, "action", None)
+            if action not in ACTIONS:
+                continue
+            params = step if isinstance(step, dict) else step.__dict__
+            try:
+                self.check_step(action, params)
+            except DaqPolicyError as exc:
+                problems.append(f"step {index}: {exc}")
+        return problems
 
     async def _sleep(self, seconds: float) -> None:
         await asyncio.sleep(min(seconds, 0.02) if self.mock else seconds)
@@ -177,12 +213,17 @@ class DaqService:
         if sig.sensor is not None and v_range is not None:
             raise ValueError(f"{sig.label} is a {sig.sensor['type']} channel: v_range does not "
                              "apply (its range is min_c / max_c in config.yaml)")
-        v = float(v_range if v_range is not None else (sig.v_range or DEFAULT_V_RANGE))
+        p = self.profile
+        default_v = DEFAULT_V_RANGE if DEFAULT_V_RANGE in p.v_ranges else max(p.v_ranges)
+        v = float(v_range if v_range is not None else (sig.v_range or default_v))
         t = terminal if terminal is not None else (sig.terminal or DEFAULT_TERMINAL)
-        if v not in V_RANGES:
-            raise ValueError(f"v_range must be one of {V_RANGES}, got {v:g}")
-        if t not in TERMINALS:
-            raise ValueError(f"terminal must be one of {TERMINALS}, got {t!r}")
+        if v not in p.v_ranges:
+            raise ValueError(f"v_range must be one of {p.v_ranges} on the {p.model}, got {v:g}")
+        if t not in p.ai_terminals:
+            raise ValueError(f"terminal must be one of {p.ai_terminals} on the {p.model}, "
+                             f"got {t!r}")
+        if t == "diff":
+            check_differential(p, sig.channel)
         return sig, v, t
 
     @staticmethod
@@ -458,10 +499,10 @@ class DaqService:
         freq = float(frequency_hz)
         if not freq > 0.0:
             raise ValueError("frequency_hz must be > 0")
-        points = min(WAVEFORM_POINTS, int(AO_MAX_RATE_HZ // freq))
+        points = min(WAVEFORM_POINTS, int(self.profile.ao_max_rate_hz // freq))
         if points < WAVEFORM_MIN_POINTS:
             raise ValueError(f"frequency_hz = {freq:g} is too high: fewer than "
-                             f"{WAVEFORM_MIN_POINTS} points per cycle at {AO_MAX_RATE_HZ:g} points/s")
+                             f"{WAVEFORM_MIN_POINTS} points per cycle at {self.profile.ao_max_rate_hz:g} points/s")
         period = waveform_period(waveform, amplitude, offset, points)
         actual = await self._call(self.backend.start_waveform, name, period, freq * points)
         if actual and abs(actual - freq * points) > 1e-9 * freq * points:
@@ -611,10 +652,10 @@ class DaqService:
         freq = float(frequency_hz)
         if not freq > 0.0:
             raise ValueError("frequency_hz must be > 0")
-        points = min(WAVEFORM_POINTS, int(AO_MAX_RATE_HZ // freq))
+        points = min(WAVEFORM_POINTS, int(self.profile.ao_max_rate_hz // freq))
         if points < WAVEFORM_MIN_POINTS:
             raise ValueError(f"frequency_hz = {freq:g} is too high: fewer than "
-                             f"{WAVEFORM_MIN_POINTS} points per cycle at {AO_MAX_RATE_HZ:g} points/s")
+                             f"{WAVEFORM_MIN_POINTS} points per cycle at {self.profile.ao_max_rate_hz:g} points/s")
         rate = DEFAULT_RATE_HZ if rate_hz is None else float(rate_hz)
         samples = int(round(rate * float(duration_s)))
         if samples < 2:
@@ -666,7 +707,7 @@ class DaqService:
     async def _acquire_digital(self, lines, rate_hz=None, duration_s=1.0, clock=None,
                                file_path=None) -> dict:
         signals = self._lines(lines)
-        names = check_timed_lines([s.channel for s in signals])
+        names = check_timed_lines([s.channel for s in signals], self.profile)
         rate = DEFAULT_RATE_HZ if rate_hz is None else float(rate_hz)
         samples = int(round(rate * float(duration_s)))
         if samples < 2:
@@ -706,7 +747,7 @@ class DaqService:
         if not rate > 0.0 or len(rows) / rate > MAX_PATTERN_S:
             raise ValueError(f"rate_hz must be > 0 and the pattern at most {MAX_PATTERN_S:g} s long")
         recorded_signals = self._lines(record) if record else []
-        recorded_names = check_timed_lines([s.channel for s in recorded_signals]) if record else None
+        recorded_names = check_timed_lines([s.channel for s in recorded_signals], self.profile) if record else None
         data = await self._call(self.backend.write_digital_pattern, names, rows, rate,
                                 recorded_names)
         rate = float(getattr(self.backend, "do_rate_hz", None) or rate)   # the clock really used
@@ -727,7 +768,7 @@ class DaqService:
 
     async def _wait_digital_change(self, lines, edge="both", timeout_s=60.0) -> dict:
         signals = self._lines(lines)
-        names = check_timed_lines([s.channel for s in signals])
+        names = check_timed_lines([s.channel for s in signals], self.profile)
         states = await self._call(self.backend.wait_digital_change, names, edge, float(timeout_s))
         label = "+".join(s.label for s in signals)
         shown = ", ".join(f"{s.label}={'High' if v else 'Low'}" for s, v in zip(signals, states))

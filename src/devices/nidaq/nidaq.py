@@ -36,10 +36,10 @@ import threading
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .policy import (AI_MAX_RATE_AGGREGATE_HZ, AI_MAX_RATE_SINGLE_HZ, AO_MAX_RATE_HZ,
-                     COUNTER_OUTPUT_LINES, DIO_MAX_RATE_HZ, ENCODER_DECODINGS, DEVICE_AO_MAX_V, DEVICE_AO_MIN_V, EDGES, TERMINALS, normalize_ai, normalize_ao,
+from .policy import (ENCODER_DECODINGS, EDGES, TERMINALS, normalize_ai, normalize_ao,
                      normalize_counter, normalize_line, normalize_terminal, physical_kind,
                      check_timed_lines)
+from .profiles import USB_6351, DaqProfileError, DeviceProfile, get_profile
 
 logger = logging.getLogger(__name__)
 
@@ -72,15 +72,17 @@ def _load_nidaqmx():
     return nidaqmx
 
 
-def check_ai_rate(n_channels: int, rate_hz: float) -> None:
-    """Refuse a sample rate the USB-6351 cannot deliver for this many channels."""
+def check_ai_rate(n_channels: int, rate_hz: float,
+                  profile: Optional[DeviceProfile] = None) -> None:
+    """Refuse a sample rate the model cannot deliver for this many channels."""
+    profile = profile or USB_6351
     if n_channels < 1:
         raise ValueError("at least one analog input channel is needed")
     rate = float(rate_hz)
-    limit = AI_MAX_RATE_SINGLE_HZ if n_channels == 1 else AI_MAX_RATE_AGGREGATE_HZ / n_channels
+    limit = profile.ai_rate_limit(n_channels)
     if not (0.0 < rate <= limit):
-        raise ValueError(f"rate_hz = {rate:g} is outside 0 .. {limit:g} Hz "
-                         f"(the limit for {n_channels} analog input channel(s))")
+        raise ValueError(f"rate_hz = {rate:g} is outside 0 .. {limit:g} Hz (the limit of the "
+                         f"{profile.model} for {n_channels} analog input channel(s))")
 
 
 def _locked(method):
@@ -104,6 +106,8 @@ class NIDaq:
         """
         self.device = device
         self.product_type: Optional[str] = None
+        #: What the model has (profiles.py); the model the device reports, once connected.
+        self.profile: DeviceProfile = USB_6351
         self._ao_tasks: Dict[str, object] = {}
         self._ao_waveforms: set = set()         # ao channels whose task generates a waveform
         self._ao_driven: set = set()            # ao channels not known to be back at 0 V
@@ -121,6 +125,7 @@ class NIDaq:
         self._pattern_task = None               # a digital pattern being played
         self._pattern_lines: List[str] = []
         self._encoder = None                    # (counter, task) of the encoder being followed
+        self._encoder_pins: set = set()         # digital lines that are its A / B terminals
         self.di_rate_hz: Optional[float] = None
         self._connected = False
 
@@ -152,6 +157,13 @@ class NIDaq:
         if self._closed:
             logger.error("this DAQ object has been closed; create a new one for a new run")
             return False
+        try:
+            if not self.product_type.strip():
+                raise DaqProfileError("the device reports no product type")
+            self.profile = get_profile(self.product_type)
+        except DaqProfileError as exc:
+            logger.error(f"DAQ device {self.device!r}: {exc}")
+            return False
         self._connected = True
         return True
 
@@ -172,7 +184,15 @@ class NIDaq:
         return f"{self.device}/{channel}"
 
     def _terminal(self, terminal: str) -> str:
+        """The device's name of an input terminal. A PFI is the same pin as a digital
+        line: while this run drives that line it is not offered as an input, since
+        routing it could change what the pin does."""
         name = normalize_terminal(terminal)
+        line = self.profile.pfi_lines.get(name)
+        if line is not None and (line in self._do_tasks or line in self._do_dirty
+                                 or line in self._pattern_lines):
+            raise RuntimeError(f"{name} is the pin of {line}, which this run is driving as "
+                               "a digital output; stop that output first")
         return f"/{self.device}/{_INTERNAL_TERMINALS.get(name, name.upper())}"
 
     @staticmethod
@@ -256,6 +276,8 @@ class NIDaq:
             raise ValueError(f"terminal must be one of {TERMINALS}, got {terminal!r}")
         if not (0 < float(v_range) <= 10.0):
             raise ValueError("v_range must be in (0, 10] V")
+        if samples > 1:
+            check_ai_rate(1, rate_hz, self.profile)
         self._require_ai_free()
         nidaqmx = _load_nidaqmx()
         constants = nidaqmx.constants
@@ -298,7 +320,7 @@ class NIDaq:
         samples = int(samples)
         if samples < 2:
             raise ValueError("samples must be >= 2")
-        check_ai_rate(len(specs), rate_hz)
+        check_ai_rate(len(specs), rate_hz, self.profile)
         pretrigger = int(pretrigger)
         if pretrigger and trigger is None:
             raise ValueError("pretrigger samples need a trigger")
@@ -360,7 +382,7 @@ class NIDaq:
         Returns the stream's number: a reader that passes it to ``read_stream`` can
         never be handed the samples of a later stream.
         """
-        check_ai_rate(len(specs), rate_hz)
+        check_ai_rate(len(specs), rate_hz, self.profile)
         self._require_open()            # a late worker must not start one behind close()
         self._require_ai_free()
         nidaqmx = _load_nidaqmx()
@@ -430,9 +452,9 @@ class NIDaq:
     def _set_ao(self, channel: str, voltage: float) -> float:
         name = normalize_ao(channel)
         volts = float(voltage)
-        if not (DEVICE_AO_MIN_V <= volts <= DEVICE_AO_MAX_V):
+        if not (self.profile.ao_min_v <= volts <= self.profile.ao_max_v):
             raise ValueError(f"{name}: {volts:g} V is outside the device span "
-                             f"{DEVICE_AO_MIN_V:g} .. {DEVICE_AO_MAX_V:g} V")
+                             f"{self.profile.ao_min_v:g} .. {self.profile.ao_max_v:g} V")
         # From here the channel counts as driven until a write of 0 V has succeeded:
         # a failure half-way must not make close() forget it.
         self._ao_driven.add(name)
@@ -444,7 +466,7 @@ class NIDaq:
             task = nidaqmx.Task()
             try:
                 task.ao_channels.add_ao_voltage_chan(
-                    self._physical(name), min_val=DEVICE_AO_MIN_V, max_val=DEVICE_AO_MAX_V)
+                    self._physical(name), min_val=self.profile.ao_min_v, max_val=self.profile.ao_max_v)
             except Exception:
                 task.close()
                 raise
@@ -466,11 +488,11 @@ class NIDaq:
         points = [float(v) for v in period]
         if len(points) < 2:
             raise ValueError("a waveform needs at least 2 points")
-        if any(v != v or not (DEVICE_AO_MIN_V <= v <= DEVICE_AO_MAX_V) for v in points):
+        if any(v != v or not (self.profile.ao_min_v <= v <= self.profile.ao_max_v) for v in points):
             raise ValueError(f"{name}: the waveform leaves the device span "
-                             f"{DEVICE_AO_MIN_V:g} .. {DEVICE_AO_MAX_V:g} V")
-        if not (0.0 < float(rate_hz) <= AO_MAX_RATE_HZ):
-            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {AO_MAX_RATE_HZ:g} Hz")
+                             f"{self.profile.ao_min_v:g} .. {self.profile.ao_max_v:g} V")
+        if not (0.0 < float(rate_hz) <= self.profile.ao_max_rate_hz):
+            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {self.profile.ao_max_rate_hz:g} Hz")
         self._require_open()
         others = sorted(self._ao_waveforms - {name})
         if others:
@@ -482,7 +504,7 @@ class NIDaq:
         task = nidaqmx.Task()
         try:
             task.ao_channels.add_ao_voltage_chan(
-                self._physical(name), min_val=DEVICE_AO_MIN_V, max_val=DEVICE_AO_MAX_V)
+                self._physical(name), min_val=self.profile.ao_min_v, max_val=self.profile.ao_max_v)
             task.timing.cfg_samp_clk_timing(
                 float(rate_hz), sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
                 samps_per_chan=len(points))
@@ -502,10 +524,13 @@ class NIDaq:
     # digital I/O
     # ------------------------------------------------------------------
     def _require_pin_free(self, name: str) -> None:
-        for counter, pin in COUNTER_OUTPUT_LINES.items():
+        for counter, pin in self.profile.counter_output_lines.items():
             if pin == name and counter in self._co_tasks:
                 raise RuntimeError(f"{name} is the output pin of {counter}, which is generating "
                                    "a pulse train; stop it first")
+        if name in self._encoder_pins:
+            raise RuntimeError(f"{name} is the pin of a terminal the encoder is being "
+                               "followed on; stop the encoder first")
 
     @_locked
     def write_digital(self, line: str, state: bool) -> bool:
@@ -564,8 +589,8 @@ class NIDaq:
         """The counter a measurement uses: the one asked for, else the highest free one."""
         if counter is not None:
             name = normalize_counter(counter)
-            if name not in COUNTERS:
-                raise ValueError(f"{name}: the device has {COUNTERS}")
+            if name not in self.profile.counter_names:
+                raise ValueError(f"{name}: the device has {self.profile.counter_names}")
             if name in self._co_tasks:
                 raise RuntimeError(f"{name} is generating a pulse train; stop it first "
                                    "or use another counter")
@@ -573,7 +598,7 @@ class NIDaq:
                 raise RuntimeError(f"{name} is following the encoder; use another counter")
             return name
         busy = set(self._co_tasks) | ({self._encoder[0]} if self._encoder is not None else set())
-        for name in reversed(COUNTERS):
+        for name in reversed(self.profile.counter_names):
             if name not in busy:
                 return name
         raise RuntimeError("all four counters are in use")
@@ -640,8 +665,8 @@ class NIDaq:
         ctr0 -> PFI12, ctr1 -> PFI13, ctr2 -> PFI14, ctr3 -> PFI15.
         """
         name = normalize_counter(counter)
-        if name not in COUNTERS:
-            raise ValueError(f"{name}: the device has {COUNTERS}")
+        if name not in self.profile.counter_names:
+            raise ValueError(f"{name}: the device has {self.profile.counter_names}")
         freq, duty = float(frequency_hz), float(duty_cycle)
         if not freq > 0.0 or not (0.0 < duty < 1.0):
             raise ValueError("frequency_hz must be > 0 and duty_cycle between 0 and 1")
@@ -650,8 +675,8 @@ class NIDaq:
         self._require_open()
         if self._encoder is not None and self._encoder[0] == name:
             raise RuntimeError(f"{name} is following the encoder; use another counter")
-        if COUNTER_OUTPUT_LINES[name] in self._do_tasks:
-            raise RuntimeError(f"the output pin of {name} ({COUNTER_OUTPUT_LINES[name]}) has "
+        if self.profile.counter_output_lines.get(name) in self._do_tasks:
+            raise RuntimeError(f"the output pin of {name} ({self.profile.counter_output_lines.get(name)}) has "
                                "been driven as a digital line in this run; use another counter")
         nidaqmx = _load_nidaqmx()
         self._stop_counter(name)
@@ -706,7 +731,7 @@ class NIDaq:
         samples = int(samples)
         if samples < 2:
             raise ValueError("samples must be >= 2")
-        check_ai_rate(len(specs), rate_hz)
+        check_ai_rate(len(specs), rate_hz, self.profile)
         self._require_ai_free()
         self._require_open()
         ao_name = normalize_ao(channel)
@@ -740,7 +765,7 @@ class NIDaq:
     # hardware-timed digital I/O (port 0)
     # ------------------------------------------------------------------
     def _add_di(self, nidaqmx, task, lines: Sequence[str]) -> List[str]:
-        names = check_timed_lines(lines)
+        names = check_timed_lines(lines, self.profile)
         for name in names:
             if name in self._do_tasks or name in self._pattern_lines:
                 raise RuntimeError(f"{name} is being driven as an output in this session; "
@@ -761,8 +786,8 @@ class NIDaq:
         samples = int(samples)
         if samples < 2:
             raise ValueError("samples must be >= 2")
-        if not (0.0 < float(rate_hz) <= DIO_MAX_RATE_HZ):
-            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {DIO_MAX_RATE_HZ:g} Hz")
+        if not (0.0 < float(rate_hz) <= self.profile.dio_max_rate_hz):
+            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {self.profile.dio_max_rate_hz:g} Hz")
         nidaqmx = _load_nidaqmx()
         with nidaqmx.Task() as task:
             with self._lock:
@@ -819,12 +844,12 @@ class NIDaq:
         port 0 sampled on the same clock while the pattern plays (the response).
         Blocks until the pattern is over; ``close()`` from another thread ends it early.
         """
-        names = check_timed_lines(lines)
+        names = check_timed_lines(lines, self.profile)
         steps = [[bool(v) for v in row] for row in rows]
         if len(steps) < 2 or any(len(row) != len(names) for row in steps):
             raise ValueError("a pattern needs at least 2 rows, each with one state per line")
-        if not (0.0 < float(rate_hz) <= DIO_MAX_RATE_HZ):
-            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {DIO_MAX_RATE_HZ:g} Hz")
+        if not (0.0 < float(rate_hz) <= self.profile.dio_max_rate_hz):
+            raise ValueError(f"rate_hz = {float(rate_hz):g} is outside 0 .. {self.profile.dio_max_rate_hz:g} Hz")
         nidaqmx = _load_nidaqmx()
         finite = nidaqmx.constants.AcquisitionType.FINITE
         di = None
@@ -836,7 +861,7 @@ class NIDaq:
                 for name in names:
                     self._require_pin_free(name)
                 if record:
-                    if set(check_timed_lines(record)) & set(names):
+                    if set(check_timed_lines(record, self.profile)) & set(names):
                         raise ValueError("a line cannot be played and recorded at the same time")
                     di = nidaqmx.Task()
                     record_names = self._add_di(nidaqmx, di, list(record))
@@ -996,6 +1021,7 @@ class NIDaq:
             task.close()
             raise
         self._encoder = (name, task)
+        self._encoder_pins = {self.profile.pfi_lines.get(normalize_terminal(t)) for t in (a, b)}
         return name
 
     @_locked
@@ -1009,6 +1035,7 @@ class NIDaq:
     def stop_encoder(self) -> bool:
         """Stop following the encoder. False if none was being followed."""
         encoder, self._encoder = self._encoder, None
+        self._encoder_pins = set()
         if encoder is None:
             return False
         try:
@@ -1136,5 +1163,8 @@ if __name__ == "__main__":
         sys.exit(1)
     print(f"{daq.device}: {daq.product_type}")
     for ch in sys.argv[2:]:
+        if not daq.profile.has("ai", ch.strip().lower()):
+            daq.close()
+            sys.exit(f"{ch}: the {daq.profile.model} has {daq.profile.available('ai')}")
         print(f"{ch}: {daq.read_analog(ch, samples=100):+.5f} V (mean of 100 samples at 1 kHz)")
     daq.close()
