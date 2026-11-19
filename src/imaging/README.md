@@ -1,7 +1,7 @@
 # Imaging module
 
 Appearance-imaging system for SAIGEN, the automated experimentation platform (see the
-[repository README](../../README.md) for the manuscript in preparation that this
+[repository README](../../README.md) for the paper, in press at STAM Methods, that this
 module's results belong to). It backlights a sample vial with an RGB light,
 photographs it under white, red, green and blue illumination with a fixed
 camera, and turns those photographs into cropped side-by-side comparisons and

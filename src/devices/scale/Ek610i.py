@@ -64,11 +64,13 @@ class Scale:
         raw = self._ser.readline().decode("ascii", errors="ignore").strip()
         if not raw:
             raise TimeoutError("天びんから応答がありません")
-        # 例: "ST,+000123.45 g"
+        # 例: "ST,+000123.45 g" / "ST,-0000.03 g"
         header, val_unit = raw.split(",", 1)
-        # 数字部分だけ抽出
-        num_str = re.sub(r"[^\d.]", "", val_unit)
-        return float(num_str)
+        # 符号付きの数値部分を抽出（"[^\d.]" を削る方式は符号を落としていた）
+        match = re.search(r"[+-]?\d+(?:\.\d+)?", val_unit)
+        if match is None:
+            raise ValueError(f"計量値を解釈できません: {raw!r}")
+        return float(match.group())
 
     def tare(self, delay: float = 0.5):
         """

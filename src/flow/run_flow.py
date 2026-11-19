@@ -14,15 +14,24 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
         --robot2-dobot COM5 --robot2-picus2 COM6 \
         --scale-port COM8
 
+    # Keithley 2002 DMM（GPIB）の VISA リソースは --dmm-resource
+    # NF LI5640 ロックインアンプ（GPIB）の VISA リソースは --lockin-resource
+    # Agilent 1000 シリーズ オシロスコープ（USB）の VISA リソースは --scope-resource
+    python -m src.flow.run_flow examples/keithley2002/measure_dc_voltage.json --mock
+
     # MaxArm（robot 4, config.yaml の type: maxarm）のポートは --robot4-maxarm
     python -m src.flow.run_flow examples/maxarm/pick_and_place.json --mock
+
+    # Dobot MG400（robot 5, config.yaml の type: mg400）のアドレスは --robot5-mg400。
+    # 実機ランは、プリフライトの後・接続の前にターミナルで Enter を求める（空行以外は中止）
+    python -m src.flow.run_flow examples/mg400/z_hop.json --mock
 
 処理の流れ:
     1. JSON を読み込み、Pydantic スキーマ（schema.py）で検証する
     2. loop_start / loop_end を展開してフラットなステップ列にする
     2.5 プリフライト: 絶対目標（move_xyz / rotate）を可動域バリデータで検査する。
        可動域はロボットごと（robots.<id>.workspace があればそれ、無ければ共通の
-       workspace）。各アクションがそのロボットの種別（dobot / maxarm）で
+       workspace）。各アクションがそのロボットの種別（dobot / maxarm / mg400）で
        実行できるかも検査する。違反があればデバイスを開く前に中止する
        （--validate-only でも同じ）。
        相対移動（move_z / rotate_relative / move_radial）は開始姿勢に依存するため
@@ -30,7 +39,7 @@ run_flow.py - JSON 実験フローをコマンドラインから実行する
     3. 実行ごとのログフォルダを作る（logs/<日付>/<フロー名>_<時刻>/）
     4. ExperimentSession の安全枠（初期化 → 実行 → 中断時は緊急停止 /
        エラー時はホーム復帰 → 切断）の中でステップを順に実行する
-    5. 各ステップの結果（重量・画像パス）を measurements.csv / summary.md に残し、
+    5. 各ステップの結果（重量・画像パス・DMM 測定値）を measurements.csv / summary.md に残し、
        dispense と直後の measure_weight を対応させた分注精度 CSV も出力する
 
 接続ポートの優先順位:
@@ -42,11 +51,14 @@ import asyncio
 import json
 import logging
 import os
+import queue
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 from urllib import request as urlrequest
 from urllib.error import URLError
 
@@ -58,10 +70,12 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from src import config as lab_config
+from src.devices.li5640 import oscillator as osc
 from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
 from src.flow.executor import (execute_step, expand_loops, SHARED_DEVICE_ACTIONS, DAQ_ACTIONS, DAQ_DATA_ACTIONS,
-                               MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS)
+                               MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS,
+                               DMM_ACTIONS, LOCKIN_ACTIONS, SCOPE_ACTIONS)
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, robot_type, validator_for_robot
 from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
@@ -78,6 +92,7 @@ ROBOT_ACTIONS_BY_TYPE = {
                         "go_home", "move_slider", "move_conveyer", "wait",
                         "aspirate", "dispense", "blow_out"}),
     "maxarm": frozenset({"move_xyz", "move_z", "go_home", "suction", "wait"}),
+    "mg400": frozenset({"move_xyz", "move_z", "go_home", "wait"}),
 }
 # 開始姿勢に依存し、実行前には目標位置が決まらない相対移動
 RELATIVE_MOVE_ACTIONS = {"move_z", "rotate_relative", "move_radial"}
@@ -253,6 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(f"--robot{rid}-maxarm", default=None,
                        help=f"Robot {rid} が MaxArm（config.yaml の type: maxarm）の場合のポート"
                             f"（既定: ROBOT{rid}_MAXARM_PORT / config.yaml）")
+        p.add_argument(f"--robot{rid}-mg400", default=None,
+                       help=f"Robot {rid} が Dobot MG400（config.yaml の type: mg400）の場合の IP アドレス"
+                            f"（既定: ROBOT{rid}_MG400_ADDRESS / config.yaml）")
     p.add_argument("--scale-port", default=None,
                    help="電子天秤のポート（既定: SCALE_PORT / config.yaml）")
     p.add_argument("--camera-index", type=int, default=None,
@@ -263,6 +281,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="顕微鏡 LED 制御用シリアルポート（既定: MICROSCOPE_PORT / config.yaml。空なら LED 制御なし）")
     p.add_argument("--daq-device", default=None,
                    help="daq_* 用の NI DAQ デバイス名（NI MAX 上の名前、例: Dev1。既定: DAQ_DEVICE / config.yaml）")
+    p.add_argument("--dmm-resource", default=None,
+                   help="Keithley 2002 DMM の VISA リソース（例 GPIB0::16::INSTR。"
+                        "既定: DMM_RESOURCE / config.yaml）")
+    p.add_argument("--lockin-resource", default=None,
+                   help="NF LI5640 ロックインアンプの VISA リソース（例 GPIB0::<アドレス>::INSTR。"
+                        "既定: LOCKIN_RESOURCE / config.yaml）")
+    p.add_argument("--scope-resource", default=None,
+                   help="オシロスコープ（Agilent 1000 シリーズ）の VISA リソース"
+                        "（例 USB0::0x0957::...::INSTR。既定: SCOPE_RESOURCE / config.yaml）")
     record = p.add_mutually_exclusive_group()
     record.add_argument("--record", dest="record", action="store_true", default=None,
                         help="センサーCSV・動画の録画を行う（実機実行時の既定）")
@@ -301,6 +328,12 @@ def resolve_ports(args) -> Tuple[dict, dict]:
                 logger.warning(f"Robot {rid} は type={ports['type']} のため MaxArm ポート "
                                f"{maxarm} は使われません（config.yaml の robots.{rid}.type を確認）")
             ports["maxarm_port"] = maxarm
+        mg400 = getattr(args, f"robot{rid}_mg400", None) or os.getenv(f"ROBOT{rid}_MG400_ADDRESS")
+        if mg400:
+            if ports["type"] != "mg400":
+                logger.warning(f"Robot {rid} は type={ports['type']} のため MG400 アドレスは使われません"
+                               f"（config.yaml の robots.{rid}.type を確認）")
+            ports["mg400_address"] = mg400
         robot_ports[rid] = ports
 
     scale = args.scale_port or os.getenv("SCALE_PORT")
@@ -323,6 +356,16 @@ def resolve_ports(args) -> Tuple[dict, dict]:
     daq = getattr(args, "daq_device", None) or os.getenv("DAQ_DEVICE")
     if daq:
         shared_config["daq_device"] = daq
+    # CSV ランナーは自前のパーサーでこの関数を呼ぶので getattr で読む
+    dmm = getattr(args, "dmm_resource", None) or os.getenv("DMM_RESOURCE")
+    if dmm:
+        shared_config["dmm_resource"] = dmm
+    lockin = getattr(args, "lockin_resource", None) or os.getenv("LOCKIN_RESOURCE")
+    if lockin:
+        shared_config["lockin_resource"] = lockin
+    scope = getattr(args, "scope_resource", None) or os.getenv("SCOPE_RESOURCE")
+    if scope:
+        shared_config["scope_resource"] = scope
 
     return robot_ports, shared_config
 
@@ -359,10 +402,12 @@ class PreflightReport:
     capability_errors: List[str] = field(default_factory=list)
     validators_by_robot: Dict[int, object] = field(default_factory=dict)
     robot_types: Dict[int, str] = field(default_factory=dict)
+    #: LI5640 の内部発振器の書き込み（set_lockin_oscillator）で、開く前に分かる問題
+    oscillator_errors: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return not self.violations and not self.capability_errors
+        return not self.violations and not self.capability_errors and not self.oscillator_errors
 
 
 def _step_label(index: int, step: dict) -> str:
@@ -512,6 +557,10 @@ def _unverified_note(report: PreflightReport) -> str:
 def violation_message(report: PreflightReport) -> str:
     """違反を 1 件 1 行にまとめた、UI / 例外向けの短い文面"""
     lines = []
+    if report.oscillator_errors:
+        lines.append("LI5640 の発振器の設定（set_lockin_oscillator）に問題があります。"
+                     "デバイスを開かずに中止します:")
+        lines.extend(f"- {msg}" for msg in report.oscillator_errors)
     if report.capability_errors:
         lines.append(f"ロボットが対応していないアクションが {len(report.capability_errors)} 件あります。"
                      "デバイスを開かずに中止します:")
@@ -539,7 +588,8 @@ def build_robot_validators(robot_ids, validator, robot_ports: dict) -> Dict[int,
 
 def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optional[dict] = None,
                   validators_by_robot: Optional[dict] = None,
-                  robot_types: Optional[dict] = None) -> PreflightReport:
+                  robot_types: Optional[dict] = None,
+                  shared_config: Optional[dict] = None) -> PreflightReport:
     """デバイスを開く前のプリフライト（可動域 + 対応アクションの検査とログ出力）。
 
     run_flow.py・CSV ランナー（run_csv.py）・GUI（src/gui/runner.py）が共通で
@@ -558,6 +608,8 @@ def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optiona
             :func:`validator_for_robot` で補う（共通のバリデータで黙って埋めない）。
             MaxArm の項目が共通の（Dobot の）バリデータそのものなら ConfigError
         robot_types: robot_id → 種別。省略時は robot_ports から作る
+        shared_config: 共有デバイス設定（LI5640 の発振器の上限）。省略時は config.yaml。
+            フローが set_lockin_oscillator を含むときだけ読む
 
     Returns:
         PreflightReport。``validators_by_robot`` と ``robot_types`` には実際に
@@ -598,7 +650,15 @@ def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optiona
     report.robot_types = {rid: robot_types.get(rid, lab_config.DEFAULT_ROBOT_TYPE)
                           for rid in robot_ids}
     report.capability_errors = preflight_capabilities(steps, robot_types)
+    report.capability_errors += preflight_mg400(robot_ids, robot_types, validators_by_robot, robot_ports)
+    if any(s.get("action") == osc.ACTION for s in steps):
+        if shared_config is None:
+            shared_config = lab_config.get_shared_devices()
+        report.oscillator_errors = osc.preflight_errors(steps, shared_config)
     log_preflight(report, validator, log=log)
+    if report.oscillator_errors:
+        for msg in report.oscillator_errors:
+            log.error(f"LI5640 発振器: {msg}")
     if not report.ok:
         if report.capability_errors:
             log.error(f"ロボットが対応していないアクションが {len(report.capability_errors)} 件"
@@ -610,7 +670,41 @@ def run_preflight(steps: list, validator=None, log=None, *, robot_ports: Optiona
     checked_note = (f"絶対目標 {report.checked} 件すべて範囲内" if report.checked
                     else "絶対目標（move_xyz / rotate）なし")
     log.info(f"可動域チェック: {checked_note}{_unverified_note(report)}")
+    for rid in robot_ids:
+        if robot_types.get(rid) == "mg400":
+            log.info(MG400_PREFLIGHT_NOTE.format(rid=rid))
     return report
+
+
+#: MG400 のプリフライトで分かること・分からないこと（flow plan F5）
+MG400_PREFLIGHT_NOTE = (
+    "Robot {rid}（MG400）: ここで検査したのは絶対目標と home_position の箱・半径だけ。"
+    "コントローラの到達性（InverseSolution）、各移動の測った開始姿勢からの経路（長さ、線分の半径、"
+    "5 mm ごとの関節サンプル）、相対移動と go_home の区間は実行時に 1 手ごとに検査される。"
+    "--mock の成功は fake の平面モデルの結果で、アームのものではない")
+
+
+def preflight_mg400(robot_ids, robot_types: dict, validators_by_robot: dict,
+                    robot_ports: Optional[dict]) -> List[str]:
+    """MG400 の home_position を自分の箱・半径で検査する（デバイスは開かない）。
+    設定の必須キーは validator_for_robot（lab_config.mg400_config）が先に ConfigError にする"""
+    errors = []
+    for rid in robot_ids:
+        if (robot_types or {}).get(rid) != "mg400":
+            continue
+        ports = (robot_ports or {}).get(rid) or (robot_ports or {}).get(str(rid)) or {}
+        home = ports.get("home_position")
+        v = validators_by_robot.get(rid)
+        if home is None or v is None:
+            continue
+        try:
+            from src.devices.safety.mg400_robot import parse_home_position
+            x, y, z = parse_home_position(home)
+            v.validate_xyz(x, y, z)
+        except (ValueError, WorkspaceViolationError) as e:
+            errors.append(f"Robot {rid}（MG400）の home_position {home} が robots.{rid}.workspace の"
+                          f"外、または不正です: {e}")
+    return errors
 
 
 def require_preflight(steps: list, validator=None, log=None, **kwargs) -> PreflightReport:
@@ -624,8 +718,58 @@ def require_preflight(steps: list, validator=None, log=None, **kwargs) -> Prefli
     return report
 
 
-def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
-    """フローが必要とするロボット・共有デバイスを洗い出す。"""
+class ResourcePlan(NamedTuple):
+    """フローが開くロボット・共有デバイス（:func:`plan_resources` の戻り値）"""
+    robot_ids: list
+    picus2_robots: set
+    needs_scale: bool
+    needs_camera: bool
+    needs_microscope: bool
+    needs_microscope_serial: bool
+    needs_dmm: bool
+    needs_lockin: bool
+    needs_scope: bool
+    #: フローが LI5640 の内部発振器を書くなら、その要約（oscillator.OscPlan）。無ければ None
+    lockin_osc_plan: Optional[object] = None
+    #: フローが daq_* ステップを含む（NI の DAQ デバイスを開く）
+    needs_daq: bool = False
+
+    @property
+    def needs_shared(self) -> bool:
+        return (self.needs_scale or self.needs_camera or self.needs_microscope
+                or self.needs_microscope_serial or self.needs_dmm or self.needs_lockin
+                or self.needs_scope or self.needs_daq)
+
+    def shared_kwargs(self) -> dict:
+        """ExperimentSession.add_shared() に渡す use_* 引数"""
+        kwargs = dict(use_scale=self.needs_scale, use_camera=self.needs_camera,
+                      use_microscope=self.needs_microscope,
+                      use_microscope_serial=self.needs_microscope_serial,
+                      use_dmm=self.needs_dmm, use_lockin=self.needs_lockin,
+                      use_scope=self.needs_scope)
+        if self.lockin_osc_plan is not None:
+            kwargs["lockin_osc_plan"] = self.lockin_osc_plan
+        if self.needs_daq:
+            # 要るときだけ渡す（use_daq を知らない差し替えファクトリも動くように）
+            kwargs["use_daq"] = True
+        return kwargs
+
+    def shared_labels(self) -> list:
+        """ログ表示用の共有デバイス名"""
+        return [n for n, need in (("天秤", self.needs_scale), ("カメラ", self.needs_camera),
+                                  ("顕微鏡カメラ", self.needs_microscope),
+                                  ("顕微鏡制御ポート", self.needs_microscope_serial),
+                                  ("DMM", self.needs_dmm), ("ロックイン", self.needs_lockin),
+                                  ("オシロ", self.needs_scope), ("DAQ", self.needs_daq))
+                if need]
+
+
+def plan_resources(steps: list) -> ResourcePlan:
+    """フローが必要とするロボット・共有デバイスを洗い出す。
+
+    フローに出てこないデバイスは開かない。呼び出し側は名前（``plan.needs_dmm`` など）で
+    読む（項目が増えても呼び出し側を壊さない）。
+    """
     actions = {s.get("action") for s in steps}
     robot_ids = set()
     picus2_robots = set()
@@ -641,14 +785,19 @@ def plan_resources(steps: list) -> Tuple[list, set, bool, bool]:
     needs_camera = "capture_and_save" in actions
     needs_microscope = bool(actions & MICROSCOPE_CAMERA_ACTIONS)          # 顕微鏡カメラ
     needs_microscope_serial = bool(actions & MICROSCOPE_SERIAL_ACTIONS)   # 顕微鏡の制御ポート
-    return (sorted(robot_ids), picus2_robots, needs_scale, needs_camera,
-            needs_microscope, needs_microscope_serial)
+    needs_dmm = bool(actions & DMM_ACTIONS)                               # Keithley 2002
+    needs_lockin = bool(actions & LOCKIN_ACTIONS)                         # NF LI5640
+    needs_scope = bool(actions & SCOPE_ACTIONS)                           # Agilent DSO1000
+    return ResourcePlan(sorted(robot_ids), picus2_robots, needs_scale, needs_camera,
+                        needs_microscope, needs_microscope_serial, needs_dmm, needs_lockin,
+                        needs_scope, osc.plan_from_steps(steps),
+                        needs_daq=bool(actions & DAQ_ACTIONS))
 
 
 def plan_daq(steps: list) -> bool:
     """フローが NI の DAQ デバイス（daq_* アクション）を必要とするか。
 
-    plan_resources の戻り値の形を変えないため別関数にしている。
+    plan_resources(steps).needs_daq と同じ（フローの一覧だけ見たい呼び出し側のため）。
     """
     return any(s.get("action") in DAQ_ACTIONS for s in steps)
 
@@ -664,10 +813,13 @@ async def run(args) -> int:
     # 各アクションがそのロボットの種別で実行できるかを検査する
     robot_ports, shared_config = resolve_ports(args)
     validator = default_workspace_validator()
-    report = run_preflight(steps, validator, robot_ports=robot_ports)
+    report = run_preflight(steps, validator, robot_ports=robot_ports, shared_config=shared_config)
     if not report.ok:
         return PREFLIGHT_EXIT_CODE
     unverified_note = _unverified_note(report)
+    if any(s.get("action") == osc.ACTION for s in steps):
+        unverified_note += ("。LI5640 の発振器: 上限・周波数の分解能・共通レンジは OK。接続時の"
+                            "レンジと設定値（上限の内側か）は接続してから確かめます")
 
     if args.validate_only:
         logger.info(f"検証のみ完了（--validate-only）: スキーマ・ループ構造・絶対目標の可動域 OK"
@@ -677,12 +829,18 @@ async def run(args) -> int:
         logger.error("ステップが空です")
         return 2
 
-    (robot_ids, picus2_robots, needs_scale, needs_camera,
-     needs_microscope, needs_microscope_serial) = plan_resources(steps)
-    needs_daq = plan_daq(steps)
-    needs_shared = (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
-                    or needs_daq)
+    plan = plan_resources(steps)
+    robot_ids, picus2_robots = plan.robot_ids, plan.picus2_robots
     robot_types = report.robot_types
+
+    # MG400 の実機ラン: デバイスを開く前・ログフォルダを作る前に、ターミナルで人の Enter を
+    # 求める（flow plan F7）。空行以外・端末でない stdin は中止（exit 2）
+    mg400_ids = [rid for rid in robot_ids if robot_types.get(rid) == "mg400"]
+    if mg400_ids and not args.mock:
+        from src.devices.mg400.control import confirm_tty
+        if not confirm_tty(mg400_confirmation_text(mg400_ids, robot_ports, steps)):
+            logger.error("MG400 の実機ランは確認されませんでした: 何も開かずに終了します")
+            return 2
 
     # 実機実行では既定で録画する。Mock モードでは常に録画しない。
     record = (not args.mock) and (True if args.record is None else args.record)
@@ -705,12 +863,8 @@ async def run(args) -> int:
                 + ", ".join(f"{rid}={robot_types.get(rid, 'dobot')}" for rid in robot_ids) + "）")
     if picus2_robots:
         logger.info(f"ピペット使用: Robot {sorted(picus2_robots)}")
-    if needs_shared:
-        parts = [n for n, need in (("天秤", needs_scale), ("カメラ", needs_camera),
-                                   ("顕微鏡カメラ", needs_microscope),
-                                   ("顕微鏡制御ポート", needs_microscope_serial),
-                                   ("DAQ", needs_daq)) if need]
-        logger.info(f"共有デバイス: {', '.join(parts)}")
+    if plan.needs_shared:
+        logger.info(f"共有デバイス: {', '.join(plan.shared_labels())}")
 
     # 録画セッション開始（CSV: ダッシュボード経由 / 動画: ローカルスレッド）
     video_recorder = None
@@ -742,20 +896,24 @@ async def run(args) -> int:
         shared_config=shared_config,
         workspace_validator=validator,
         robot_validators=report.validators_by_robot,
+        record_root=exp_logger.dir,
     )
+    if not args.mock:
+        for rid in mg400_ids:
+            session.confirm_robot(rid)          # the Enter above, before anything was opened
+    # MG400: Ctrl+C の扱いを段階にする（1 回目: ループに頼らない停止要求と中断、2 回目以降:
+    # 記録の確定まで保留）。--mock も同じ（同じ経路を試すため）。他のロボットだけのランは従来どおり
+    interrupt_guard = MG400InterruptGuard.install(session) if mg400_ids else None
 
     async def body():
         for rid in robot_ids:
             await session.add_robot(rid, use_picus2=(rid in picus2_robots))
-        if needs_shared:
-            await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
-                                     use_microscope=needs_microscope,
-                                     use_microscope_serial=needs_microscope_serial,
-                                     use_daq=needs_daq)
+        if plan.needs_shared:
+            await session.add_shared(**plan.shared_kwargs())
 
         # DAQ: 接続した機種（Mock では config.yaml の daq_model）にできないステップが
         # あれば、最初のステップを実行する前に止める
-        daq_service = getattr(session.shared, "daq_service", None) if needs_daq else None
+        daq_service = getattr(session.shared, "daq_service", None) if plan.needs_daq else None
         if daq_service is not None:
             problems = daq_service.unsupported_steps(steps)
             for line in problems:
@@ -795,7 +953,15 @@ async def run(args) -> int:
             except Exception as step_err:
                 exp_logger.record_step(i, total, action, rid, iteration,
                                        "error", time.monotonic() - t_start,
-                                       error=str(step_err))
+                                       error=str(step_err),
+                                       diagnostics=getattr(step_err, "diagnostics", None))
+                raise
+            except BaseException as step_interrupt:
+                # Ctrl+C / キャンセル: 分かっていたことを中断として残してから再送出
+                exp_logger.record_step(i, total, action, rid, iteration,
+                                       "aborted", time.monotonic() - t_start,
+                                       error="中断（Ctrl+C）",
+                                       diagnostics=getattr(step_interrupt, "diagnostics", None))
                 raise
 
             # 分注精度: dispense の指示量と直後の measure_weight を対応付ける
@@ -835,10 +1001,120 @@ async def run(args) -> int:
             accuracy_logger.finalize(logger)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"分注精度CSVの確定でエラー: {e}")
-        exp_logger.finalize(session.status, session.error)
-        logger.info(f"実験ログを保存しました: {exp_logger.dir}")
+        try:
+            exp_logger.record_output_restore(session.output_restore_report())
+            exp_logger.record_robot_reports(session.robot_reports)
+            exp_logger.finalize(session.status, session.error)
+            logger.info(f"実験ログを保存しました: {exp_logger.dir}")
+        finally:
+            if interrupt_guard is not None:
+                interrupt_guard.restore()
 
     return exit_code
+
+
+class MG400InterruptGuard:
+    """MG400 を使うランの SIGINT（Ctrl+C）: 停止をイベントループに頼らずに届け、停止
+    シーケンス・切断・記録の確定を、続く Ctrl+C で途切れさせない（flow plan F3）。
+
+    - ハンドラは定数を ``queue.SimpleQueue.put`` するだけ（シグナルハンドラから呼べる;
+      数えない・ロックもログも取らない: 入れ子の SIGINT でも 1 回目は失われない）。数えるのは
+      中継スレッド
+    - 1 回目: 中継スレッドが、まず MG400 全台の停止ラッチをログなしで立て
+      （``latch_stops_first``; ループが同期処理で詰まっていても、ログのロックが取られていても
+      届く）、実行タスクのキャンセルをループに頼み、それから全ロボットへの通常の停止要求
+      （``emergency_stop_all``: ログを出す、他の種別はシリアル送信）とログ
+    - 2 回目以降: 保留（停止シーケンス・切断・記録の確定を待つ。その旨を出す）。
+      KeyboardInterrupt は送出しない: 中断で切断と記録が途切れることはない
+
+    主スレッドでだけ入れる（GUI のランナーは別スレッドのループなので入れない）。
+    記録の確定の後に元のハンドラへ戻す"""
+
+    def __init__(self, loop, task, session):
+        self.loop, self.task, self.session = loop, task, session
+        self.count = 0
+        self.previous = None
+        self._q: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._relay = threading.Thread(target=self._relay_main, name="mg400-sigint-relay", daemon=True)
+
+    @classmethod
+    def install(cls, session) -> "Optional[MG400InterruptGuard]":
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        guard = cls(asyncio.get_running_loop(), asyncio.current_task(), session)
+        guard._relay.start()
+        guard.previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, guard.handler)
+        return guard
+
+    def restore(self) -> None:
+        if signal.getsignal(signal.SIGINT) == self.handler:
+            signal.signal(signal.SIGINT, self.previous if self.previous is not None else signal.default_int_handler)
+        self._q.put(None)
+
+    _SIGINT = "sigint"
+
+    def handler(self, signum, frame):
+        self._q.put(self._SIGINT)
+
+    def _relay_main(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            self.count += 1
+            if self.count == 1:
+                error = None
+                try:
+                    self.session.latch_stops_first()          # no logging, no I/O
+                except Exception as e:  # noqa: BLE001 - emergency_stop_all below tries again
+                    error = e
+                try:
+                    self.loop.call_soon_threadsafe(self._cancel)
+                except RuntimeError:
+                    pass                        # the loop has already closed
+                try:
+                    self.session.emergency_stop_all(skip_already_stopped=True)
+                except Exception as e:  # noqa: BLE001
+                    error = e
+                logger.warning("Ctrl+C: MG400 の停止シーケンスを始めました（緊急停止ではありません。"
+                               "緊急停止はコントローラのボタンです）")
+                if error is not None:
+                    logger.error(f"停止要求に失敗しました: {error!r}")
+            else:
+                logger.warning("Ctrl+C: 停止シーケンス・切断・記録の確定を待っています（MG400 の切断待ちは "
+                               "25 s ほどまで; 他のステップが止まっているときは docs/setup.md §13 の手順）。"
+                               "この間の Ctrl+C は保留します。緊急停止はコントローラのボタンです")
+
+    def _cancel(self):
+        if self.task is not None:
+            self.task.cancel()
+
+
+def mg400_confirmation_text(mg400_ids, robot_ports: dict, steps: list) -> str:
+    """実機ランの前にターミナルへ出す確認文（flow plan F7）: ロボット、入力されたアドレス、箱、
+    速度比、ホーム、フローの最初の MG400 の手、停止の意味、緊急停止ボタン"""
+    lines = ["MG400 real run: the arm WILL move (flows: MovL in a straight line, one move at a time)."]
+    for rid in mg400_ids:
+        ports = robot_ports.get(rid) or {}
+        ws = ports.get("workspace") or {}
+        first = next((s for s in steps if s.get("robot_id", 1) == rid
+                      and s.get("action") not in SHARED_DEVICE_ACTIONS), None)
+        lines.append(f"  Robot {rid}: address {ports.get('mg400_address') or '(not set)'}; "
+                     f"box x {ws.get('x_min')}..{ws.get('x_max')}, y {ws.get('y_min')}..{ws.get('y_max')}, "
+                     f"z {ws.get('z_min')}..{ws.get('z_max')}" +
+                     (f", r {ws.get('r_min')}..{ws.get('r_max')}" if 'r_min' in ws or 'r_max' in ws else "") +
+                     f"; SpeedL = AccL = {ports.get('speed_ratio')} % of the controller's playback setting x global "
+                     f"ratio (not read); home {ports.get('home_position')}; max move {ports.get('max_move_mm')} mm")
+        if first is not None:
+            lines.append(f"      first MG400 step: {first.get('action')} {_fmt_params(first)}")
+    lines.append("  Before the Enter: DobotStudio Pro closed, remote-control mode TCP/IP, the arm disabled with no "
+                 "alarm, nothing on the flange, the volume of the box clear, the emergency-stop button within reach.")
+    lines.append("  After the Enter: ResetRobot, EnableRobot, then the flow's moves. Ctrl+C (or the GUI Stop) is NOT "
+                 "an emergency stop: it starts an orderly stop (ResetRobot, DisableRobot, confirmation polls, then "
+                 "EmergencyStop unless the arm showed itself disabled or in alarm and still and the Enable's outcome "
+                 "is known), bounded by 15 s; the emergency stop is the button on the controller.")
+    return "\n".join(lines)
 
 
 def main(argv=None) -> int:

@@ -434,13 +434,28 @@ class MockSharedDevices:
 
     #: measure_weight が返すモック測定値 (g)
     MOCK_WEIGHT = 4.98
+    #: measure_dmm が返すモック測定値（単位は測定機能による）
+    MOCK_DMM_VALUE = 1.234
+    #: measure_lockin が返すモック値（DATA1 = X [V], DATA2 = Y [V], 参照周波数 [Hz]）
+    MOCK_LOCKIN_X = 1.0e-3
+    MOCK_LOCKIN_Y = 2.0e-5
+    MOCK_LOCKIN_FREQ = 1000.0
+    #: measure_scope が返すモック値（項目 -> 値。単位は実機と同じ規則: 電圧項目は V）
+    MOCK_SCOPE_VALUES = {
+        "vpp": 2.0, "vmax": 1.0, "vmin": -1.0, "vamplitude": 2.0, "vtop": 1.0,
+        "vbase": -1.0, "vaverage": 0.0, "vrms": 0.707, "frequency": 1000.0,
+        "period": 1.0e-3, "risetime": 2.0e-6, "falltime": 2.0e-6, "pwidth": 5.0e-4,
+        "nwidth": 5.0e-4, "pdutycycle": 50.0, "ndutycycle": 50.0, "overshoot": 1.0,
+        "preshoot": 1.0,
+    }
 
     #: daq_read_analog が返すモック電圧 (V)（MockNIDaq.MOCK_VOLTAGE と同じ値）
     MOCK_VOLTAGE = 1.234
 
     def __init__(self, use_scale: bool = False, use_camera: bool = False,
                  use_microscope: bool = False, use_microscope_serial: bool = False,
-                 use_daq: bool = False, **device_configs):
+                 use_dmm: bool = False, use_lockin: bool = False, use_scope: bool = False,
+                 lockin_osc_plan=None, use_daq: bool = False, **device_configs):
         self.use_scale = use_scale
         self.use_daq = use_daq
         # DAQ: 実機と同じ DaqService（信号名の解決・出力の許可判定）を模擬デバイスの上で
@@ -455,6 +470,21 @@ class MockSharedDevices:
         self.use_camera = use_camera
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
+        self.use_dmm = use_dmm
+        self._dmm_open = False          # 実機と同じく initialize() 〜 cleanup() の間だけ測れる
+        self.use_lockin = use_lockin
+        self._lockin_open = False
+        self.use_scope = use_scope
+        self._scope_open = False
+        # LI5640 の内部発振器（実機と同じ規則で検査する。初期状態はフローに合わせる:
+        # 最初の周波数、0 V、フローの全振幅を表せる最小のレンジ）
+        self.lockin_osc_plan = lockin_osc_plan
+        self._configs = device_configs
+        self._osc_state = None
+        self._osc_saved = None
+        self._osc_dirty = False
+        self._osc_report = None
+        self._osc_closed = None
         self._captures = 0
         self._microscope_captures = 0
         self.microscope_led_on = True
@@ -462,14 +492,163 @@ class MockSharedDevices:
         self.microscope_focus_position = 1568   # 実機の出荷時レンズ位置
 
     async def initialize(self) -> bool:
+        if self.use_lockin and self.lockin_osc_plan is not None:
+            from decimal import Decimal
+
+            from src.devices.li5640 import oscillator as osc
+            try:
+                limits = osc.parse_limits(self._configs)
+            except ValueError as e:
+                logger.error(f"[MOCK] LI5640 初期化エラー: {e}")
+                return False
+            if not limits.enabled or not self.lockin_osc_plan.ranges:
+                logger.error("[MOCK] LI5640 初期化エラー: 発振器の書き込みが無効、"
+                             "またはフローの振幅を表せる共通のレンジがありません")
+                return False
+            self._osc_state = osc.OscState(self.lockin_osc_plan.first_frequency, Decimal(0),
+                                           min(self.lockin_osc_plan.ranges))
+            self._osc_saved = self._osc_state
         logger.info("=== [MOCK] 共有デバイス初期化 (成功) ===")
+        self._dmm_open = self.use_dmm
+        self._lockin_open = self.use_lockin
+        self._scope_open = self.use_scope
         return True
+
+    async def set_lockin_oscillator(self, frequency: float, amplitude: float,
+                                    settle: float = 0.0) -> dict:
+        # 実機と同じ契約: 未初期化・許可なしは RuntimeError、値は同じ規則で検査する
+        from src.devices.li5640 import oscillator as osc
+        if not self.use_lockin or not self._lockin_open:
+            raise RuntimeError("LI5640 が初期化されていません")
+        if self.lockin_osc_plan is None or self._osc_saved is None:
+            raise RuntimeError("このランでは LI5640 の発振器を書けません")
+        limits = osc.parse_limits(self._configs)
+        target = osc.OscState(osc.check_frequency(frequency), osc.check_amplitude(amplitude),
+                              self._osc_saved.range)
+        if not 0.0 <= float(settle) <= 600.0:
+            raise ValueError(f"settle は 0〜600 秒: {settle}")
+        limits.check_state(target, "要求")
+        if not osc.amplitude_fits(target.ampl, target.range):
+            raise ValueError(f"amplitude {target.ampl} Vrms は接続時のレンジ {target.range} で表せません")
+        before = self._osc_state
+        if target != before:                # 実機と同じく、同じ値なら何も書かない
+            self._osc_dirty = True
+        self._osc_state = target
+        await asyncio.sleep(min(float(settle), 0.05))
+        logger.info(f"✓ [MOCK] LI5640 発振器: {float(target.freq)!r} Hz, {float(target.ampl)!r} Vrms")
+        return {
+            "lockin_osc_freq_hz": float(target.freq),
+            "lockin_osc_ampl_vrms": float(target.ampl),
+            "lockin_osc_range": target.range,
+            "lockin_osc_before": before.as_record(),
+            "lockin_osc_rsrc": 1,
+            "lockin_osc_settle_s": float(settle),
+            "lockin_osc_settled_s": min(float(settle), 0.05),
+        }
+
+    def output_restore_report(self):
+        """実機と同じ形（発振器を書かないランなら None）"""
+        if self.lockin_osc_plan is None:
+            return None
+        if not self._osc_dirty:
+            report = {"state": "not_needed"}
+        elif self._osc_report is None:
+            report = {"state": "unverified", "errors": ["復元はまだ実行されていません"]}
+        else:
+            report = dict(self._osc_report)
+        return {"oscillator": report, "closed": self._osc_closed}
 
     async def measure_weight(self, stabilization_count: int = 3) -> float:
         logger.info(f"[MOCK] 重量測定中（{stabilization_count}回測定）...")
         await asyncio.sleep(0.1)
         logger.info(f"✓ [MOCK] 重量測定完了: {self.MOCK_WEIGHT:.3f}g")
         return self.MOCK_WEIGHT
+
+    async def measure_dmm(self, function: str = "dc_voltage", samples: int = 3,
+                          nplc: float = 1.0, range_: Optional[float] = None) -> dict:
+        # 実機と同じ契約: 未初期化は RuntimeError、有効値なし（samples < 1）は ValueError、
+        # 引数はドライバの configure と同じ表で検査する
+        from src.devices.keithley2002 import FUNCTIONS, NPLC_MAX, NPLC_MIN
+        if not self.use_dmm or not self._dmm_open:
+            raise RuntimeError("Keithley 2002 が初期化されていません")
+        if int(samples) < 1:
+            raise ValueError(f"DMM から有効な測定値を取得できませんでした（{samples} 回）")
+        if function not in FUNCTIONS:
+            raise ValueError(f"未知の測定機能: {function!r}")
+        _, unit, max_range = FUNCTIONS[function]
+        if not (NPLC_MIN <= float(nplc) <= NPLC_MAX):
+            raise ValueError(f"nplc は {NPLC_MIN}〜{NPLC_MAX}: {nplc}")
+        if range_ is not None and not (0 < float(range_) <= max_range):
+            raise ValueError(f"{function} のレンジは 0 より大きく {max_range:g} {unit} 以下: {range_}")
+        logger.info(f"[MOCK] DMM 測定中（{function}, {samples}回, NPLC {nplc}）...")
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] DMM 測定完了: {self.MOCK_DMM_VALUE} {unit}")
+        return {
+            "dmm_value": self.MOCK_DMM_VALUE,
+            "dmm_unit": unit,
+            "dmm_function": function,
+            "dmm_range": float(range_) if range_ is not None else max_range,
+            "dmm_nplc": float(nplc),
+            "dmm_valid_samples": int(samples),
+        }
+
+    async def measure_lockin(self, samples: int = 5, interval: float = 0.0) -> dict:
+        # 実機と同じ契約: 未初期化は RuntimeError、samples < 1 は ValueError。
+        # 表示は X / Y（電圧入力、正規化・レシオなし）として返す
+        if not self.use_lockin or not self._lockin_open:
+            raise RuntimeError("LI5640 が初期化されていません")
+        if int(samples) < 1:
+            raise ValueError(f"samples は 1 以上: {samples}")
+        logger.info(f"[MOCK] LI5640 読み取り中（{samples}回, 間隔 {interval}s）...")
+        await asyncio.sleep(0.05)
+        logger.info(f"✓ [MOCK] LI5640: X = {self.MOCK_LOCKIN_X} V, Y = {self.MOCK_LOCKIN_Y} V")
+        return {
+            "lockin_data1": self.MOCK_LOCKIN_X,
+            "lockin_data1_kind": "X",
+            "lockin_data1_unit": "V",
+            "lockin_data2": self.MOCK_LOCKIN_Y,
+            "lockin_data2_kind": "Y",
+            "lockin_data2_unit": "V",
+            "lockin_freq": self.MOCK_LOCKIN_FREQ,
+            "lockin_sensitivity": "100 mV",
+            "lockin_time_constant": "100 ms",
+            "lockin_valid_samples": int(samples),
+            "lockin_invalid": {},
+            "lockin_settings": ({"mock": True} if self._osc_state is None else
+                                {"mock": True, "osc_freq": float(self._osc_state.freq),
+                                 "osc_ampl": float(self._osc_state.ampl),
+                                 "osc_range": self._osc_state.range}),
+        }
+
+    async def measure_scope(self, channel: int = 1, items=("vpp", "frequency"),
+                            samples: int = 3, interval: float = 0.5) -> dict:
+        # 実機と同じ契約: 未初期化は RuntimeError、引数は同じ規則で検査する。
+        # 4 チャネル機（DSO1014A）として振る舞う
+        from src.devices.dso1000 import ITEMS
+        from src.devices.dso1000.dso1000 import item_unit
+        if not self.use_scope or not self._scope_open:
+            raise RuntimeError("オシロスコープが初期化されていません")
+        items = list(items)
+        if not items or len(set(items)) != len(items) or any(i not in ITEMS for i in items):
+            raise ValueError(f"items は重複のない既知の項目 1 つ以上: {items}")
+        if int(samples) < 1:
+            raise ValueError(f"samples は 1 以上: {samples}")
+        if not 1 <= int(channel) <= 4:
+            raise ValueError(f"channel は 1〜4: {channel}")
+        logger.info(f"[MOCK] オシロスコープ CH{channel} 読み取り中（{items}, {samples}回）...")
+        await asyncio.sleep(0.05)
+        values = {i: self.MOCK_SCOPE_VALUES[i] for i in items}
+        logger.info(f"✓ [MOCK] オシロスコープ: {values}")
+        return {
+            "scope_channel": int(channel),
+            "scope_values": values,
+            "scope_units": {i: item_unit(i, "V") for i in items},
+            "scope_valid": {i: int(samples) for i in items},
+            "scope_invalid": {},
+            "scope_settings": {"mock": True},
+            "scope_settings_after": {"mock": True},
+            "scope_raw": {i: [repr(values[i])] * int(samples) for i in items},
+        }
 
     async def tare_scale(self, delay: float = 1.0):
         logger.info("[MOCK] 電子天秤を風袋引き中...")
@@ -551,4 +730,14 @@ class MockSharedDevices:
         # 実機と同じく、連続記録を止め、駆動した出力は 0 V / Low に戻す
         if self.daq_service is not None:
             self.daq_service.close()
+        if self._lockin_open and self._osc_dirty and self._osc_report is None:
+            self._osc_report = {"state": "verified", "saved": self._osc_saved.as_record(),
+                                "read_before": self._osc_state.as_record(), "errors": []}
+            self._osc_state = self._osc_saved
+            logger.info(f"✓ [MOCK] LI5640 の発振器を戻しました: {self._osc_saved.as_record()}")
+        if self._lockin_open:
+            self._osc_closed = True
+        self._dmm_open = False
+        self._lockin_open = False
+        self._scope_open = False
         logger.info("✓ [MOCK] 共有デバイスの仮想接続を切断")

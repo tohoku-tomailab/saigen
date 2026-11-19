@@ -1,0 +1,8 @@
+{
+  "name": "Read the NF LI5640 lock-in amplifier",
+  "description": "Read what the NF LI5640 lock-in amplifier shows, over GPIB, twice: five readings back to back, then five readings one second apart. Sensitivity, time constant, reference, input and the DATA1/DATA2 display (X/Y, R/theta, noise, AUX) are set on the front panel; the flow changes none of them and only reads. Wait for the output to settle before starting (about 10 time constants at 24 dB/oct). Each step takes the median of its valid readings and writes DATA1 and DATA2 with their kind and unit, the measured reference frequency, sensitivity, time constant, the number of valid readings and the panel settings to measurements.csv. The flow uses only the lock-in amplifier, so no robot is opened. The VISA resource comes from config.yaml (shared_devices.lockin_resource) or from --lockin-resource.",
+  "steps": [
+    {"action": "measure_lockin", "samples": 5},
+    {"action": "measure_lockin", "samples": 5, "interval": 1.0}
+  ]
+}

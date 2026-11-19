@@ -22,7 +22,9 @@ from src.devices.nidaq.service import ACTIONS as _DAQ_ACTION_NAMES
 DAQ_ACTIONS = set(_DAQ_ACTION_NAMES)
 # 共有デバイス用アクション（robot_idに依存しない）
 SHARED_DEVICE_ACTIONS = {"measure_weight", "tare_scale", "capture_and_save",
-                         "capture_microscope", "microscope_led", "microscope_focus"} | DAQ_ACTIONS
+                         "capture_microscope", "microscope_led", "microscope_focus",
+                         "measure_dmm", "measure_lockin", "set_lockin_oscillator",
+                         "measure_scope"} | DAQ_ACTIONS
 # CSV（波形・連続記録）を保存する DAQ アクション。保存先は実行フォルダに束ねる
 DAQ_DATA_ACTIONS = {"daq_acquire": "acquire", "daq_start_logging": "logging",
                     "daq_stimulate_acquire": "stimulate", "daq_acquire_digital": "digital",
@@ -31,6 +33,12 @@ MICROSCOPE_ACTIONS = {"capture_microscope", "microscope_led", "microscope_focus"
 # 顕微鏡のカメラ（UVC）が要るアクションと、制御ポート（シリアル）が要るアクション
 MICROSCOPE_CAMERA_ACTIONS = {"capture_microscope", "microscope_focus"}
 MICROSCOPE_SERIAL_ACTIONS = {"microscope_led", "microscope_focus"}
+# Keithley 2002 DMM（GPIB）が要るアクション
+DMM_ACTIONS = {"measure_dmm"}
+# NF LI5640 ロックインアンプ（GPIB）が要るアクション
+LOCKIN_ACTIONS = {"measure_lockin", "set_lockin_oscillator"}
+# Agilent 1000 シリーズ オシロスコープ（USB）が要るアクション
+SCOPE_ACTIONS = {"measure_scope"}
 
 # ループ制御アクション（実行時にスキップ）
 LOOP_CONTROL_ACTIONS = {"loop_start", "loop_end"}
@@ -207,6 +215,60 @@ async def execute_shared_device_step(step, shared_devices, logger=None):
         elif "daq_value" in result:
             logger.info(f"  結果: {result['daq_channel']} = {result['daq_value']:g} "
                         f"{result.get('daq_unit', '')}")
+        return result
+
+    # ===== DMM 操作（Keithley 2002） =====
+    elif action == "measure_dmm":
+        if isinstance(step, dict):
+            kwargs = {"function": step.get("function", "dc_voltage"),
+                      "samples": step.get("samples", 3),
+                      "nplc": step.get("nplc", 1.0),
+                      "range_": step.get("range")}
+        else:
+            kwargs = {"function": step.function, "samples": step.samples,
+                      "nplc": step.nplc, "range_": step.range}
+        result = await shared_devices.measure_dmm(**kwargs)
+        logger.info(f"  DMM: {result['dmm_value']!r} {result['dmm_unit']} ({result['dmm_function']})")
+        return result
+
+    # ===== ロックインアンプ（NF LI5640、読み取り専用） =====
+    elif action == "measure_lockin":
+        if isinstance(step, dict):
+            kwargs = {"samples": step.get("samples", 5), "interval": step.get("interval", 0.0)}
+        else:
+            kwargs = {"samples": step.samples, "interval": step.interval}
+        result = await shared_devices.measure_lockin(**kwargs)
+        logger.info(f"  LI5640: {result['lockin_data1_kind']} {result['lockin_data1']!r} "
+                    f"{result['lockin_data1_unit']}, {result['lockin_data2_kind']} "
+                    f"{result['lockin_data2']!r} {result['lockin_data2_unit']}")
+        return result
+
+    # ===== ロックインアンプの内部発振器（設定で許可したときだけ書く） =====
+    elif action == "set_lockin_oscillator":
+        if isinstance(step, dict):
+            kwargs = {"frequency": step.get("frequency"), "amplitude": step.get("amplitude"),
+                      "settle": step.get("settle", 0.0)}
+        else:
+            kwargs = {"frequency": step.frequency, "amplitude": step.amplitude,
+                      "settle": step.settle}
+        result = await shared_devices.set_lockin_oscillator(**kwargs)
+        logger.info(f"  LI5640 発振器: {result['lockin_osc_freq_hz']!r} Hz, "
+                    f"{result['lockin_osc_ampl_vrms']!r} Vrms（レンジ {result['lockin_osc_range']}）")
+        return result
+
+    # ===== オシロスコープ（Agilent 1000 シリーズ、読み取り専用） =====
+    elif action == "measure_scope":
+        if isinstance(step, dict):
+            kwargs = {"channel": step.get("channel", 1),
+                      "items": list(step.get("items") or ["vpp", "frequency"]),
+                      "samples": step.get("samples", 3), "interval": step.get("interval", 0.5)}
+        else:
+            kwargs = {"channel": step.channel, "items": list(step.items),
+                      "samples": step.samples, "interval": step.interval}
+        result = await shared_devices.measure_scope(**kwargs)
+        logger.info(f"  オシロ CH{result['scope_channel']}: " + ", ".join(
+            f"{k} {v!r} {result['scope_units'].get(k, '')}"
+            for k, v in result["scope_values"].items()))
         return result
 
     else:

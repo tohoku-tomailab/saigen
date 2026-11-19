@@ -33,6 +33,8 @@ except ImportError:
 
 from pydantic import ValidationError
 
+from src.devices.dso1000 import ITEMS as SCOPE_ITEMS
+from src.devices.keithley2002 import FUNCTIONS as DMM_FUNCTIONS
 from src.flow.executor import SHARED_DEVICE_ACTIONS
 from src.flow.schema import PIPETTE_MIN_VOLUME_ML
 
@@ -248,6 +250,22 @@ ACTION_CONFIG = {
         "icon": "🧭", "label": "エンコーダ 追従終了 (DAQ)", "category": "daq",
         "defaults": {}
     },
+    "measure_dmm": {
+        "icon": "🔌", "label": "DMM測定", "category": "sensor",
+        "defaults": {"function": "dc_voltage", "samples": 3, "nplc": 1.0}
+    },
+    "measure_lockin": {
+        "icon": "📈", "label": "ロックイン測定", "category": "sensor",
+        "defaults": {"samples": 5, "interval": 0.0}
+    },
+    "set_lockin_oscillator": {
+        "icon": "🔊", "label": "ロックイン発振器設定", "category": "sensor",
+        "defaults": {"frequency": 100.0, "amplitude": 0.1, "settle": 1.0}
+    },
+    "measure_scope": {
+        "icon": "📉", "label": "オシロ測定", "category": "sensor",
+        "defaults": {"channel": 1, "items": ["vpp", "frequency"], "samples": 3, "interval": 0.5}
+    },
     # ループ制御
     "loop_start": {
         "icon": "🔁", "label": "ループ開始", "category": "loop",
@@ -265,6 +283,7 @@ ROBOT_COLORS = {
     2: {"bg": "#e8f5e9", "border": "#388e3c", "label": "🟢", "name": "Robot 2"},
     3: {"bg": "#fff3e0", "border": "#e65100", "label": "🟠", "name": "Robot 3 (Slider)"},
     4: {"bg": "#f3e5f5", "border": "#7b1fa2", "label": "🟣", "name": "Robot 4 (MaxArm)"},
+    5: {"bg": "#e0f7fa", "border": "#00838f", "label": "🔷", "name": "Robot 5 (MG400)"},
 }
 
 SHARED_COLOR = {"bg": "#f5f5f5", "border": "#9e9e9e"}
@@ -275,7 +294,7 @@ CATEGORIES = {
     "peripheral": ("🔩 周辺機器", ["move_slider", "move_conveyer"]),
     "pipette": ("💉 ピペット", ["aspirate", "dispense", "blow_out"]),
     "maxarm": ("🧲 MaxArm", ["suction"]),
-    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale"]),
+    "sensor": ("📡 センサー", ["capture_and_save", "capture_microscope", "microscope_led", "microscope_focus", "measure_weight", "tare_scale", "measure_dmm", "measure_lockin", "set_lockin_oscillator", "measure_scope"]),
     "daq": ("🔌 DAQ", ["daq_read_analog", "daq_acquire", "daq_start_logging", "daq_stop_logging",
                       "daq_wait_analog", "daq_write_analog", "daq_generate_waveform",
                       "daq_stop_output", "daq_read_digital", "daq_write_digital",
@@ -599,12 +618,14 @@ def validate_current_workflow():
         st.toast(f"検証OK: {len(steps)} ステップ（ループ展開後）{note}", icon="✅")
 
 
-def start_run(mock: bool = True):
+def start_run(mock: bool = True, confirmed_robots=()):
     """検証・プリフライトしてから FlowRunner を起動する（実行はバックグラウンドスレッド1本）
 
     検証または可動域プリフライトに失敗したフローはここで弾かれ、ロボットには
     一切触れない。``mock=False``（実機）は、実行パネルで「実機で実行する」を
-    チェックし確認ダイアログで承認したときだけ渡される。
+    チェックし確認ダイアログで承認したときだけ渡される。``confirmed_robots`` は
+    そのダイアログが示し人が承認した MG400 の robot_id（flow plan F7）: これ無しの
+    MG400 実機ランは FlowRunner が拒否する。
     """
     if is_running():
         return
@@ -625,6 +646,7 @@ def start_run(mock: bool = True):
             shared_config=shared_config,
             # Mock 実行では録画も安全確認ゲートも使わない（CLI の --mock と同じ）
             pre_step=None if use_mock else flow_runner._safety_gate,
+            confirmed_robots=() if use_mock else tuple(confirmed_robots),
         )
     except ValidationError as e:
         st.session_state.error_message = (
@@ -702,12 +724,30 @@ def confirm_real_run_dialog():
     ports = flow_runner.settings_to_session_args(build_run_settings())[0]
     st.caption("接続ポート: " + ", ".join(
         f"Robot {rid}: " + ((f"MaxArm {cfg.get('maxarm_port') or '-'}")
-                            if cfg.get("type") == "maxarm" else (cfg.get('dobot_port') or '-'))
+                            if cfg.get("type") == "maxarm" else
+                            (f"MG400 {cfg.get('mg400_address') or '-'}")
+                            if cfg.get("type") == "mg400" else (cfg.get('dobot_port') or '-'))
         for rid, cfg in ports.items()))
+    used = {s.get("robot_id", 1) for s in (data.get("steps") or []) if isinstance(s, dict)}
+    mg400_used = [rid for rid, cfg in ports.items() if cfg.get("type") == "mg400" and rid in used]
+    if mg400_used:
+        # the MG400's confirmation (flow plan F7): this dialog is the only way to a real run
+        for rid in mg400_used:
+            cfg = ports[rid]
+            ws = cfg.get("workspace") or {}
+            st.warning(
+                f"🔷 Robot {rid} (MG400) が動きます: アドレス {cfg.get('mg400_address') or '（未設定）'}、"
+                f"箱 x {ws.get('x_min')}..{ws.get('x_max')} / y {ws.get('y_min')}..{ws.get('y_max')} / "
+                f"z {ws.get('z_min')}..{ws.get('z_max')}、速度比 {cfg.get('speed_ratio')} %、"
+                f"ホーム {cfg.get('home_position')}、1 手 {cfg.get('max_move_mm')} mm 以内。"
+                "開始前に: DobotStudio Pro を閉じる、リモート制御モード TCP/IP、アームは無効（アラームなし）、"
+                "フランジに何も付けない、箱の中を空ける、緊急停止ボタンを手元に。"
+                "■ 停止 は緊急停止ではありません（ResetRobot, DisableRobot, 確認, 必要なら EmergencyStop の"
+                "整然停止; 15 s 以内）。緊急停止はコントローラのボタンです。")
     c1, c2 = st.columns(2)
     if c1.button("実機で開始", type="primary", use_container_width=True, key="confirm_real_run"):
         st.session_state["_disarm_real_run"] = True
-        start_run(mock=False)
+        start_run(mock=False, confirmed_robots=mg400_used)    # the approval of the MG400 text above (F7)
         st.rerun()
     if c2.button("キャンセル", use_container_width=True, key="cancel_real_run"):
         st.rerun()
@@ -999,6 +1039,18 @@ def get_param_summary(step):
                 f"{step.get('pulses_per_rev', 0)} パルス/回転")
     elif action in ("daq_read_encoder", "daq_stop_encoder"):
         return ""
+    elif action == "measure_dmm":
+        rng = step.get('range')
+        return (f"{escape(str(step.get('function', 'dc_voltage')))} {step.get('samples', 3)}回 "
+                f"NPLC {step.get('nplc', 1.0)} " + (f"レンジ {rng}" if rng is not None else "オート"))
+    elif action == "measure_lockin":
+        return f"{step.get('samples', 5)}回 間隔 {step.get('interval', 0.0)}秒"
+    elif action == "set_lockin_oscillator":
+        return (f"{step.get('frequency', 100.0)} Hz {step.get('amplitude', 0.1)} Vrms "
+                f"待機 {step.get('settle', 0.0)}秒")
+    elif action == "measure_scope":
+        items = ", ".join(escape(str(i)) for i in (step.get("items") or ["vpp", "frequency"]))
+        return f"CH{step.get('channel', 1)} {items} {step.get('samples', 3)}回"
     elif action == "go_home":
         return ""
     elif action == "loop_start":
@@ -1018,11 +1070,14 @@ def _bump_flow_rev():
     st.session_state.flow_rev = st.session_state.get("flow_rev", 0) + 1
 
 
-def _num(container, label, step, idx, param, kind, default, **kwargs):
+def _num(container, label, flow_step, idx, param, kind, default, **kwargs):
     """数値入力。表示値だけ既定値で補い、保存済みフローには書き込まない
-    （書き込むのはユーザーが値を変えたときの on_change だけ）。"""
+    （書き込むのはユーザーが値を変えたときの on_change だけ）。
+
+    フローのステップは ``flow_step``。``step`` という名前にすると、刻み幅の
+    ``step=0.1`` などを ``**kwargs`` で number_input に渡せない（引数が重複する）。"""
     key = _wkey(param, idx)
-    raw = step.get(param)
+    raw = flow_step.get(param)
     value = kind(default if raw is None else raw)
     container.number_input(label, value=value, key=key,
                            on_change=_update_step_param, args=(idx, param, key), **kwargs)
@@ -1116,6 +1171,46 @@ def _toggle_led_level(idx, key):
         step.pop("level", None)
 
 
+def _change_dmm_function(idx, key):
+    """測定機能の on_change: 単位が変わるので固定レンジを外す（オートに戻す）
+
+    キー付きウィジェットは既定値を変えても前の状態を保つので、「レンジを固定する」
+    のチェックとレンジ欄の状態もここで合わせる（表示と実行設定を食い違わせない）。
+    """
+    if is_running():
+        return
+    step = st.session_state.workflow_data["steps"][idx]
+    flow_runner.change_dmm_function(step, st.session_state[key])
+    st.session_state[_wkey("fix_range", idx)] = step.get("range") is not None
+    st.session_state.pop(_wkey("range", idx), None)
+
+
+def _change_scope_items(idx, key):
+    """測定項目の on_change: 空にはしない（スキーマが 1 つ以上を要求するので、
+    空のステップは検証に通らず編集できなくなる）。空にされたら元の選択に戻す"""
+    if is_running():
+        return
+    step = st.session_state.workflow_data["steps"][idx]
+    chosen = list(st.session_state[key])
+    if chosen:
+        step["items"] = chosen
+    else:
+        st.session_state[key] = list(step.get("items") or ["vpp", "frequency"])
+
+
+def _toggle_dmm_range(idx, key):
+    """「レンジを固定する」の on_change: チェック時だけ range を書き込む"""
+    if is_running():
+        return
+    step = st.session_state.workflow_data["steps"][idx]
+    st.session_state.pop(_wkey("range", idx), None)   # レンジ欄は step の値から作り直す
+    if st.session_state[key]:
+        if step.get("range") is None:
+            step["range"] = DMM_FUNCTIONS[step.get("function", "dc_voltage")][2]
+    else:
+        step.pop("range", None)
+
+
 def render_step_params(step, idx):
     """ステップのパラメータ入力UI（popover内用）
 
@@ -1142,9 +1237,11 @@ def render_step_params(step, idx):
         label = "角度 (deg)" + (" - 相対" if action == "rotate_relative" else " - 絶対")
         c1, c2 = st.columns(2)
         _num(c1, label, step, idx, "angle", float, 0.0)
-        speed_labels = {"low": "低速", "normal": "普通", "high": "高速"}
-        _select(c2, "速度", step, idx, "speed", ["low", "normal", "high"], "low",
-                format_func=lambda x: speed_labels[x])
+        # 速度は相対回転だけの項目（絶対回転の schema に speed は無く、書くと拒否される）
+        if action == "rotate_relative":
+            speed_labels = {"low": "低速", "normal": "普通", "high": "高速"}
+            _select(c2, "速度", step, idx, "speed", ["low", "normal", "high"], "low",
+                    format_func=lambda x: speed_labels[x])
 
     elif action == "move_slider":
         _num(st, "位置 (mm)", step, idx, "position", float, 500.0,
@@ -1430,6 +1527,56 @@ def render_step_params(step, idx):
 
     elif action == "daq_stop_encoder":
         st.caption("追従を終え、最後の角度を記録します")
+
+    elif action == "measure_dmm":
+        fn_key = _wkey("function", idx)
+        functions = list(DMM_FUNCTIONS)
+        current = step.get("function", "dc_voltage")
+        st.selectbox("測定機能（変えると固定レンジは解除）", options=functions,
+                     index=functions.index(current) if current in functions else 0,
+                     key=fn_key, on_change=_change_dmm_function, args=(idx, fn_key))
+        _num(st, "測定回数（中央値）", step, idx, "samples", int, 3, min_value=1, max_value=10)
+        _num(st, "NPLC（積分時間）", step, idx, "nplc", float, 1.0,
+             min_value=0.01, max_value=50.0, step=1.0)
+        _, unit, max_range = DMM_FUNCTIONS[step.get("function", "dc_voltage")]
+        rng_key = _wkey("fix_range", idx)
+        fixed = st.checkbox("レンジを固定する（外すとオート）", value=step.get("range") is not None,
+                            key=rng_key, on_change=_toggle_dmm_range, args=(idx, rng_key))
+        if fixed and step.get("range") is not None:
+            _num(st, f"レンジ ({unit}, 最大 {max_range:g})", step, idx, "range", float, max_range,
+                 min_value=1e-9, max_value=max_range)
+        st.caption("Keithley 2002（config.yaml の shared_devices.dmm_resource）")
+
+    elif action == "measure_lockin":
+        _num(st, "読み取り回数（中央値）", step, idx, "samples", int, 5, min_value=1, max_value=100)
+        _num(st, "読み取り間隔(秒)", step, idx, "interval", float, 0.0,
+             min_value=0.0, max_value=60.0, step=0.1)
+        st.caption("NF LI5640（config.yaml の shared_devices.lockin_resource）。感度・時定数・"
+                   "表示は前面パネルで設定し、整定を待ってから実行してください")
+
+    elif action == "set_lockin_oscillator":
+        _num(st, "周波数 (Hz)", step, idx, "frequency", float, 100.0,
+             min_value=0.0005, max_value=105000.0, step=1.0, format="%.4f")
+        _num(st, "振幅 (Vrms)", step, idx, "amplitude", float, 0.1,
+             min_value=0.0, max_value=5.0, step=0.001, format="%.4f")
+        _num(st, "設定後の待機(秒)", step, idx, "settle", float, 0.0,
+             min_value=0.0, max_value=600.0, step=0.5)
+        st.caption("NF LI5640 の OSC OUT を設定します。config.yaml の shared_devices."
+                   "lockin_osc_max_vrms が 0（既定）なら実行前に拒否されます。振幅は接続時の"
+                   "レンジのまま、ランの終わりに接続時の値へ戻ります")
+
+    elif action == "measure_scope":
+        _select(st, "チャネル", step, idx, "channel", [1, 2, 3, 4], 1)
+        items_key = _wkey("items", idx)
+        st.multiselect("測定項目（1〜10 個）", options=list(SCOPE_ITEMS),
+                       default=list(step.get("items") or ["vpp", "frequency"]),
+                       max_selections=10, key=items_key,
+                       on_change=_change_scope_items, args=(idx, items_key))
+        _num(st, "読み取り回数（中央値）", step, idx, "samples", int, 3, min_value=1, max_value=20)
+        _num(st, "読み取り間隔(秒)", step, idx, "interval", float, 0.5,
+             min_value=0.0, max_value=60.0, step=0.1)
+        st.caption("Agilent 1000 シリーズ（config.yaml の shared_devices.scope_resource）。"
+                   "垂直・水平・トリガは前面パネルで設定（エッジトリガ・時間軸 MAIN のみ）")
 
     elif action == "loop_start":
         _num(st, "繰り返し回数", step, idx, "count", int, 10, min_value=1, max_value=1000)
@@ -1753,7 +1900,7 @@ def render_workflow_canvas():
             with col2:
                 render_step_card(step, idx, len(steps), step_error)
         else:
-            # Robot 3 / Robot 4 (MaxArm): 右側
+            # Robot 3 / Robot 4 (MaxArm) / Robot 5 (MG400): 右側
             col1, col2, col3 = st.columns(3)
             with col3:
                 render_step_card(step, idx, len(steps), step_error)
@@ -1792,6 +1939,12 @@ def render_settings_panel():
                     key=f"r{robot_id}_mp", disabled=running,
                     help="Hiwonder MaxArm（CH340）のシリアルポート。"
                          "空のままでは実機ランを開始できません")
+                continue
+            if config.get("type") == "mg400":
+                config["mg400_address"] = st.text_input(
+                    "MG400 Address", value=config.get("mg400_address", ""),
+                    key=f"r{robot_id}_ma", disabled=running,
+                    help="Dobot MG400 の IP アドレス（数値）。空のままでは実機ランを開始できません")
                 continue
             config["dobot_port"] = st.text_input(
                 "Dobot Port", value=config.get("dobot_port", ""),

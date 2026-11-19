@@ -7,15 +7,17 @@ A simple, easy-to-introduce, open-source platform for automated materials-synthe
 experiments, focusing on **reliable automation and quantitative process recording**
 rather than full autonomy.
 
-Repository: https://github.com/YusukeHashimotoLab/saigen
+Repository: https://github.com/tohoku-tomailab/saigen
+(QR code for slides and posters: [`docs/images/qr-saigen.png`](docs/images/qr-saigen.png),
+[`docs/images/qr-saigen.svg`](docs/images/qr-saigen.svg))
 
-A manuscript describing the platform and its ZIF-8 demonstration is in preparation
-(working title: *Quantitative control and improved reproducibility of materials
-synthesis processes using an automated experimentation platform*). It is referred to
-as "the paper" throughout this repository; a citation will be added here once it is
-available.
-<!-- TODO: add the citation / DOI when the manuscript is published, and add a
-     preferred-citation block to CITATION.cff. -->
+A paper describing the platform and its ZIF-8 demonstration has been accepted for
+publication in *Science and Technology of Advanced Materials: Methods* (STAM Methods)
+and is in press (working title: *Quantitative control and improved reproducibility of
+materials synthesis processes using an automated experimentation platform*). It is
+referred to as "the paper" throughout this repository; see [Citing](#citing).
+<!-- TODO: on publication, replace the working title with the published one and add
+     the volume and article number, here, under "Citing" and in CITATION.cff. -->
 
 The platform combines commercially available instruments (robot arms, electric
 pipettes, web cameras, an electronic balance) with 3D-printed fixtures, and operates
@@ -29,6 +31,20 @@ https://youtu.be/5X2-4LuQfns
 
 ## Repository layout
 
+The repository's main resources are organized into five parts:
+
+| Part | Folder |
+|---|---|
+| Control code for the instruments | [`src/`](src/) |
+| Fixture design data (CAD design bank) | [`cad/`](cad/) |
+| Procedures for setting up and modifying the system | [`docs/`](docs/) |
+| Knowledge base: what bringing each instrument into the cell taught us | [`knowledge/`](knowledge/) |
+| Example experiments | [`examples/`](examples/) |
+
+Beside these, `tests/` and `.github/` hold the automated tests and their CI, and
+`detection/` is an optional object-detection module kept apart for licensing
+reasons (see below). In detail:
+
 | Path | Contents |
 |---|---|
 | `src/agent/` | AI agent that generates JSON experimental flows from natural language (Gemini API or any OpenAI-compatible endpoint) and the preset flows |
@@ -40,10 +56,12 @@ https://youtu.be/5X2-4LuQfns
 | `src/imaging/` | Appearance-imaging system: NEEWER RGB62 light + Logitech C920n camera control, white/red/green/blue capture sequence, cropped-image comparison and depth-direction transmitted-light profiles (paper Figure 6) |
 | `detection/` | Object detection based on YOLOv8 — **kept separate for licensing reasons, see below** |
 | `cad/` | CAD design bank of 3D-printable experimental components (STL + editable Fusion 360 sources) |
-| `docs/` | Bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument, MaxArm commissioning notes |
+| `docs/` | Procedures: bill of materials, setup guide, experimental-flow format reference, spreadsheet-input guide, guide to adding an instrument |
+| `knowledge/` | Knowledge base: what bringing each instrument into the cell taught us (order of work, replies that differed from the manual, defects found, open points). Index in [`knowledge/README.md`](knowledge/README.md) |
 | `examples/zif8/` | Sample experimental flows of the ZIF-8 demonstration (JSON equivalents of the spreadsheet sequence) and monitoring CSV templates |
 | `examples/microscope/` | Example flow that photographs the product with the USB digital microscope (`capture_microscope`) |
 | `examples/maxarm/` | Example suction pick-and-place flow for the optional Hiwonder MaxArm (robot 4) |
+| `examples/mg400/` | Example flow and complete `config.yaml` for the optional Dobot MG400 (robot 5, TCP/IP) |
 | `examples/dispensing_stability/` | Measured data of the 100-shot dispensing-repeatability test and the script that recorded it |
 
 ## Getting started
@@ -72,7 +90,10 @@ https://youtu.be/5X2-4LuQfns
 
    Every move is checked against the `workspace` limits in `config.yaml` before the
    robot is commanded — in `--mock` mode too. Ctrl+C is an emergency stop: the arm
-   halts where it is rather than driving home. Each run leaves
+   halts where it is rather than driving home (an MG400 is the exception: its Ctrl+C
+   starts an orderly stop, a second Ctrl+C waits for it to finish, and its emergency
+   stop is the button on its controller,
+   `docs/setup.md` §13). Each run leaves
    `logs/<date>/<flow>_<time>/` with `run.log`, `measurements.csv`, `summary.md`,
    `metadata.json` and a copy of the flow; add `--no-record` to skip the sensor-CSV
    and video recording that real runs start by default.
@@ -132,7 +153,7 @@ JSON equivalents of the spreadsheet sequence the paper's batches were run with �
   (Copyright 2017 Luis Mesas, MIT License) with a small patch in
   `src/devices/dobot/pydobot_patch.py`. The vendor SDK (DobotDll) is **not** used and
   is not included in this repository.
-- **CAD models and documentation** (`cad/`, `docs/`): Creative Commons Attribution 4.0
+- **CAD models and documentation** (`cad/`, `docs/`, `knowledge/`): Creative Commons Attribution 4.0
   (CC BY 4.0, https://creativecommons.org/licenses/by/4.0/); the CAD-specific notes are in
   [`cad/README.md`](cad/README.md).
 - **Object detection** (`detection/`): depends on [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics),
@@ -176,6 +197,12 @@ damage to equipment, loss of samples or data, or any other loss arising from its
 
 ## Citing
 
-If you use SAIGEN, please cite the software using the metadata in
-[`CITATION.cff`](CITATION.cff) (GitHub's "Cite this repository" button). A paper
-citation will be added once the manuscript above is published.
+If you use SAIGEN, please cite the paper:
+
+> Y. Hashimoto, T. Muramoto, H. Terada, H. Song, Y. Wang, T. Tomai,
+> *Science and Technology of Advanced Materials: Methods*, in press (2026).
+> https://doi.org/10.1080/27660400.2026.2756911
+
+The DOI becomes active when the paper is published. The software itself can be cited
+with the metadata in [`CITATION.cff`](CITATION.cff) (GitHub's "Cite this repository"
+button, which offers the paper as the preferred citation).

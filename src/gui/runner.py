@@ -67,7 +67,8 @@ __all__ = ["FlowRunner", "PreflightError", "SafetyAbort", "ProgressEvent",
            "_safety_gate"]
 
 #: Robots the sidebar offers. Robot 3 is the slider/conveyer arm; robot 4 is
-#: the optional Hiwonder MaxArm (``type: maxarm`` in config.yaml).
+#: the optional Hiwonder MaxArm (``type: maxarm`` in config.yaml); robot 5 the
+#: optional Dobot MG400 (``type: mg400``).
 ROBOT_IDS = tuple(range(1, MAX_ROBOT_ID + 1))
 
 
@@ -257,6 +258,7 @@ def default_device_settings() -> dict:
             "dobot_port": rp.get("dobot_port", "") or "",
             "picus2_port": picus2,
             "maxarm_port": rp.get("maxarm_port", "") or "",
+            "mg400_address": rp.get("mg400_address", "") or "",
         }
     return {
         "robots": robots,
@@ -281,6 +283,11 @@ def settings_to_session_args(settings: dict):
     connection settings come from ``config.yaml`` as well. Sidebar ports are
     used only when the sidebar type matches the configured type.
 
+    The shared-device settings start from ``config.yaml`` as well and only the
+    fields the sidebar edits (``scale_port``, ``camera_index``) are overlaid, so
+    the microscope and DMM settings, which have no sidebar field, still reach
+    the devices.
+
     Returns:
         ``(robot_ports, shared_config)`` in the shape ExperimentSession expects.
     """
@@ -297,11 +304,14 @@ def settings_to_session_args(settings: dict):
             logger.warning(f"Robot {rid}: sidebar type {cfg.get('type')!r} and its ports "
                            f"ignored; config.yaml says {rtype!r} (its ports are used)")
         entry = {k: v for k, v in base.items()
-                 if k not in ("dobot_port", "picus2_address", "maxarm_port")}
+                 if k not in ("dobot_port", "picus2_address", "maxarm_port", "mg400_address")}
         entry["type"] = rtype
         if rtype == "maxarm":
             entry["maxarm_port"] = (base.get("maxarm_port", "") if stale
                                     else cfg.get("maxarm_port", base.get("maxarm_port", "")))
+        elif rtype == "mg400":
+            entry["mg400_address"] = (base.get("mg400_address", "") if stale
+                                      else cfg.get("mg400_address", base.get("mg400_address", "")))
         elif stale:
             entry["dobot_port"] = base.get("dobot_port", "")
             entry["picus2_address"] = base.get("picus2_address", "") or ""
@@ -311,11 +321,25 @@ def settings_to_session_args(settings: dict):
                                        if cfg.get("use_picus2", True) else "")
         robot_ports[int(rid)] = entry
     shared = settings.get("shared") or {}
-    shared_config = {
-        "scale_port": shared.get("scale_port", ""),
-        "camera_index": int(shared.get("camera_index", 0) or 0),
-    }
+    shared_config = dict(lab_config.get_shared_devices())
+    shared_config["scale_port"] = shared.get("scale_port", shared_config.get("scale_port", ""))
+    shared_config["camera_index"] = int(
+        shared.get("camera_index", shared_config.get("camera_index", 0)) or 0)
     return robot_ports, shared_config
+
+
+def change_dmm_function(step: dict, function: str) -> dict:
+    """Set a ``measure_dmm`` step's function and drop its fixed range.
+
+    A range is in the unit of the function (V, A or Ohm), so a value kept across a
+    change of function is meaningless and usually out of bounds (20 V -> 20 A),
+    which would leave the step invalid and read-only in the GUI. The step falls
+    back to autorange; the user sets a new fixed range if needed.
+    """
+    if step.get("function", "dc_voltage") != function:
+        step.pop("range", None)
+    step["function"] = function
+    return step
 
 
 # ======================================================================
@@ -414,6 +438,7 @@ class FlowRunner:
         robot_factory: Optional[Callable] = None,
         shared_factory: Optional[Callable] = None,
         recording: Optional[dict] = None,
+        confirmed_robots=(),
     ):
         # Validation happens here: an invalid flow raises before anything is
         # built, so no ExperimentSession and no run folder are ever created.
@@ -423,7 +448,20 @@ class FlowRunner:
         # PreflightError here, before a session or run folder exists.
         self.validator = default_workspace_validator()
         self.preflight = require_preflight(self.steps, self.validator, log=logger,
-                                           robot_ports=robot_ports)
+                                           robot_ports=robot_ports, shared_config=shared_config)
+        # The MG400's confirmation (flow plan F7) is evidence handed in by the caller: the
+        # robot ids the GUI's confirmation dialog showed and the human approved. A real run
+        # that uses an MG400 without it is refused here, before a session or run folder exists.
+        self.confirmed_robots = frozenset(int(r) for r in (confirmed_robots or ()))
+        if not mock:
+            used = plan_resources(self.steps).robot_ids
+            unconfirmed = [rid for rid in used
+                           if self.preflight.robot_types.get(rid) == "mg400" and rid not in self.confirmed_robots]
+            if unconfirmed:
+                raise PreflightError(
+                    self.preflight,
+                    f"Robot {unconfirmed}（MG400）の実機ランは確認ダイアログで承認されていません"
+                    f"（confirmed_robots）。実行は行いません")
         self.recording = recording
 
         self.workflow_data = workflow_data
@@ -570,9 +608,8 @@ class FlowRunner:
 
         steps = self.steps
         total = len(steps)
-        (robot_ids, picus2_robots, needs_scale, needs_camera,
-         needs_microscope, needs_microscope_serial) = plan_resources(steps)
-        needs_daq = plan_daq(steps)
+        plan = plan_resources(steps)
+        robot_ids, picus2_robots = plan.robot_ids, plan.picus2_robots
 
         exp_logger = ExperimentLogger(
             self.workflow.name,
@@ -618,7 +655,12 @@ class FlowRunner:
             shared_config=self.shared_config,
             workspace_validator=self.validator,
             robot_validators=self.preflight.validators_by_robot,
+            record_root=exp_logger.dir,
         )
+        for rid in sorted(self.confirmed_robots):
+            # the confirmation dialog's approval (app.py confirm_real_run_dialog ->
+            # start_run(mock=False, confirmed_robots=...)), never inferred from the mode
+            session.confirm_robot(rid)
         with self._lock:
             self.session = session
 
@@ -632,12 +674,8 @@ class FlowRunner:
             for rid in robot_ids:
                 await session.add_robot(rid, use_picus2=(rid in picus2_robots))
                 check_stop()
-            if (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
-                    or needs_daq):
-                await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
-                                         use_microscope=needs_microscope,
-                                         use_microscope_serial=needs_microscope_serial,
-                                         use_daq=needs_daq)
+            if plan.needs_shared:
+                await session.add_shared(**plan.shared_kwargs())
 
             for i, step in enumerate(steps, 1):
                 # Cancellation is checked between steps as well, so a Stop
@@ -671,12 +709,20 @@ class FlowRunner:
                 except Exception as step_err:
                     duration = time.monotonic() - t0
                     exp_logger.record_step(i, total, action, rid, iteration,
-                                           "error", duration, error=str(step_err))
+                                           "error", duration, error=str(step_err),
+                                           diagnostics=getattr(step_err, "diagnostics", None))
                     self._emit(ProgressEvent(
                         kind="step", index=i, total=total, action=action, robot_id=rid,
                         iteration=iteration, status="error", duration=duration,
                         error=str(step_err),
                     ))
+                    raise
+                except BaseException as step_interrupt:
+                    # Stop / Ctrl+C: record what was known as an aborted step, then re-raise
+                    exp_logger.record_step(i, total, action, rid, iteration,
+                                           "aborted", time.monotonic() - t0,
+                                           error="中断",
+                                           diagnostics=getattr(step_interrupt, "diagnostics", None))
                     raise
                 duration = time.monotonic() - t0
                 exp_logger.record_step(i, total, action, rid, iteration,
@@ -710,6 +756,8 @@ class FlowRunner:
                 accuracy_logger.finalize(logger)
             except Exception:  # noqa: BLE001
                 pass
+            exp_logger.record_output_restore(session.output_restore_report())
+            exp_logger.record_robot_reports(session.robot_reports)
             exp_logger.finalize(session.status, session.error)
             root_logger.removeHandler(handler)
             root_logger.setLevel(previous_level)

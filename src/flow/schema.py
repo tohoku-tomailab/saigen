@@ -6,6 +6,8 @@ from typing import Annotated, Literal, Union, List, Optional
 # DAQ のチャンネル名の検査（ハードウェアにも nidaqmx にも依存しない）
 from src.devices.nidaq.policy import check_flow_name, physical_kind
 
+from src.devices.keithley2002.keithley2002 import FUNCTIONS as DMM_FUNCTIONS, NPLC_MAX, NPLC_MIN
+
 # ==========================================
 # 0. 共通の基底モデル
 # ==========================================
@@ -16,10 +18,10 @@ from src.devices.nidaq.policy import check_flow_name, physical_kind
 PIPETTE_MIN_VOLUME_ML = 0.5
 #: ピペットの最大容量 (mL)。LabRobot.max_pipette_volume と同じ。
 PIPETTE_MAX_VOLUME_ML = 10.0
-#: robot_id の上限。1〜3 は Dobot Magician、4 は任意の Hiwonder MaxArm
-#: （config.yaml の robots.<id>.type で種別を決める）。ロボットが実際に
+#: robot_id の上限。1〜3 は Dobot Magician、4 は任意の Hiwonder MaxArm、5 は任意の
+#: Dobot MG400（config.yaml の robots.<id>.type で種別を決める）。ロボットが実際に
 #: そのアクションを実行できるかは run_flow.preflight_capabilities が検査する。
-MAX_ROBOT_ID = 4
+MAX_ROBOT_ID = 5
 
 
 class _StrictModel(BaseModel):
@@ -55,7 +57,7 @@ class ActionMoveXYZ(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionMoveZ(_StrictModel):
@@ -75,7 +77,7 @@ class ActionMoveZ(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionRotate(_StrictModel):
@@ -95,7 +97,7 @@ class ActionRotate(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionRotateRelative(_StrictModel):
@@ -119,7 +121,7 @@ class ActionRotateRelative(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionMoveRadial(_StrictModel):
@@ -141,7 +143,7 @@ class ActionMoveRadial(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionGoHome(_StrictModel):
@@ -157,7 +159,7 @@ class ActionGoHome(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 # ==========================================
@@ -183,7 +185,7 @@ class ActionMoveSlider(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionMoveConveyer(_StrictModel):
@@ -217,7 +219,7 @@ class ActionMoveConveyer(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionWait(_StrictModel):
@@ -238,7 +240,7 @@ class ActionWait(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 # ==========================================
@@ -274,7 +276,7 @@ class ActionAspirate(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionDispense(_StrictModel):
@@ -306,7 +308,7 @@ class ActionDispense(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 class ActionBlowOut(_StrictModel):
@@ -340,7 +342,7 @@ class ActionBlowOut(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)"
+        description="操作対象のロボットID (1..5)"
     )
 
 # ==========================================
@@ -367,7 +369,7 @@ class ActionSuction(_StrictModel):
         default=1,
         ge=1,
         le=MAX_ROBOT_ID,
-        description="操作対象のロボットID (1..4)。MaxArm の robot_id を指定する"
+        description="操作対象のロボットID (1..5)。MaxArm の robot_id を指定する"
     )
 
 # ==========================================
@@ -482,6 +484,184 @@ class ActionMicroscopeFocus(_StrictModel):
     def _position_required_for_position_mode(self):
         if self.mode == "position" and self.position is None:
             raise ValueError("microscope_focus: mode='position' には position (0-65535) が必要です")
+        return self
+
+# ==========================================
+# 1.65 個別のアクション定義 (共有デバイス: Keithley 2002 DMM)
+# ==========================================
+
+class ActionMeasureDMM(_StrictModel):
+    """
+    Keithley 2002 デジタルマルチメータ（GPIB）で測定
+    SharedDevices.measure_dmm(function, samples, nplc, range_) に対応
+
+    結果は measurements.csv の dmm_value / dmm_unit / dmm_function / dmm_range /
+    dmm_nplc / dmm_valid_samples 列に記録される。
+    config.yaml の shared_devices.dmm_resource（例 GPIB0::16::INSTR）が必要。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["measure_dmm"] = Field(
+        ...,
+        description="アクション識別子: DMM 測定"
+    )
+    function: Literal["dc_voltage", "ac_voltage", "dc_current", "ac_current",
+                      "resistance_2w", "resistance_4w"] = Field(
+        default="dc_voltage",
+        description="測定機能: 直流/交流電圧 (V)、直流/交流電流 (A)、2線式/4線式抵抗 (Ohm)"
+    )
+    samples: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="測定回数（有効値の中央値を記録）"
+    )
+    nplc: float = Field(
+        default=1.0,
+        ge=NPLC_MIN,
+        le=NPLC_MAX,
+        description="積分時間（電源周期の倍数）。大きいほど低ノイズで遅い"
+    )
+    range: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="固定レンジ（その機能の単位）。省略でオートレンジ"
+    )
+
+    @model_validator(mode="after")
+    def _range_within_function_limit(self):
+        _, unit, max_range = DMM_FUNCTIONS[self.function]
+        if self.range is not None and self.range > max_range:
+            raise ValueError(f"measure_dmm: {self.function} のレンジは {max_range:g} {unit} 以下です"
+                             f"（指定 {self.range:g}）")
+        return self
+
+# ==========================================
+# 1.66 個別のアクション定義 (共有デバイス: NF LI5640 ロックインアンプ)
+# ==========================================
+
+class ActionMeasureLockin(_StrictModel):
+    """
+    NF LI5640 ロックインアンプ（GPIB）のパネル表示値を読む（読み取り専用）
+    SharedDevices.measure_lockin(samples, interval) に対応
+
+    感度・時定数・表示（X/Y、R/θ など）は前面パネルで設定する。結果は
+    measurements.csv の lockin_* 列（DATA1 / DATA2 の値・種類・単位、参照周波数、
+    感度、時定数、有効サンプル数、パネル設定）に記録される。
+    config.yaml の shared_devices.lockin_resource が必要。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["measure_lockin"] = Field(
+        ...,
+        description="アクション識別子: ロックインアンプの読み取り"
+    )
+    samples: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="読み取り回数（有効サンプルの中央値を記録）"
+    )
+    interval: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=60.0,
+        description="読み取りの間隔（秒）。整定待ちではない"
+    )
+
+class ActionSetLockinOscillator(_StrictModel):
+    """
+    NF LI5640 の内部発振器（OSC OUT）の周波数と振幅を設定する
+    SharedDevices.set_lockin_oscillator(frequency, amplitude, settle) に対応
+
+    config.yaml の shared_devices.lockin_osc_max_vrms が 0 より大きいときだけ使える
+    （既定 0 = 無効。OSC OUT につないだ負荷に合わせて研究室が決める）。振幅は
+    接続時のレンジのまま（SAIGEN はレンジを切り替えない）。1 コマンドずつ書いて
+    読み返す。ランの終わり（失敗・中断を含む）に接続時の値へ戻す。結果は
+    measurements.csv の lockin_osc_* 列に記録される。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["set_lockin_oscillator"] = Field(
+        ...,
+        description="アクション識別子: ロックインアンプの内部発振器の設定"
+    )
+    frequency: float = Field(
+        ...,
+        ge=0.0005,
+        le=105000.0,
+        description="周波数 [Hz]（4 1/2 桁、最大 19999 カウントで表せる値）"
+    )
+    amplitude: float = Field(
+        ...,
+        ge=0.0,
+        le=5.0,
+        description="振幅 [Vrms]（接続時のレンジで表せる値。config の上限以下）"
+    )
+    settle: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=600.0,
+        description="設定を読み返して確かめた後に待つ秒数（待つだけで、整定は保証しない）"
+    )
+
+# ==========================================
+# 1.67 個別のアクション定義 (共有デバイス: Agilent 1000 シリーズ オシロスコープ)
+# ==========================================
+
+ScopeItem = Literal["vpp", "vmax", "vmin", "vamplitude", "vtop", "vbase", "vaverage", "vrms",
+                    "frequency", "period", "risetime", "falltime", "pwidth", "nwidth",
+                    "pdutycycle", "ndutycycle", "overshoot", "preshoot"]
+
+
+class ActionMeasureScope(_StrictModel):
+    """
+    Agilent 1000 シリーズ（DSO1014A など）オシロスコープの自動測定値を読む（読み取り専用）
+    SharedDevices.measure_scope(channel, items, samples, interval) に対応
+
+    垂直・水平・トリガ・取り込みの設定は前面パネルで行う。結果は measurements.csv の
+    scope_* 列（項目ごとの値・単位・有効回数の JSON、パネル設定）に記録される。
+    config.yaml の shared_devices.scope_resource が必要。
+
+    Note:
+        共有デバイスのため、robot_idは不要です。
+    """
+    action: Literal["measure_scope"] = Field(
+        ...,
+        description="アクション識別子: オシロスコープの自動測定値の読み取り"
+    )
+    channel: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="測るチャネル（2 チャネル機では 1〜2）"
+    )
+    items: List[ScopeItem] = Field(
+        default_factory=lambda: ["vpp", "frequency"],
+        min_length=1,
+        max_length=10,
+        description="読む測定項目（重複なし）"
+    )
+    samples: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="読み取り回数（項目ごとに有効値の中央値を記録）。取り込みの回数ではない"
+    )
+    interval: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=60.0,
+        description="読み取りの間隔（秒）"
+    )
+
+    @model_validator(mode="after")
+    def _items_unique(self):
+        if len(set(self.items)) != len(self.items):
+            raise ValueError(f"measure_scope: items が重複しています: {self.items}")
         return self
 
 # ==========================================
@@ -1639,6 +1819,10 @@ LabRobotAction = Union[
     ActionDaqStartEncoder,
     ActionDaqReadEncoder,
     ActionDaqStopEncoder,
+    ActionMeasureDMM,
+    ActionMeasureLockin,
+    ActionSetLockinOscillator,
+    ActionMeasureScope,
     # ユーティリティ
     ActionWait,
     # ループ制御

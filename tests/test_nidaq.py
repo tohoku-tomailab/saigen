@@ -556,7 +556,11 @@ def test_plan_daq_and_no_robot_for_a_daq_only_flow():
     assert run_flow.plan_daq(steps) is True
     assert run_flow.plan_daq([{"action": "measure_weight"}]) is False
     plan = run_flow.plan_resources(steps)
-    assert len(plan) == 6 and plan[0] == [] and not any(plan[2:])
+    assert plan.robot_ids == [] and plan.needs_daq is True and plan.needs_shared is True
+    assert plan.shared_kwargs()["use_daq"] is True and "DAQ" in plan.shared_labels()
+    assert not (plan.needs_scale or plan.needs_camera or plan.needs_dmm or plan.needs_scope)
+    other = run_flow.plan_resources([{"action": "measure_weight"}])
+    assert other.needs_daq is False and "use_daq" not in other.shared_kwargs()
 
 
 def test_resolve_ports_daq_device(monkeypatch):

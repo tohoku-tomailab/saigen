@@ -54,7 +54,7 @@ SYSTEM_PROMPT = """
 {"name": "名前", "description": "説明", "steps": [...]}
 
 ## ロボットID（robot_id）について
-- システムには3台のDobotロボットアームと、任意で1台のMaxArmがあります
+- システムには3台のDobotロボットアームと、任意で1台のMaxArm、任意で1台のDobot MG400があります
   - Robot 1 (robot_id: 1): メインロボット。コンベアベルトもRobot 1が制御
   - Robot 2 (robot_id: 2): サブロボット
   - Robot 3 (robot_id: 3): スライダーレール上のロボット。ピペットなし
@@ -63,7 +63,11 @@ SYSTEM_PROMPT = """
     （rotate_relative, move_radial, aspirate, dispense, blow_out, move_slider, move_conveyer は使えない）。
     座標は MaxArm 自身の座標系（mm、原点は台座の回転軸、アームはホームで -Y 方向を向く）で、
     Dobot の座標とは別物。ユーザーが MaxArm / 吸着 / ピック＆プレースを指示したときだけ使う
-- 各ステップに "robot_id": 1, 2, 3, または 4 を指定します
+  - Robot 5 (robot_id: 5): 任意の Dobot MG400（TCP/IP）。ピペット・吸着なし。
+    使えるアクションは move_xyz / move_z / go_home / wait だけ。座標は MG400 の基準座標系
+    （mm、原点は台座、フランジの位置）で、Dobot Magician の座標とは別物。1 回の移動は 50 mm 以内。
+    ユーザーが MG400 を指示したときだけ使う
+- 各ステップに "robot_id": 1, 2, 3, 4, または 5 を指定します
 - 指定がない場合やデフォルトは robot_id: 1 です
 
 ## 利用可能なアクション
@@ -125,6 +129,16 @@ SYSTEM_PROMPT = """
 - daq_start_encoder: {"action": "daq_start_encoder", "a": "pfi8", "b": "pfi10", "pulses_per_rev": 360} (ロータリーエンコーダの追従を 0° から開始。任意: "decoding": "x1"/"x2"/"x4")
 - daq_read_encoder: {"action": "daq_read_encoder"} (追従開始からの回転角を度で記録)
 - daq_stop_encoder: {"action": "daq_stop_encoder"} (エンコーダの追従を終了)
+
+### デジタルマルチメータ操作（Keithley 2002, GPIB）※共有デバイスのためrobot_id不要
+- measure_dmm: {"action": "measure_dmm", "function": "dc_voltage", "samples": 3, "nplc": 1.0} (DMM 測定。function: "dc_voltage"/"ac_voltage" (V), "dc_current"/"ac_current" (A), "resistance_2w"/"resistance_4w" (Ohm)。samples: 1-10 回の中央値, nplc: 0.01-50 (大きいほど低ノイズで遅い), range: 固定レンジ (省略でオートレンジ))
+
+### ロックインアンプ（NF LI5640, GPIB, 読み取り専用）※共有デバイスのためrobot_id不要
+- measure_lockin: {"action": "measure_lockin", "samples": 5, "interval": 0.0} (パネル表示の DATA1 / DATA2 と参照周波数を読む。感度・時定数・表示は前面パネルで設定し、フローからは変えない。samples: 1-100 回の中央値, interval: 読み取り間隔 0-60 秒 (整定待ちではない))
+- set_lockin_oscillator: {"action": "set_lockin_oscillator", "frequency": 100.0, "amplitude": 0.1, "settle": 1.0} (LI5640 の内部発振器 OSC OUT の周波数 [Hz] と振幅 [Vrms] を設定する。config.yaml の lockin_osc_max_vrms が 0 なら使えない (既定)。振幅は上限以下で、接続時のレンジ (0.05 / 0.5 / 5 V) の刻みで表せる値。周波数は 4 1/2 桁 (最大 19999 カウント)。settle: 設定後に待つ秒数 0-600。ランの終わりに接続時の値へ戻る。ユーザーが明示的に頼んだときだけ使う)
+
+### オシロスコープ（Agilent 1000 シリーズ, USB, 読み取り専用）※共有デバイスのためrobot_id不要
+- measure_scope: {"action": "measure_scope", "channel": 1, "items": ["vpp", "frequency"], "samples": 3, "interval": 0.5} (前面パネルで設定した波形の自動測定値を読む。設定はフローから変えない。channel: 1-4, items: vpp/vmax/vmin/vamplitude/vtop/vbase/vaverage/vrms (V), frequency (Hz), period/risetime/falltime/pwidth/nwidth (s), pdutycycle/ndutycycle/overshoot/preshoot (%) から 1-10 個, samples: 1-20 回の中央値, interval: 0-60 秒)
 
 ### ユーティリティ
 - wait: {"action": "wait", "robot_id": 1, "seconds": 2.0}

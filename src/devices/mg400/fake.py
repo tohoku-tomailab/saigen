@@ -1,0 +1,515 @@
+"""A fake MG400 controller for ``--mock`` and the tests (loopback only, no hardware).
+
+It listens on 127.0.0.1 only: a Dashboard port answering the read-only queries and the
+control commands of the jog tool, a motion port accepting ``JointMovJ`` (the arm "moves":
+the angles are interpolated over ``move_s`` with mode 7, then mode 5), and a feedback port
+streaming 1440-byte packets every ``period_s``. Every received command is recorded, so
+tests can assert what was sent, and on which port.
+
+Knobs for the robot wrapper's mock and tests (flow plan stage two): ``ik_model`` (InverseSolution
+and MovL work from the planar model of ``fk``, consistent with itself only), ``ack_no_motion``
+(a motion command is acknowledged and nothing moves).
+
+Knobs for the joint-tracking tests (tracking plan): feedback packets carry ``q_target`` (the
+angles GetAngle answers) and ``q_actual``; ``sag={joint: deg}`` offsets ``q_actual`` only while
+enabled (modes 5 and 7), as J2 was in stage C1's jog_07; ``settle=(joint, deg, seconds)`` offsets
+``q_actual`` after each move's end, decaying linearly to 0 (a healthy arm settling);
+``getangle_offset={joint: deg}`` offsets the GetAngle answer only; ``feedback_mode`` replaces the
+RobotMode in the packets (None: the fake's own mode); ``feedback_error_status`` replaces their
+error_status. All may be set at any time. (``settle`` is linear, not the first-order lag the
+tracking plan named: it exercises the same settle-and-retry path.)
+
+Kinematics (fake-kinematics plan): ``kinematics="standin"`` (default) is the smooth stand-in
+of ``fk`` (not the MG400's); ``"fitted_planar_v1"`` is a fitted planar approximation to one
+controller's PositiveSolution answers (record ``observe_c2_rest``, 2026-11-04: 13 joint sets,
+J2 / J3 in about -22..30 deg), intended for use near those joints; its accuracy between and
+beyond the samples is unverified, and it is still a fake. Both have the same form
+(``planar_fk``); ``model_fk`` / ``ik`` follow the instance's model.
+
+Knobs for the jog tool's tests: ``enable_s`` (how long EnableRobot takes to show mode 5;
+None = never), ``stuck_running`` (a move never ends: mode stays 7), ``refuse_motion``
+(JointMovJ answers ErrorID -1), ``disable_fails`` (DisableRobot is answered but the mode
+stays), ``alarm_on_move`` (the first move raises an alarm: mode 9).
+"""
+import math
+import socket
+import threading
+import time
+from typing import List, Optional
+
+from . import feedback
+
+LOOPBACK = "127.0.0.1"
+
+#: (L0, H, L1, L2) of r = L0 + L1 sin J2 + L2 cos J3, z = H + L1 cos J2 - L2 sin J3,
+#: x = r cos J1, y = r sin J1, R = J1 + J4
+KINEMATICS = {
+    "standin": (200.0, 100.0, 175.0, 175.0),               # not the MG400's kinematics
+    # least-squares fit to the 13 PositiveSolution answers of record observe_c2_rest
+    # (2026-11-04), every answer reproduced within 0.00003 mm; not Dobot's published model
+    "fitted_planar_v1": (109.5, -53.0, 174.2076, 175.0707),
+}
+J2_RANGE, J3_RANGE = (-25.0, 85.0), (-25.0, 105.0)
+
+
+def planar_fk(model, j):
+    l0, h, l1, l2 = model
+    r = l0 + l1 * math.sin(math.radians(j[1])) + l2 * math.cos(math.radians(j[2]))
+    z = h + l1 * math.cos(math.radians(j[1])) - l2 * math.sin(math.radians(j[2]))
+    a = math.radians(j[0])
+    return [r * math.cos(a), r * math.sin(a), z, j[0] + j[3]]
+
+
+def planar_ik(model, x, y, z):
+    """[J1, J2, J3] of ``planar_fk`` (one elbow branch), or None: beyond the annulus
+    |L1 - L2| .. L1 + L2, or J2 / J3 outside J2_RANGE / J3_RANGE (no clipping, no other branch).
+    Link angles from the vertical: t1 = J2 (link L1), t2 = J3 + 90 (link L2)"""
+    l0, h, l1, l2 = model
+    j1 = math.degrees(math.atan2(y, x))
+    a, b = math.hypot(x, y) - l0, z - h
+    d = math.hypot(a, b)
+    if d == 0.0 or d > l1 + l2 or d < abs(l1 - l2):
+        return None
+    phi = math.degrees(math.atan2(a, b))
+    if l1 == l2:                                           # the stand-in: today's expressions
+        c1 = c2 = math.degrees(math.acos(d / (l1 + l2)))
+    else:
+        c1 = math.degrees(math.acos(max(-1.0, min(1.0, (l1 * l1 + d * d - l2 * l2) / (2 * l1 * d)))))
+        c2 = math.degrees(math.acos(max(-1.0, min(1.0, (l2 * l2 + d * d - l1 * l1) / (2 * l2 * d)))))
+    j2 = phi - c1
+    j3 = (phi + c2) - 90.0
+    if not (J2_RANGE[0] <= j2 <= J2_RANGE[1] and J3_RANGE[0] <= j3 <= J3_RANGE[1]):
+        return None
+    return [j1, j2, j3]
+
+
+class FakeMG400:
+    def __init__(self, mode: int = 4, pose=(308.141606, 0.384430, 67.673470, 18.632881),
+                 angles=(0.071847, 10.278645, 16.846972, 18.555908, 0.0, 0.0),
+                 errors: Optional[list] = None, period_s: float = 0.008,
+                 split_replies: bool = False, echo_bare=(), single_dashboard: bool = False,
+                 enable_s: Optional[float] = 0.2, move_s: float = 0.6, stuck_running: bool = False,
+                 refuse_motion: bool = False, disable_fails: bool = False,
+                 alarm_on_move: bool = False, reset_fails: bool = False,
+                 alarm_keeps_moving: bool = False, ik_model: bool = False,
+                 ack_no_motion: bool = False, kinematics: str = "standin"):
+        if kinematics not in KINEMATICS:
+            raise ValueError(f"unknown fake kinematics {kinematics!r} (known: {', '.join(KINEMATICS)})")
+        self.kinematics = kinematics
+        self.mode = mode
+        self.pose = list(pose)
+        self.angles = list(angles)
+        self.errors = errors if errors is not None else [[], [], [], [], [], []]
+        self.period_s = period_s
+        self.split_replies = split_replies
+        self.echo_bare = set(echo_bare)            # names echoed without their parameters
+        self.received: List[str] = []
+        self.received_on: List[tuple] = []        # (Dashboard connection number from 1, cmd)
+        self.motion_received: List[str] = []      # commands received on the motion port
+        self.enable_s, self.move_s = enable_s, move_s
+        self.stuck_running, self.refuse_motion = stuck_running, refuse_motion
+        self.disable_fails, self.alarm_on_move = disable_fails, alarm_on_move
+        self.reset_fails, self.alarm_keeps_moving = reset_fails, alarm_keeps_moving
+        self.ack_lost: set = set()                # command names: executed, then the connection closes instead of replying (once each)
+        # the robot wrapper's fake (flow plan stage two): InverseSolution answers from the same
+        # planar model as fk() (consistent with itself, not with the arm) and refuses what the
+        # model cannot reach; MovL is accepted and the pose moves in a straight line over move_s
+        self.ik_model = ik_model
+        self.ack_no_motion = ack_no_motion        # MovL / JointMovJ answered 0, then nothing moves (mode stays 5)
+        self.sag: dict = {}                       # tracking knobs (see the module docstring)
+        self.settle: Optional[tuple] = None
+        self.getangle_offset: dict = {}
+        self.feedback_mode: Optional[int] = None
+        self.feedback_error_status: Optional[int] = None
+        self._move_end_t: Optional[float] = None
+        self.movl_received: List[str] = []
+        self._move_gen = 0                        # a Reset / Disable ends the current move
+        self.moves: List[list] = []               # targets the fake started moving to
+        self.on_command = None                    # hook(cmd) called before a Dashboard reply
+        self.drop_on: set = set()                 # command names: close the connection instead of replying (once each)
+        # True: a new Dashboard connection closes the previous one (as the bench controller
+        # appeared to do), then sets ``dropped``
+        self.single_dashboard = single_dashboard
+        self.dropped = threading.Event()
+        self.conn_number = threading.local()       # .n: the connection whose command reply() answers
+        self._dashboard_conns: List[socket.socket] = []
+        self._silenced: set = set()
+        self.feedback_bytes_received = 0
+        self.hold_replies = threading.Event()      # set: replies wait until cleared
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._threads: List[threading.Thread] = []
+        self._socks: List[socket.socket] = []
+        self._feedback_conns: List[socket.socket] = []
+        self.dashboard_port = self._listen(self._serve_dashboard)
+        self.feedback_port = self._listen(self._serve_feedback)
+        self.motion_port = self._listen(self._serve_motion)
+
+    # -- lifecycle --------------------------------------------------------
+    def _listen(self, handler) -> int:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((LOOPBACK, 0))
+        srv.listen(8)
+        srv.settimeout(0.1)
+        self._socks.append(srv)
+        t = threading.Thread(target=self._accept, args=(srv, handler), daemon=True)
+        t.start()
+        self._threads.append(t)
+        return srv.getsockname()[1]
+
+    def _accept(self, srv, handler):
+        while not self._stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except (socket.timeout, OSError):
+                continue
+            self._socks.append(conn)
+            threading.Thread(target=handler, args=(conn,), daemon=True).start()
+
+    def drop_feedback(self):
+        """Close every feedback connection (the tool sees the feed end)"""
+        for c in list(self._feedback_conns):
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+                c.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self._stop.set()
+        for s in self._socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # -- Dashboard --------------------------------------------------------
+    def _serve_dashboard(self, conn):
+        with self._lock:
+            older = list(self._dashboard_conns)
+            self._dashboard_conns.append(conn)
+            self.conn_number.n = len(self._dashboard_conns)
+        number = self.conn_number.n
+        if self.single_dashboard and older:
+            for c in older:
+                # end of stream for the client (what the bench run saw); whatever it still
+                # sends is read and dropped, so it never sees a reset
+                self._silenced.add(c)
+                try:
+                    c.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            self.dropped.set()
+        conn.settimeout(0.1)
+        buf = ""
+        while not self._stop.is_set():
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not data:
+                return
+            if conn in self._silenced:
+                continue
+            buf += data.decode("ascii", "replace")
+            while ")" in buf:
+                # a command ends at its only ")" (the allowed ones have no nested parentheses)
+                cmd, buf = buf[:buf.index(")") + 1].strip(), buf[buf.index(")") + 1:]
+                with self._lock:
+                    self.received.append(cmd)
+                    self.received_on.append((number, cmd))
+                while self.hold_replies.is_set() and not self._stop.is_set():
+                    time.sleep(0.01)
+                if self.on_command is not None:
+                    self.on_command(cmd)
+                if cmd.split("(", 1)[0] in self.drop_on:
+                    self.drop_on.discard(cmd.split("(", 1)[0])
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    return
+                reply = self.reply(cmd).encode("ascii")
+                if cmd.split("(", 1)[0] in self.ack_lost:
+                    self.ack_lost.discard(cmd.split("(", 1)[0])
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    return
+                try:
+                    if self.split_replies and len(reply) > 4:
+                        conn.sendall(reply[:3])
+                        time.sleep(0.005)
+                        conn.sendall(reply[3:])
+                    else:
+                        conn.sendall(reply)
+                except OSError:
+                    return
+
+    def reply(self, cmd: str) -> str:
+        name = cmd.split("(", 1)[0]
+        fmt = lambda xs: ",".join(f"{x:.6f}" for x in xs)
+        if name == "RobotMode":
+            return f"0,{{{self.mode}}},{cmd};"
+        if name == "GetErrorID":
+            inner = ",\n\t".join("[" + ",".join(str(i) for i in e) + "]" for e in self.errors)
+            return f"0,{{[\n\t{inner}\n]\n}},GetErrorID();"
+        if name == "GetPose":
+            return f"0,{{{fmt(self.pose)}}},GetPose();"
+        if name == "GetAngle":
+            angles = list(self.angles)
+            for j, d in dict(self.getangle_offset).items():
+                angles[j - 1] += d
+            return f"0,{{{fmt(angles)}}},GetAngle();"
+        if name == "PositiveSolution":
+            j = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
+            return f"0,{{{fmt(self.model_fk(j))}}},{cmd};"
+        if name == "InverseSolution":
+            # the bench controller refused the joint-near form with -20000 (its record); that
+            # it answers the six-parameter form is this fake's assumption, with the current
+            # joint angles standing in for the nearest solution
+            if "{" in cmd or cmd.count(",") != 5:
+                return f"-20000,{{}},{cmd};"
+            if self.ik_model:
+                x, y, z, r = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
+                joints = self.ik(x, y, z, r)
+                if joints is None:
+                    return f"-1,{{}},{cmd};"           # unreachable in this fake's model (not a guide value)
+                return f"0,{{{fmt(joints)}}},{name + '()' if name in self.echo_bare else cmd};"
+            return f"0,{{{fmt(self.angles[:4])}}},{name + '()' if name in self.echo_bare else cmd};"
+        if name == "EnableRobot":
+            self._end_move()
+            if self.enable_s is not None and self.mode == 4:
+                threading.Thread(target=self._enable_later, daemon=True).start()
+            return f"0,{{}},{cmd};"
+        if name == "DisableRobot":
+            if self.disable_fails:                # answered, but nothing changes
+                return f"0,{{}},{cmd};"
+            self._end_move()
+            if self.mode != 9:
+                self.mode = 4
+            return f"0,{{}},{cmd};"
+        if name == "ResetRobot":
+            if self.reset_fails:                  # answered, but the arm keeps doing what it does
+                return f"0,{{}},{cmd};"
+            self._end_move()
+            if self.mode == 7:
+                self.mode = 5
+            return f"0,{{}},{cmd};"
+        if name == "EmergencyStop":
+            self._end_move()
+            self.mode = 9
+            self.errors = [[114], [], [], [], [], []]       # some alarm (not a guide value)
+            return f"0,{{}},{cmd};"
+        return f"-10000,{{}},{cmd};"
+
+    # -- control and motion (jog tool) ---------------------------------------
+    def _enable_later(self):
+        time.sleep(self.enable_s)
+        with self._lock:
+            if self.mode == 4:
+                self.mode = 5
+
+    def _end_move(self):
+        with self._lock:
+            self._move_gen += 1
+
+    def _serve_motion(self, conn):
+        conn.settimeout(0.1)
+        buf = ""
+        while not self._stop.is_set():
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not data:
+                return
+            buf += data.decode("ascii", "replace")
+            while ")" in buf:
+                cmd, buf = buf[:buf.index(")") + 1].strip(), buf[buf.index(")") + 1:]
+                with self._lock:
+                    self.received.append(cmd)
+                    self.motion_received.append(cmd)
+                try:
+                    conn.sendall(self.motion_reply(cmd).encode("ascii"))
+                except OSError:
+                    return
+
+    def motion_reply(self, cmd: str) -> str:
+        name = cmd.split("(", 1)[0]
+        if name == "MovL":
+            return self._movl_reply(cmd)
+        if name != "JointMovJ":
+            return f"-10000,{{}},{cmd};"
+        if self.refuse_motion or self.mode != 5:
+            return f"-1,{{}},{cmd};"
+        target = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
+        if self.ack_no_motion:
+            return f"0,{{}},{cmd};"               # acknowledged; the arm stays where it is
+        with self._lock:
+            self._move_gen += 1
+            gen = self._move_gen
+            self.moves.append(target)
+        threading.Thread(target=self._move, args=(target, gen), daemon=True).start()
+        return f"0,{{}},{cmd};"          # the echo keeps SpeedJ / AccJ (this fake's assumption)
+
+    def _move(self, target, gen):
+        start = list(self.angles[:4])
+        with self._lock:
+            if gen != self._move_gen:
+                return                           # a Reset / Disable raced this thread's start
+            self.mode = 7
+        if self.alarm_on_move:
+            time.sleep(0.1)
+            with self._lock:
+                if gen == self._move_gen:
+                    self.mode, self.errors = 9, [[], [23], [], [], [], []]
+            if not self.alarm_keeps_moving:
+                return
+            # a (hypothetical) alarm that does not stop the arm: J1 keeps turning until a
+            # Reset / Disable / EmergencyStop ends this generation
+            while True:
+                time.sleep(0.02)
+                with self._lock:
+                    if gen != self._move_gen or self.mode != 9:
+                        return
+                    self.angles[0] += 0.2
+                    self.pose = self.model_fk(self.angles[:4])
+        steps = max(1, int(self.move_s / 0.02))
+        for i in range(1, steps + 1):
+            time.sleep(self.move_s / steps)
+            with self._lock:
+                if gen != self._move_gen:
+                    return                       # Reset / Disable / Enable ended this move
+                self.angles[:4] = [a + (b - a) * i / steps for a, b in zip(start, target)]
+                self.pose = self.model_fk(self.angles[:4])
+        with self._lock:
+            if gen == self._move_gen and not self.stuck_running:
+                self.mode = 5
+                self._move_end_t = time.monotonic()
+
+    def _movl_reply(self, cmd: str) -> str:
+        """``MovL(X,Y,Z,R,User=0,Tool=0,SpeedL=s,AccL=s)``: the pose moves in a straight line
+        over move_s (mode 7, then 5); the joints follow the planar model. Needs ik_model"""
+        with self._lock:
+            self.movl_received.append(cmd)
+        if self.refuse_motion or self.mode != 5 or not self.ik_model:
+            return f"-1,{{}},{cmd};"
+        pose = [float(v) for v in cmd[cmd.index("(") + 1:-1].split(",")[:4]]
+        if self.ik(*pose) is None:
+            return f"-1,{{}},{cmd};"
+        if self.ack_no_motion:
+            return f"0,{{}},{cmd};"
+        with self._lock:
+            self._move_gen += 1
+            gen = self._move_gen
+            self.moves.append(list(pose))
+        threading.Thread(target=self._move_pose, args=(pose, gen), daemon=True).start()
+        return f"0,{{}},{cmd};"          # the echo keeps every optional parameter (this fake's assumption)
+
+    def _move_pose(self, target, gen):
+        start = self.model_fk(self.angles[:4])
+        with self._lock:
+            if gen != self._move_gen:
+                return
+            self.mode = 7
+        if self.alarm_on_move:
+            time.sleep(0.1)
+            with self._lock:
+                if gen == self._move_gen:
+                    self.mode, self.errors = 9, [[], [23], [], [], [], []]
+            return
+        steps = max(1, int(self.move_s / 0.02))
+        for i in range(1, steps + 1):
+            time.sleep(self.move_s / steps)
+            pose = [a + (b - a) * i / steps for a, b in zip(start, target)]
+            joints = self.ik(*pose)
+            with self._lock:
+                if gen != self._move_gen:
+                    return
+                if joints is not None:
+                    self.angles[:4] = joints
+                self.pose = self.model_fk(self.angles[:4])
+        with self._lock:
+            if gen == self._move_gen and not self.stuck_running:
+                self.mode = 5
+                self._move_end_t = time.monotonic()
+
+    def ik(self, x, y, z, r=None):
+        """The inverse of model_fk() in the instance's model (``planar_ik``); J4 = R - J1
+        (None keeps J4). None when the model cannot reach the point or J2 / J3 leave the range.
+        Every internal caller goes through this method, so a test may replace it"""
+        j = planar_ik(KINEMATICS[self.kinematics], x, y, z)
+        if j is None:
+            return None
+        j4 = (r - j[0]) if r is not None else self.angles[3]
+        return [j[0], j[1], j[2], j4]
+
+    def model_fk(self, j):
+        """The instance's model (``kinematics``)"""
+        return planar_fk(KINEMATICS[self.kinematics], j)
+
+    @staticmethod
+    def fk(j):
+        """Not the MG400's kinematics: the stand-in, a smooth model so the tool has numbers to record"""
+        return planar_fk(KINEMATICS["standin"], j)
+
+    # -- feedback ---------------------------------------------------------
+    def packet(self) -> bytes:
+        with self._lock:                         # one snapshot: target, actual and mode agree
+            mode, target, pose = self.mode, list(self.angles), list(self.pose)
+            sag, settle, end_t = dict(self.sag), self.settle, self._move_end_t
+            fb_mode, fb_error = self.feedback_mode, self.feedback_error_status
+        actual = list(target)
+        if mode in (5, 7):
+            for j, d in sag.items():
+                actual[j - 1] += d
+            if settle is not None and end_t is not None and mode == 5:
+                j, d, seconds = settle
+                left = 1.0 - (time.monotonic() - end_t) / seconds
+                if left > 0:
+                    actual[j - 1] += d * left
+        return feedback.build(robot_mode=mode if fb_mode is None else fb_mode,
+                              timestamp_ms=int(time.time() * 1000),
+                              q_target=target, q_actual=actual, tool_vector_actual=pose + [0.0, 0.0],
+                              robot_type=1,
+                              error_status=(0 if mode != 9 else 1) if fb_error is None else fb_error)
+
+    def _serve_feedback(self, conn):
+        self._feedback_conns.append(conn)
+        while not self._stop.is_set():
+            try:
+                conn.setblocking(False)
+                data = conn.recv(4096)                   # the tool must never write here
+                if data == b"":
+                    return
+                with self._lock:
+                    self.feedback_bytes_received += len(data)
+            except BlockingIOError:
+                pass
+            except OSError:
+                return
+            finally:
+                try:
+                    conn.setblocking(True)
+                except OSError:
+                    return
+            try:
+                pkt = self.packet()
+                conn.sendall(pkt[:700])                  # split on purpose
+                conn.sendall(pkt[700:])
+            except OSError:
+                return
+            time.sleep(self.period_s)

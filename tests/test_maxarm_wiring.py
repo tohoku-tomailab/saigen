@@ -101,7 +101,7 @@ def test_unknown_robot_type_is_a_config_error(tmp_path, restore_config):
 # schema
 # ----------------------------------------------------------------------
 def test_schema_suction_and_robot_id_range():
-    assert MAX_ROBOT_ID == 4
+    assert MAX_ROBOT_ID == 5          # 5 is the optional Dobot MG400 (tests/test_mg400_wiring.py)
     wf = ExperimentWorkflow(name="t", steps=[
         {"action": "suction", "robot_id": 4},
         {"action": "suction", "robot_id": 4, "on": False},
@@ -109,12 +109,12 @@ def test_schema_suction_and_robot_id_range():
     ])
     assert wf.steps[0].on is True and wf.steps[1].on is False
     with pytest.raises(ValidationError):
-        ExperimentWorkflow(name="t", steps=[{"action": "move_z", "robot_id": 5, "distance": 1}])
+        ExperimentWorkflow(name="t", steps=[{"action": "move_z", "robot_id": 6, "distance": 1}])
     with pytest.raises(ValidationError):
         ExperimentWorkflow(name="t", steps=[{"action": "suction", "robot_id": 4, "power": 1}])
 
 
-def test_every_robot_id_field_accepts_4():
+def test_every_robot_id_field_accepts_max_robot_id():
     schema = ExperimentWorkflow.model_json_schema()
     for name, model in schema["$defs"].items():
         rid = model.get("properties", {}).get("robot_id")
@@ -170,14 +170,20 @@ def test_executor_guard_ignores_robots_without_supported_actions():
 # ----------------------------------------------------------------------
 # plan_resources / preflight
 # ----------------------------------------------------------------------
-def test_plan_resources_signature_unchanged():
-    result = run_flow.plan_resources([
+def test_plan_resources_signature():
+    # a NamedTuple read by name in every runner (it grew with each shared device)
+    plan = run_flow.plan_resources([
         {"action": "suction", "robot_id": 4}, {"action": "aspirate", "robot_id": 1},
         {"action": "measure_weight"},
     ])
-    assert len(result) == 6
-    robot_ids, picus2, scale, camera, micro, micro_serial = result
-    assert robot_ids == [1, 4] and picus2 == {1} and scale and not camera
+    assert plan._fields == ("robot_ids", "picus2_robots", "needs_scale", "needs_camera",
+                            "needs_microscope", "needs_microscope_serial", "needs_dmm",
+                            "needs_lockin", "needs_scope", "lockin_osc_plan", "needs_daq")
+    assert plan.robot_ids == [1, 4] and plan.picus2_robots == {1} and plan.needs_scale
+    assert not (plan.needs_camera or plan.needs_dmm or plan.needs_lockin)
+    assert plan.shared_kwargs() == dict(use_scale=True, use_camera=False, use_microscope=False,
+                                        use_microscope_serial=False, use_dmm=False,
+                                        use_lockin=False, use_scope=False)
 
 
 def test_preflight_capabilities():

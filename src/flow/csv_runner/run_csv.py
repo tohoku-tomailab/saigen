@@ -423,8 +423,8 @@ async def run_two_solution_mixing(
     validator = default_workspace_validator()
     report = run_flow.require_preflight(steps, validator, log=logger, robot_ports=robot_ports)
 
-    (robot_ids, picus2_robots, needs_scale, needs_camera,
-     needs_microscope, needs_microscope_serial) = run_flow.plan_resources(steps)
+    plan = run_flow.plan_resources(steps)
+    robot_ids, picus2_robots = plan.robot_ids, plan.picus2_robots
 
     exp_logger = ExperimentLogger(
         workflow.name, workflow.description, csv_path, base_dir=LOGS_DIR,
@@ -488,13 +488,8 @@ async def run_two_solution_mixing(
     async def body():
         for rid in robot_ids:
             await session.add_robot(rid, use_picus2=(rid in picus2_robots))
-        needs_daq = run_flow.plan_daq(steps)
-        if (needs_scale or needs_camera or needs_microscope or needs_microscope_serial
-                or needs_daq):
-            await session.add_shared(use_scale=needs_scale, use_camera=needs_camera,
-                                     use_microscope=needs_microscope,
-                                     use_microscope_serial=needs_microscope_serial,
-                                     use_daq=needs_daq)
+        if plan.needs_shared:
+            await session.add_shared(**plan.shared_kwargs())
 
         logger.info("=== two-solution mixing started ===")
         total = len(steps)
@@ -511,7 +506,8 @@ async def run_two_solution_mixing(
                                        time.monotonic() - t_start, result=result)
             except Exception as step_err:
                 exp_logger.record_step(i, total, action, rid, None, "error",
-                                       time.monotonic() - t_start, error=str(step_err))
+                                       time.monotonic() - t_start, error=str(step_err),
+                                       diagnostics=getattr(step_err, "diagnostics", None))
                 raise
 
             if action == "dispense":
@@ -551,6 +547,7 @@ async def run_two_solution_mixing(
             accuracy_logger.finalize(logger)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"error finalising the accuracy CSV: {e}")
+        exp_logger.record_output_restore(session.output_restore_report())
         exp_logger.finalize(session.status, session.error)
         logger.info(f"experiment log saved: {exp_logger.dir}")
 

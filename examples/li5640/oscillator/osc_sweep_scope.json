@@ -1,0 +1,144 @@
+{
+  "name": "LI5640 oscillator sweep read on the DSO1014A",
+  "description": "Set the internal oscillator of the NF LI5640 (OSC OUT) and read it on CH1 of an Agilent 1000 series oscilloscope: amplitude 0.05, 0.1, 0.2 and 0.3 Vrms at 100 Hz, then 50 and 200 Hz at 0.3 Vrms. Each point waits 1 s after the setting was read back, reads the lock-in amplifier (its measured reference frequency) and the oscilloscope (frequency, period, Vpp, Vrms, mean). Requires shared_devices.lockin_osc_max_vrms >= 0.3 and a frequency range covering 50-200 Hz in config.yaml (writing the oscillator is disabled by default), the amplitude range of the LI5640 set to 500 mV on the front panel, and nothing but the oscilloscope on OSC OUT. The oscilloscope is set by hand (0.2 V/div, 5 ms/div, edge trigger on CH1). At the end of the run the oscillator is set back to what it was when the run started. No robot is opened.",
+  "steps": [
+    {
+      "action": "set_lockin_oscillator",
+      "frequency": 100.0,
+      "amplitude": 0.05,
+      "settle": 1.0
+    },
+    {
+      "action": "measure_lockin",
+      "samples": 5
+    },
+    {
+      "action": "measure_scope",
+      "channel": 1,
+      "items": [
+        "frequency",
+        "period",
+        "vpp",
+        "vrms",
+        "vaverage"
+      ],
+      "samples": 3,
+      "interval": 0.5
+    },
+    {
+      "action": "set_lockin_oscillator",
+      "frequency": 100.0,
+      "amplitude": 0.1,
+      "settle": 1.0
+    },
+    {
+      "action": "measure_lockin",
+      "samples": 5
+    },
+    {
+      "action": "measure_scope",
+      "channel": 1,
+      "items": [
+        "frequency",
+        "period",
+        "vpp",
+        "vrms",
+        "vaverage"
+      ],
+      "samples": 3,
+      "interval": 0.5
+    },
+    {
+      "action": "set_lockin_oscillator",
+      "frequency": 100.0,
+      "amplitude": 0.2,
+      "settle": 1.0
+    },
+    {
+      "action": "measure_lockin",
+      "samples": 5
+    },
+    {
+      "action": "measure_scope",
+      "channel": 1,
+      "items": [
+        "frequency",
+        "period",
+        "vpp",
+        "vrms",
+        "vaverage"
+      ],
+      "samples": 3,
+      "interval": 0.5
+    },
+    {
+      "action": "set_lockin_oscillator",
+      "frequency": 100.0,
+      "amplitude": 0.3,
+      "settle": 1.0
+    },
+    {
+      "action": "measure_lockin",
+      "samples": 5
+    },
+    {
+      "action": "measure_scope",
+      "channel": 1,
+      "items": [
+        "frequency",
+        "period",
+        "vpp",
+        "vrms",
+        "vaverage"
+      ],
+      "samples": 3,
+      "interval": 0.5
+    },
+    {
+      "action": "set_lockin_oscillator",
+      "frequency": 50.0,
+      "amplitude": 0.3,
+      "settle": 1.0
+    },
+    {
+      "action": "measure_lockin",
+      "samples": 5
+    },
+    {
+      "action": "measure_scope",
+      "channel": 1,
+      "items": [
+        "frequency",
+        "period",
+        "vpp",
+        "vrms",
+        "vaverage"
+      ],
+      "samples": 3,
+      "interval": 0.5
+    },
+    {
+      "action": "set_lockin_oscillator",
+      "frequency": 200.0,
+      "amplitude": 0.3,
+      "settle": 1.0
+    },
+    {
+      "action": "measure_lockin",
+      "samples": 5
+    },
+    {
+      "action": "measure_scope",
+      "channel": 1,
+      "items": [
+        "frequency",
+        "period",
+        "vpp",
+        "vrms",
+        "vaverage"
+      ],
+      "samples": 3,
+      "interval": 0.5
+    }
+  ]
+}

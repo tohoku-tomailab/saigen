@@ -1,165 +1,184 @@
-# Picus2電動ピペット制御モジュール
+# Picus 2 electronic pipette control module
 
-このモジュールは実験自動化システムにおいてPicus2電動ピペットを USB シリアルまたは Bluetooth 経由で制御するためのクラスと関数を提供します。
+This module provides the classes and functions for controlling a Picus 2 electronic
+pipette over USB serial or Bluetooth in the experiment-automation system.
 
-## 概要
+## Overview
 
-`picus2_controller.py`はPicus2電動ピペットを操作するための非同期インターフェースを提供します。主な機能には以下が含まれます：
+`picus2_controller.py` provides an asynchronous interface for operating the Picus 2
+electronic pipette. Its main features are:
 
-- Bluetooth接続管理
-- ボタン操作のエミュレーション
-- 液体の吸引・吐出
-- チップの排出
-- 液体の完全排出（ブローアウト）
-- 液体の混合
+- Bluetooth connection management
+- Emulation of button presses
+- Aspirating and dispensing liquid
+- Tip ejection
+- Complete expulsion of liquid (blow-out)
+- Mixing liquid
 
-このモジュールは`asyncio`と`bleak`ライブラリを使用した非同期通信を採用しています。
+The module uses asynchronous communication built on `asyncio` and the `bleak` library.
 
-## 使用方法
+## Usage
 
-### 基本的な使用例
+### Basic example
 
 ```python
 import asyncio
-from picus2.picus2_controller import Picus2Controller, Buttons
+from src.devices.picus2 import Picus2Controller, Buttons, ConnectionType
 
 async def main():
-    # Picus2コントローラーの初期化（BluetoothMACアドレスを指定）
-    picus = Picus2Controller("XX:XX:XX:XX:XX:XX")
+    # Initialise the Picus 2 controller (Bluetooth MAC address; the default
+    # connection type is USB, where the address is the serial port name)
+    picus = Picus2Controller("XX:XX:XX:XX:XX:XX",
+                             connection_type=ConnectionType.BLUETOOTH)
     
-    # 接続
+    # Connect
     await picus.connect()
     
     try:
-        # モーターモードを有効化
+        # Enable motor mode
         await picus.set_motor_mode(True)
         
-        # 5mLを吸引（速度5）
+        # Aspirate 5 mL (speed 5)
         await picus.aspirate(amount=5.0, speed=5)
         
-        # 5mLを吐出（速度5）
+        # Dispense 5 mL (speed 5)
         await picus.dispense(amount=5.0, speed=5)
         
-        # 残液を完全に排出
+        # Expel the remaining liquid completely
         await picus.blow_out()
         
-        # チップを排出
+        # Eject the tip
         await picus.eject_tip()
         
     finally:
-        # モーターモードを無効化
+        # Disable motor mode
         await picus.set_motor_mode(False)
         
-        # 切断
+        # Disconnect
         await picus.disconnect()
 
-# 非同期関数を実行
+# Run the coroutine
 asyncio.run(main())
 ```
 
-### ボタン操作
+### Button presses
 
 ```python
-# 特定のボタンを押す
+# Press a particular button
 await picus.button(Buttons.TRIGGER_BUTTON_POWER)
 await picus.button(Buttons.TRIGGER_BUTTON_LEFT)
 await picus.button(Buttons.TRIGGER_BUTTON_RIGHT)
 ```
 
-### 液体混合
+### Mixing
 
 ```python
-# 5回、速度5で3.0mLの液体を混合
+# Mix 3.0 mL of liquid 5 times at speed 5
 await picus.mix(cycles=5, speed=5, amount=3.0)
 ```
 
-## 主要機能
+## Main functions
 
-### 接続管理
+### Connection management
 
-- `connect()` - Picus2に接続する
-- `disconnect()` - Picus2から切断する
-- `send_command(command)` - コマンドを送信する
+- `connect()` - connect to the Picus 2
+- `disconnect()` - disconnect from the Picus 2
+- `send_command(command)` - send a command
 
-### ボタン操作
+### Button presses
 
-- `button(button, interval)` - 指定したボタンを押す
+- `button(button, interval)` - press the given button
 
-### モーター制御
+### Motor control
 
-- `set_motor_mode(mode)` - モーターモードを設定する
+- `set_motor_mode(mode)` - set motor mode
 
-### 液体操作
+### Liquid handling
 
-- `aspirate(amount, speed)` - 液体を吸引する
-- `dispense(amount, speed)` - 液体を吐出する
-- `blow_out(go_home, speed, delay_ms)` - 液体をすべて排出する
-- `mix(cycles, speed, amount)` - 液体を混合する
-- `eject_tip()` - チップを排出する
+- `aspirate(amount, speed)` - aspirate liquid
+- `dispense(amount, speed)` - dispense liquid
+- `blow_out(go_home, speed, delay_ms)` - expel all liquid
+- `mix(cycles, speed, amount)` - mix liquid
+- `eject_tip()` - eject the tip
 
-### ユーティリティ
+### Utilities
 
-- `calculate_operation_time(amount, speed)` - ピペット操作にかかる時間を計算する
-- `wait_until_END_received()` - ENDメッセージが受信されるまで待機する
-- `debug_print(message)` - デバッグメッセージを出力する
+- `calculate_operation_time(amount, speed)` - calculate how long a pipette operation takes
+- `wait_until_END_received()` - wait until the END message is received
+- `debug_print(message)` - print a debug message
 
-## ボタン定数
+## Button constants
 
-`Buttons`クラスは以下の定数を提供します：
+The `Buttons` class provides the following constants:
 
-- `TRIGGER_BUTTON_POWER` - 電源ボタン
-- `TRIGGER_BUTTON_LEFT` - 左ボタン
-- `TRIGGER_BUTTON_MIDDLE` - 中央ボタン
-- `TRIGGER_BUTTON_RIGHT` - 右ボタン
-- `TRIGGER_BUTTON_TOP` - 上部トリガーボタン
-- `TRIGGER_BUTTON_PRESET` - プリセットボタン
-- `TRIGGER_BUTTON_TIPEJECT` - チップ排出ボタン
-- `UP` - 上方向ボタン
-- `DOWN` - 下方向ボタン
+- `TRIGGER_BUTTON_POWER` - power button
+- `TRIGGER_BUTTON_LEFT` - left button
+- `TRIGGER_BUTTON_MIDDLE` - middle button
+- `TRIGGER_BUTTON_RIGHT` - right button
+- `TRIGGER_BUTTON_TOP` - top trigger button
+- `TRIGGER_BUTTON_PRESET` - preset button
+- `TRIGGER_BUTTON_TIPEJECT` - tip-eject button
+- `UP` - up button
+- `DOWN` - down button
 
-## 注意点
+## Notes
 
-### BluetoothMACアドレスの取得
+### Finding the Bluetooth MAC address
 
-Picus2のBluetoothMACアドレスを取得するには：
+To find the Bluetooth MAC address of the Picus 2:
 
-1. ピペットのBluetoothを有効にする
-2. コンピュータのBluetoothスキャンを使用して検出する
-3. デバイス情報からMACアドレスを確認する（例: "XX:XX:XX:XX:XX:XX"）
+1. Enable Bluetooth on the pipette
+2. Detect it with the computer's Bluetooth scan
+3. Read the MAC address from the device information (e.g. "XX:XX:XX:XX:XX:XX")
 
-### 非同期プログラミング
+### Asynchronous programming
 
-このモジュールはPython `asyncio`を使用した非同期プログラミングを採用しています：
+This module uses asynchronous programming with Python `asyncio`:
 
-- 全ての操作メソッドは`async def`で定義されており、`await`キーワードで呼び出す必要があります
-- メインスクリプトも非同期関数として定義し、`asyncio.run()`で実行する必要があります
+- The device-operation methods are defined with `async def` and must be called with
+  `await`; synchronous helpers such as `calculate_operation_time()` and `debug_print()`
+  are not
+- The main script must also be defined as a coroutine and run with `asyncio.run()`
 
-### デバッグモード
+### Debug mode
 
-デバッグが必要な場合は以下のように設定できます：
+To enable debugging:
 
 ```python
-picus = Picus2Controller("XX:XX:XX:XX:XX:XX")
-picus.DEBUG = True  # デバッグ出力を有効化
+picus = Picus2Controller("XX:XX:XX:XX:XX:XX",
+                         connection_type=ConnectionType.BLUETOOTH)
+picus.DEBUG = True  # enable debug output
 ```
 
-### オペレーション時間
+### Operation time
 
-吸引・吐出などの操作は一定時間を要します。`calculate_operation_time()`メソッドは操作にかかる推定時間を計算し、その時間が経過するまで待機します。速度（1-9）と量（mL）に基づいて計算されます。
+Aspirating, dispensing and similar operations take a certain time. The
+`calculate_operation_time()` method returns the estimated duration in seconds, based on
+the speed (1–9) and the volume (mL); `aspirate()` and `dispense()` wait for that duration.
 
-### エラー処理
+### Error handling
 
-コマンドやボタン/トリガーの送信に失敗した場合（`serial.SerialException`、Bleak の例外、ポートが閉じている場合など）は、`Picus2CommandError`（`ConnectionError` の派生）が送出されます。以前は `button()` がこれらの例外を握りつぶして正常終了していたため、吸引/吐出トリガーの失敗が「完了」と記録され、`LabRobot` の保持量が実際と食い違うことがありました。USB 接続でポート生成後の確認に失敗した場合は、ポートを閉じてから例外を伝播します。`Picus2CommandError` は `src.devices.picus2.picus2_controller` から import してください（`except ConnectionError` でも捕捉できます）。
+When sending a command or a button/trigger fails (`serial.SerialException`, a Bleak
+exception, a closed port, etc.), a `Picus2CommandError` (a subclass of `ConnectionError`)
+is raised. Previously `button()` swallowed these exceptions and returned normally, so a
+failed aspirate/dispense trigger was recorded as "completed" and the volume `LabRobot`
+believed it was holding could diverge from reality. On a USB connection, if the check after
+opening the port fails, the port is closed before the exception propagates. Import
+`Picus2CommandError` from `src.devices.picus2.picus2_controller` (it is also caught by
+`except ConnectionError`).
 
-## 依存関係
+## Dependencies
 
-- `asyncio` - 非同期処理
-- `bleak` - Bluetooth Low Energy通信
-- `random` - テスト用のランダム値生成
-- `time` - 時間計測
+- `asyncio` - asynchronous processing
+- `bleak` - Bluetooth Low Energy communication
+- `random` - random values for testing
+- `time` - timing
 
-## トラブルシューティング
+## Troubleshooting
 
-- 接続エラーが発生した場合、Picus2のバッテリーが十分であることと、Bluetoothが有効になっていることを確認してください。
-- 「モーターモードを有効にしてください」というエラーが表示された場合、操作前に`set_motor_mode(True)`を呼び出してください。
-- 操作が完了しない場合、操作時間の計算が不正確な可能性があります。実際の操作時間に合わせて待機時間を調整してください。
+- On a connection error, check that the Picus 2 battery is sufficiently charged and that
+  Bluetooth is enabled.
+- If you see an error asking you to enable motor mode, call `set_motor_mode(True)` before
+  the operation.
+- If an operation does not complete, the operation-time estimate may be inaccurate. Adjust
+  the wait time to match the actual operation time.

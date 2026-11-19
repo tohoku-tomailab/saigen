@@ -1,0 +1,8 @@
+{
+  "name": "Read the Agilent DSO1014A",
+  "description": "Read automatic measurements of channel 1 from an Agilent 1000 series oscilloscope (DSO1014A etc.) over USB, twice: the amplitude and frequency items, then the duty cycle and rise time. Vertical, horizontal, trigger and acquisition settings are made on the front panel (edge trigger, main time base); the flow only queries. Each step reads every item three times, 0.5 s apart, and writes per item the median of the valid readings with its unit and count, plus the panel settings, to measurements.csv. The flow uses only the oscilloscope, so no robot is opened. The VISA resource comes from config.yaml (shared_devices.scope_resource) or from --scope-resource.",
+  "steps": [
+    {"action": "measure_scope", "channel": 1, "items": ["vpp", "vaverage", "frequency"], "samples": 3, "interval": 0.5},
+    {"action": "measure_scope", "channel": 1, "items": ["pdutycycle", "risetime"], "samples": 3, "interval": 0.5}
+  ]
+}

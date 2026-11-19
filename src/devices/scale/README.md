@@ -1,95 +1,143 @@
-# 電子天びん制御モジュール
+# Electronic balances
 
-A&D EK-610i 系電子天びんをRS-232C経由で操作するためのコントローラーです。
+Three modules for two instruments. Only the first is used by flows.
 
-## 特徴
+| Module | Class | Instrument | Used by |
+|---|---|---|---|
+| `BCE8221.py` | `SerialBalance` | Sartorius BCE822i (the paper's cell) | `SharedDevices` for the flow actions `measure_weight` and `tare_scale` (`scale_port` in `config.yaml`) |
+| `scale_controller.py` | `ScaleController` | A&D EK-610i series | exported by `src.devices.scale`; stand-alone scripts and the self-check in `docs/setup.md` §4. Not used by flows |
+| `Ek610i.py` | `Scale` | A&D EK-610i series | older minimal driver, kept for scripts that import it; nothing in this repository uses it |
 
-- **高精度測定**: 0.01g精度での重量測定
-- **安定化測定**: 複数回測定による平均値取得
-- **風袋引き機能**: ゼロ点リセット機能
-- **コンテキストマネージャー対応**: 自動接続・切断管理
-- **エラーハンドリング**: 包括的な例外処理
+The flow executor only knows `SerialBalance`. Running flows on an A&D balance needs a
+change in `SharedDevices` (see `docs/adding-an-instrument.md`), not a new driver.
 
-## 使用方法
+## Sartorius BCE822i (`SerialBalance`)
 
-### 基本的な使用例
+Communication: 9600 bps, 8 data bits, odd parity, 1 stop bit. The balance's print
+command `P` returns one line; `T` tares.
+
+```python
+from src.devices.scale.BCE8221 import SerialBalance
+
+balance = SerialBalance(port="COM8")     # opens the port in the constructor
+try:
+    balance.tare()                       # sends T and returns at once
+    grams = balance.get_weight()         # float, or None when the reply holds no number
+finally:
+    balance.close()
+```
+
+- `get_weight() -> float | None`: sends `P`, reads one line and parses the fixed-width
+  printout (`[marker] [sign] [spaces] value [unit]`, e.g. `-     0.03 g` or
+  `N  +  0.00 g`), keeping the sign. Returns `None` and logs a warning when no number
+  is found. `SharedDevices.measure_weight` takes the median of several readings and
+  skips `None`.
+- `tare()`: sends `T`; does not wait for the balance.
+- `close()`: closes the port.
+
+## A&D EK-610i (`ScaleController`)
+
+Controller for operating an A&D EK-610i series electronic balance over RS-232C.
+
+### Features
+
+- **High-precision weighing**: weight measurement at 0.01 g precision
+- **Averaged weighing**: the mean of several readings
+- **Tare**: zero-point reset
+- **Context-manager support**: automatic connect and disconnect
+- **Error handling**: comprehensive exception handling
+
+### Basic example
 
 ```python
 from src.devices.scale import ScaleController
 
-# コンテキストマネージャーとして使用（推奨）
+# Use as a context manager (recommended)
 with ScaleController(port="COM3") as scale:
-    # 風袋引き
+    # Tare
     scale.tare()
     
-    # 重量測定
+    # Measure the weight
     weight = scale.query_weight()
-    print(f"重量: {weight:.3f} g")
+    print(f"Weight: {weight:.3f} g")
     
-    # 安定した重量取得
-    stable_weight = scale.get_stable_weight(samples=5)
-    print(f"安定重量: {stable_weight:.3f} g")
+    # Average several readings
+    mean_weight = scale.get_stable_weight(samples=5)
+    print(f"Mean weight: {mean_weight:.3f} g")
 ```
 
-### 手動接続・切断
+### Manual connect and disconnect
 
 ```python
 scale = ScaleController(port="COM3")
 
 try:
-    # 接続
+    # Connect
     if scale.connect():
-        # 測定
+        # Measure
         weight = scale.query_weight()
-        print(f"重量: {weight:.3f} g")
+        print(f"Weight: {weight:.3f} g")
 finally:
-    # 切断
+    # Disconnect
     scale.disconnect()
 ```
 
-## API リファレンス
-
-### ScaleController
-
-電子天びん制御のメインクラス
-
-#### コンストラクタ
+### Constructor
 
 ```python
-ScaleController(port="COM3", baudrate=2400, bytesize=7, parity="even", stopbits=1)
+ScaleController(port="COM3", baudrate=2400, bytesize=7, parity=serial.PARITY_EVEN, stopbits=1)
 ```
 
-#### メソッド
+`parity` is passed straight to pyserial, so use its constants (`serial.PARITY_EVEN` is `"E"`).
 
-- `connect() -> bool`: デバイスに接続
-- `disconnect()`: デバイスから切断  
-- `is_connected() -> bool`: 接続状態確認
-- `query_weight() -> float`: 重量測定（単発）
-- `tare(delay=0.5) -> bool`: 風袋引き
-- `get_stable_weight(samples=3, interval=0.1) -> float`: 安定重量測定
+### Methods
 
-## 通信仕様
+- `connect() -> bool`: connect to the device
+- `disconnect()`: disconnect from the device  
+- `is_connected() -> bool`: check the connection state
+- `query_weight() -> float`: single weight measurement
+- `tare(delay=5.0) -> bool`: tare
+- `get_stable_weight(samples=3, interval=0.1) -> float`: arithmetic mean of `samples` readings (stability is not checked)
 
-- **ポート**: RS-232C
-- **ボーレート**: 2400 bps
-- **データビット**: 7 bit
-- **パリティ**: Even
-- **ストップビット**: 1 bit
-- **フロー制御**: なし
+### Communication settings
 
-## エラー処理
+- **Port**: RS-232C
+- **Baud rate**: 2400 bps
+- **Data bits**: 7
+- **Parity**: even
+- **Stop bits**: 1
+- **Flow control**: none
 
-以下の例外が発生する可能性があります：
+### Error handling
 
-- `ConnectionError`: デバイス接続エラー
-- `TimeoutError`: 応答タイムアウト
-- `ValueError`: データ解析エラー
+The following exceptions may be raised:
 
-## ログ
+- `ConnectionError`: device connection error
+- `TimeoutError`: response timeout
+- `ValueError`: data parsing error
 
-デバッグレベルでの詳細ログと、INFOレベルでの操作ログを出力します。
+### Logging
+
+Detailed logs are emitted at DEBUG level and operation logs at INFO level.
 
 ```python
 import logging
 logging.basicConfig(level=logging.INFO)
 ```
+
+## A&D EK-610i, minimal driver (`Ek610i.Scale`)
+
+Same instrument and the same serial settings as `ScaleController`, with a smaller API
+(`Q` for a reading, `R` for tare). Kept for scripts that already import it.
+
+```python
+from src.devices.scale.Ek610i import Scale
+
+with Scale(port="COM3") as scale:       # the port is opened on enter, closed on exit
+    scale.tare(delay=0.5)               # sends R, then waits delay seconds
+    grams = scale.query_weight()        # TimeoutError on no reply, ValueError when the reply holds no number
+```
+
+`query_weight()` parses replies of the form `ST,+0012.34 g` (`US,` for an unstable
+reading) and keeps the sign; earlier versions dropped it, so negative weights came back
+positive (`tests/test_ek610i_sign.py`).

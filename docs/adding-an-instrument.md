@@ -7,6 +7,28 @@ spectrometer, a second balance. Instruments mounted on an arm (a second pipette,
 a gripper) go through `LabRobot` instead of `SharedDevices`; the layering is the
 same, only the class differs.
 
+The DMM in the steps below is a generic, hypothetical one (`measure_voltage`,
+`dmm_port`) so that the steps stay short. A real DMM, the Keithley 2002 over
+GPIB, was later added by following them: its action is `measure_dmm`, its
+setting `dmm_resource`, and its code (`src/devices/keithley2002/`,
+`SharedDevices.measure_dmm`, `tests/test_keithley2002.py`) is the worked
+example for an instrument whose I/O blocks; what its commissioning taught is in
+[`knowledge/keithley2002-commissioning.md`](../knowledge/keithley2002-commissioning.md). The NF LI5640
+lock-in amplifier (`src/devices/li5640/`, `measure_lockin`,
+`tests/test_li5640.py`) followed next, as a read-only instrument whose values
+mean what its front panel says; its notes are in
+[`knowledge/li5640-commissioning.md`](../knowledge/li5640-commissioning.md). The Agilent 1000 series
+oscilloscope (`src/devices/dso1000/`, `measure_scope`, `tests/test_dso1000.py`)
+is the third such instrument and the first over USB; it shows how to record
+several quantities per step (JSON columns keyed by item) and how to refuse
+instrument states whose meaning the code cannot check (X-Y time base, non-edge
+trigger) instead of recording ambiguous values; its notes are in
+[`knowledge/dso1000-commissioning.md`](../knowledge/dso1000-commissioning.md). The LI5640's internal
+oscillator (`set_lockin_oscillator`, `tests/test_li5640_oscillator.py`) is the
+first output SAIGEN *writes* to an instrument; the rules it needed are under
+"Instruments that write an output" in §2, and its bench test is §8 of the
+LI5640 notes.
+
 The electronic balance is the closest existing example, and every step below
 names the balance code to copy from. Read `src/devices/README.md` first for the
 two-layer design (thin drivers, one safety wrapper).
@@ -69,6 +91,109 @@ Add the instrument to `SharedDevices` following the balance:
 Do not touch `src/devices/safety/validators/` or the `workspace` section of
 `config.yaml`; a measuring instrument has no business there.
 
+### Instruments whose I/O blocks
+
+A reading that can take seconds (high integration time, a slow bus, a timeout)
+must not freeze the event loop or delay an emergency stop. The Keithley 2002 in
+`SharedDevices` (`_initialize_dmm`, `measure_dmm`, `_close_dmm`) is the
+reference; the rules, each of which was a real defect caught in review:
+
+- Run the I/O on a worker thread (`asyncio.to_thread`) under a
+  `threading.Lock`, so a measurement and the clean-up never use the bus at the
+  same time.
+- On cancellation, set a stop flag and re-raise at once; do not wait for the
+  worker. The robots are emergency-stopped first and the device is closed
+  afterwards. The thread itself cannot be killed; it stops at the next check.
+- Check the stop flag before every ordinary command you send (the 2002
+  driver does it in `write` / `query` through `abort_check`), not only before
+  each reading. The clean-up itself (device clear, GTL, close) is not gated.
+- Close the handle only while holding the lock. If the clean-up gives up
+  waiting, leave the closing to the worker when its I/O ends (give each I/O a
+  timeout; a query is a write plus a read, so that is not a bound on the whole
+  operation); never close under an I/O in flight.
+- A failed close is logged and the handle kept for the next `cleanup()`;
+  nothing in a worker may raise into the void.
+- Do not swallow I/O errors on read-back queries: a late reply desynchronises
+  the next query.
+- With more than one such instrument, `SharedDevices.cleanup()` closes each in
+  its own `try`, remembers a cancellation, tries the remaining ones and only
+  then re-raises it: a second Ctrl+C while one instrument is being closed must
+  not leave the next one open.
+- If the instrument has a setting you change only to read it (the LI5640's
+  `OTYP`), read the old value first and restore it on a path that is exempt
+  from the stop flag, after a device clear (a timed-out write may have left
+  half a command in the input buffer), and still send GTL and close if the
+  restore fails. Restore nothing you never read.
+- `ExperimentSession.add_shared()` closes a device whose `initialize()` failed,
+  and hands an interrupted one to `run()`'s clean-up after the emergency stop;
+  `_initialize_<name>()` therefore only has to leave no handle of its own open.
+
+### Instruments that write an output
+
+A source (an oscillator, a current or voltage source) puts something on a
+wire the code cannot see. The LI5640 oscillator (`SharedDevices.set_lockin_oscillator`,
+`_close_lockin_restoring`, `LI5640.apply_oscillator` / `restore_oscillator`) is
+the reference. Its plan went through six reviews and its implementation through
+three; each rule below answers a defect one of them found:
+
+- **Off by default, enabled by the lab.** Writing is refused unless
+  `config.yaml` sets a limit above 0; the limits (amplitude, frequency range)
+  belong to what is wired to the output and are the human's, like the
+  workspace. Invalid limit values (null, strings, booleans, NaN) are errors,
+  never a fallback to a default. An agent never raises them (CLAUDE.md rule 2).
+- **Refuse before anything opens.** The preflight of every runner that can
+  carry the step (CLI `--validate-only` / `--mock` / real, GUI) checks every requested
+  value against the limits and the instrument's resolution, so a flow that would
+  be refused at step 12 is refused before step 1 moves anything.
+- **Never round.** A value the instrument cannot represent exactly is refused,
+  not rounded: rounding to the instrument's format can step over a limit (a
+  saved `0.3006 V` would have been restored as `0.301 V` above a `0.3006 V`
+  limit). This applies to the values written back at the end too.
+- **Do not switch ranges.** A range change can produce a transient the manual
+  does not describe; require one range for the whole flow and refuse at
+  connect if the instrument is on another.
+- **The state to restore must itself be allowed.** Read it on connect, before
+  any write, and refuse if it is outside the limits or not exactly writable: the
+  restore will write it.
+- **One command at a time, each confirmed.** Order the commands so the set
+  values never exceed the larger of before and after (lower the amplitude
+  before changing the frequency, otherwise frequency first). After each
+  command read it back (exact match) and read the error queue; on any failure
+  send nothing that depends on it, treat the state as unknown and refuse every
+  later step's write in that run. The restore at the end is the one exception:
+  it reads the state afresh and writes back from there. Errors already queued, or a state that differs from the last one
+  confirmed (changed on the panel), stop the step before any write. Equal
+  values are not sent.
+- **Mark "changed" before the write, not after.** A write that times out may
+  still have been applied; the restore must run whenever a write was attempted.
+- **Restore once, from what is there.** At the end (normal end, failure,
+  Ctrl+C): device clear, drain the error queue (recorded separately), read the
+  current state; unreadable means write nothing and report `unverified`, a
+  different range means write nothing and report `failed`, equal means write
+  nothing. The restore runs at most once per run, even if the close is retried.
+- **Start the restore before awaiting it.** Run it on its own non-daemon
+  thread started before the first `await`, so a second Ctrl+C ends the wait but
+  never cancels the restore; the waiter records a provisional result only if
+  the final one is not there yet.
+- **The result decides the run.** A restore that failed or could not be
+  checked, or a close that failed (also in a run that wrote nothing), turns a
+  completed run into `failed` (exit code 1) with a note to check the output on
+  the front panel; an aborted run keeps its status and exit code and gets the
+  note. `run()` raises only after the result is applied.
+- **One handle per instrument.** A process-wide lock keyed by the resource
+  name as resolved by VISA (`GPIB::7` and `GPIB0::7` are the same instrument),
+  released only by a successful close, keeps the next run (the GUI) from
+  talking to the instrument while a restore is still going on.
+- **Record what was interrupted.** A step cut by Ctrl+C is recorded as
+  `aborted` with a snapshot of plain values (commands sent, read-backs, time
+  waited), copied under the lock, not shared with the worker that may still be
+  running.
+- **Test the bus traffic.** Fakes that refuse, ignore, apply a neighbouring
+  value, time out after applying, or raise after applying; assertions on the
+  commands sent and their order, not only on the exceptions; a real SIGINT in a
+  separate process; and source mutations (each rule broken on purpose must
+  fail a named test).
+
 ## 3. Mock: `src/devices/safety/mock_robot.py`
 
 `MockSharedDevices` must accept the same constructor flag and expose the same
@@ -99,18 +224,27 @@ what tests, CI and `--mock` use to check that the value reaches the log.
   it with the other flags, and pass `use_dmm=needs_dmm` through
   `ExperimentSession.add_shared()` (`src/flow/experiment_session.py`, whose
   shared-device factories forward it to `SharedDevices` / `MockSharedDevices`).
-  The CSV runner and the GUI runner unpack the same tuple, so update those two
-  call sites as well. This is what lets a flow that never measures voltage run
-  on a cell without a DMM.
+  `plan_resources()` returns a `ResourcePlan` (a `NamedTuple`) read by name:
+  add the field, then extend `needs_shared`, `shared_kwargs()` and
+  `shared_labels()`; the three runners (`run_flow`, the CSV runner, the GUI
+  runner) pick it up from there. This is what lets a flow that never measures
+  voltage run on a cell without a DMM.
 
 `src/flow/experiment_logger.py`
 
-- `record_step()` currently knows two result keys, `weight` and `image_path`,
-  and writes them as the `weight_g` and `image_path` columns of `measurements.csv`.
-  Add the new key the same way (`voltage_v`), and add the event kind to the
-  time-line report if the value is worth listing there. If you expect more
-  instruments, this is the moment to generalise to `measurement` / `unit`
-  columns instead of one column per quantity.
+- `record_step()` maps result keys to `measurements.csv` columns (`weight` to
+  `weight_g`, `image_path`, `focus_position`, and the `dmm_*` keys of the
+  Keithley 2002). Add the new key the same way (`voltage_v`), and add the event
+  kind to the time-line report if the value is worth listing there. An
+  instrument that measures several quantities should report value, unit and
+  function (as `dmm_value` / `dmm_unit` / `dmm_function` do) rather than one
+  column per quantity, and keep full precision (`repr`, not a fixed format).
+- A step that fails for a reason worth recording (the LI5640's panel changed
+  during the readings, every reading was invalid) raises an exception with a
+  `diagnostics` dict. All three runners pass `getattr(e, "diagnostics", None)`
+  to `record_step()`, which writes it to the `diagnostics` column, the
+  time-line and `metadata.json` (`step_diagnostics`). An exception message
+  alone loses the structured data.
 
 ## 5. Configuration
 
@@ -133,10 +267,20 @@ All tests run without hardware.
   `tests/test_run_flow.py` and assert that `measurements.csv` has the value in the new
   column. This catches a missing union entry, a missing action in
   `SHARED_DEVICE_ACTIONS`, and a mock that returns `None`.
+- Blocking I/O (see §2): drive the wrapper with a fake resource whose write or
+  query blocks on a `threading.Event`, then cancel during initialisation,
+  during configuration, during the last reading and during clean-up, and
+  assert the order of events (emergency stop before the device is released,
+  no ordinary command sent after an abort, no I/O after close). Then revert
+  each fix once and check that its test fails: a test that releases the fake
+  too early passes against the broken code as well.
+- Test what the code asks for, not wall-clock time: a check of `elapsed >= 0.3`
+  after `asyncio.sleep(0.3)` failed now and then on Windows (the timer
+  granularity there was about 15 ms); record the requested pause instead.
 - Run the full check before reporting done:
 
 ```bash
-python -m pytest tests/ src/monitoring/tests/ -q
+python -m pytest tests/ src/monitoring/tests/ src/imaging/tests/ -q
 python -m src.flow.run_flow <your flow>.json --validate-only
 python -m src.flow.run_flow <your flow>.json --mock
 ```
@@ -158,10 +302,25 @@ the step from the GUI:
   the second drawing the input widgets (copy the `measure_weight` branches).
 
 The GUI imports `SHARED_DEVICE_ACTIONS` from the executor, so a step whose
-action is in that set is created without a `robot_id` automatically. Validation
+action is in that set is created without a `robot_id` automatically. The
+shared-device settings of a GUI run start from `config.yaml` and only the
+sidebar fields are overlaid (`settings_to_session_args()` in
+`src/gui/runner.py`), so a new configuration key reaches the session's
+settings without a sidebar field. It still has to be passed on to the device:
+`default_shared_factory()` in `src/flow/experiment_session.py` lists the keys
+it gives `SharedDevices`; add yours there (§4), or the setting is silently
+dropped. A keyed Streamlit widget keeps its state when its default
+changes: if one parameter invalidates another (the 2002's range is in the unit
+of its function), reset the dependent widget's state in the `on_change`
+callback, as `_change_dmm_function()` does, or the GUI shows a value the step
+no longer has. Validation
 and the Mock run in the GUI go through the same schema and executor as the CLI,
 so nothing else is needed. Verify with `streamlit run src/gui/app.py`: add the
-block, check the parameters, run *Mock*.
+block, check the parameters, run *Mock*. Also add a schema-valid sample of the
+new step to `VALID_STEPS` in `tests/test_gui_app_params.py` (the test fails
+until every palette block has one); it renders every block's editor headlessly
+with Streamlit's `AppTest` and is skipped where Streamlit is not installed,
+as in the CI.
 
 ## 8. Documentation
 
@@ -170,6 +329,9 @@ block, check the parameters, run *Mock*.
   `SharedDevices` row.
 - `docs/bom.md`: the instrument, with model and interface.
 - `docs/setup.md`: how to connect it and find its port.
+- `knowledge/<instrument>-commissioning.md`: what bringing the instrument up
+  taught (order of work, replies that differed from the manual, defects, open
+  points), and one row in the table of `knowledge/README.md`.
 - `src/agent/llm_service.py`: the action list given to the flow-generating
   LLM. Add the action there if the agent should be able to use it; leave it out
   if it should not.
@@ -185,8 +347,12 @@ block, check the parameters, run *Mock*.
 [ ] experiment_logger.py           result key -> CSV column
 [ ] config.py + config.example.yaml   port key
 [ ] tests/                         parser test + mock-run test
+[ ] (output instruments)           off by default, preflight limits, read-back,
+                                   restore once, result decides the run (§2)
 [ ] src/gui/app.py (optional)      ACTION_CONFIG, CATEGORIES, two elif branches
 [ ] docs/experimental-flow.md, src/devices/README.md, docs/bom.md, docs/setup.md
+[ ] knowledge/<name>-commissioning.md + one row in knowledge/README.md
+                                   (state it if nothing ran on real hardware)
 [ ] pytest, --validate-only, --mock all green
 ```
 

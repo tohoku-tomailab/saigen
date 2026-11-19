@@ -323,9 +323,9 @@ def test_empty_cli_port_disables_serial_control(monkeypatch):
 
 def test_plan_resources_splits_camera_and_serial():
     plan = run_flow.plan_resources
-    assert plan([{"action": "capture_microscope"}])[4:] == (True, False)
-    assert plan([{"action": "microscope_led", "on": False}])[4:] == (False, True)
-    assert plan([{"action": "microscope_focus"}])[4:] == (True, True)
+    assert plan([{"action": "capture_microscope"}])[4:6] == (True, False)
+    assert plan([{"action": "microscope_led", "on": False}])[4:6] == (False, True)
+    assert plan([{"action": "microscope_focus"}])[4:6] == (True, True)
 
 
 def test_mock_session_passes_serial_flag():

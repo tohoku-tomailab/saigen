@@ -25,6 +25,7 @@ pydantic>=2.5
 python-dotenv>=1.0
 pyyaml>=6.0               # config.yaml loader (src/config.py, src/monitoring)
 pyserial>=3.5             # Picus 2 (USB), balances, IKA stirrer
+pyvisa>=1.13              # Keithley 2002 DMM over GPIB; needs a VISA library (NI-VISA etc.), see docs/setup.md
 pydobot>=1.3.2            # Dobot Magician
 bleak>=0.21               # Picus 2 over Bluetooth LE (also used by src/imaging)
 opencv-python==4.12.0.88 ; sys_platform != "win32"   # webcam capture (win32 pin above)

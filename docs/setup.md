@@ -38,7 +38,7 @@ Connect everything to the control PC and note the port of each device
 ## 2. Software
 
 ```bash
-git clone https://github.com/YusukeHashimotoLab/saigen.git
+git clone https://github.com/tohoku-tomailab/saigen.git
 cd saigen
 python -m venv venv
 # Windows
@@ -52,6 +52,12 @@ Python 3.11–3.13. Optional extras:
 
 - `ffmpeg` on PATH for voice input (`winget install ffmpeg` / `brew install ffmpeg`).
 - A CUDA GPU speeds up whisper; CPU works with the int8 model.
+
+On Windows, keep the virtual environment on a short path (e.g. `C:\saigen\venv`).
+Without long-path support enabled, `pip install streamlit` (version not
+recorded; October 2026) into a venv several directories deep failed with
+`WinError 206` on a file deep inside the package and left a package that could
+not be imported.
 
 ## 3. Configuration (`config.yaml` and `.env`)
 
@@ -68,8 +74,8 @@ Edit `config.yaml`:
 
 | Section | Purpose |
 |---|---|
-| `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); a robot without `type` is a Dobot |
-| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy). For the NI DAQ: `daq_device`, the named signals flows refer to (`daq_signals`: name → channel, wiring, conversion to a unit), the outputs a flow may drive (`daq_ao_channels`, `daq_do_lines`, `daq_co_counters`; empty = none) and their limits (`daq_ao_min_v`, `daq_ao_max_v`, `daq_co_max_hz`) |
+| `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); robot 5 is an optional Dobot MG400 (`type: mg400`, `mg400_address`, its own `workspace`, `home_position`, `joint_limits`, `speed_ratio`, `max_move_mm`, see §13); a robot without `type` is a Dobot |
+| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10); `lockin_resource` and `lockin_timeout_ms` of the optional NF LI5640 lock-in amplifier (§11); `scope_resource` and `scope_timeout_ms` of the optional Agilent 1000 series oscilloscope (§12); for the optional NI DAQ: `daq_device`, the named signals flows refer to (`daq_signals`: name → channel, wiring, conversion to a unit), the outputs a flow may drive (`daq_ao_channels`, `daq_do_lines`, `daq_co_counters`; empty = none) and their limits (`daq_ao_min_v`, `daq_ao_max_v`, `daq_co_max_hz`) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
 If `config.yaml` is absent the tracked `config.example.yaml` is used, and if that is
@@ -83,8 +89,8 @@ Edit `.env`:
 | `LLM_MODE` | `gemini` (default) or `openai_compatible` |
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
-| `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT` | optional per-run override of the `config.yaml` robot ports |
-| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DAQ_DEVICE` | optional per-run override of the shared devices (for the DAQ only the device name; which outputs are enabled is set in `config.yaml` alone) |
+| `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT`, `ROBOT5_MG400_ADDRESS` | optional per-run override of the `config.yaml` robot ports / addresses |
+| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE`, `LOCKIN_RESOURCE`, `SCOPE_RESOURCE`, `DAQ_DEVICE` | optional per-run override of the shared devices (for the DAQ only the device name; which outputs are enabled is set in `config.yaml` alone) |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
 `.env` is git-ignored. No key is read from anywhere else. For device ports the
@@ -97,7 +103,8 @@ Each driver has a small self-test; run them with the arm clear of obstacles.
 ```bash
 python -m src.devices.dobot.pydobot_controller          # lists serial ports, connects, reads position
 python src/devices/picus2/test_picus2_minimal.py         # edit the port inside the file first
-python -m src.devices.scale.scale_controller             # reads the balance
+python -m src.devices.scale.scale_controller             # A&D EK-610i only (ScaleController; port fixed to COM3 in the file): TARES the balance, then reads it
+python -m src.devices.scale.BCE8221                      # Sartorius BCE822i (SerialBalance, the balance the flows use; port fixed to COM4 in the file): one reading, no tare
 ```
 
 The Dobot Magician only knows its joint angles precisely after a **homing** run
@@ -307,7 +314,7 @@ coordinates of your vials and rests, jog the arm with
 this tool (see `CLAUDE.md`, rule 1). Details, the wire protocol and the
 restore-to-factory notes are in [`src/devices/maxarm/README.md`](../src/devices/maxarm/README.md);
 the order of work that proved safe, the numbers measured on a real arm and the
-recovery steps are in [`maxarm-commissioning.md`](maxarm-commissioning.md).
+recovery steps are in [`knowledge/maxarm-commissioning.md`](../knowledge/maxarm-commissioning.md).
 
 **Configuration.** Set the port in `config.yaml` (or `--robot4-maxarm COM11` /
 `ROBOT4_MAXARM_PORT`):
@@ -398,6 +405,439 @@ connect. Details are in [`src/devices/maxarm/README.md`](../src/devices/maxarm/R
 
 The example flow is [`examples/maxarm/pick_and_place.json`](../examples/maxarm/pick_and_place.json).
 
+## 10. Keithley 2002 digital multimeter (optional)
+
+The Keithley 2002 speaks only GPIB (IEEE-488). SAIGEN talks to it through
+PyVISA, which needs a VISA library from the maker of the GPIB interface.
+
+1. Install the driver of the GPIB interface. For National Instruments
+   adapters, **NI-488.2 with NI-VISA** (select NI-VISA in the installer if it
+   is offered separately); this is the configuration tested on hardware (NI
+   GPIB-USB-HS+, see the commissioning notes). Keysight adapters use the
+   **Keysight IO Libraries Suite**, which provides a VISA library as well, but
+   that combination has not been tried. (PyVISA-py can also reach GPIB through
+   `gpib-ctypes` and the vendor's GPIB driver; that path is not covered here.)
+2. `pip install pyvisa` (listed in `requirements.txt`; the mock and the tests do
+   not need it).
+3. Find the address: on the 2002, *MENU > GPIB* shows it (16 from the factory,
+   but do not assume it). On the PC, NI MAX lists the instrument, or list the
+   GPIB resources only (the default query also returns the serial ports, and
+   some devices on this cell react when a serial port is opened):
+
+   ```bash
+   python -c "import pyvisa; print(pyvisa.ResourceManager().list_resources('GPIB?*::INSTR'))"
+   ```
+
+4. Put the resource string in `config.yaml`:
+
+   ```yaml
+   shared_devices:
+     dmm_resource: "GPIB0::16::INSTR"
+     dmm_timeout_ms: 10000
+     wait_after_dmm: 0.0      # optional pause after each measure_dmm step (s)
+   ```
+
+5. Check the link. This talks to the instrument (`*IDN?`, line sync, one
+   DC-voltage reading, then back to front-panel control) and moves nothing.
+   Steps 3 (the listing), 5 and the real run in step 6 are the human's. An
+   agent runs them only when the human explicitly asks for it in the current
+   conversation, the real run only after the `--mock` run succeeded, and it is
+   the human who starts the real run (presses Enter) (CLAUDE.md rule 1):
+
+   ```bash
+   python -m src.devices.keithley2002.keithley2002 GPIB0::16::INSTR
+   ```
+
+6. `--validate-only` and `--mock` the example
+   [`examples/keithley2002/measure_dc_voltage.json`](../examples/keithley2002/measure_dc_voltage.json),
+   then run it for real.
+
+Every `measure_dmm` step sends `:CONFigure:<function>` first, which puts the
+trigger model in single-shot mode (all three layers immediate, count 1, delay
+0), disables math, the buffer and scanning, sets the acquisition method to
+normal and returns the autozero controls and that function's own settings
+(filter, REL, digits) to their `*RST` values (2002 manual p. 3-42); then the
+range, NPLC and output format. It does not send `*RST`; settings outside that
+list, such as the GPIB address, the display and line synchronization, stay as
+they are. The line-synchronization state is written to `run.log` when the DMM
+is opened (a snapshot, not a per-measurement record). The range and NPLC are read back after the last sample and
+logged (on autorange, the range the last sample used). At the end of the run
+the instrument is returned to front-panel control (GTL).
+
+Ctrl+C during a DMM step stops the step at once (robots in the flow are
+emergency-stopped without waiting for the instrument). The I/O already on the
+bus is left to finish (each VISA read and write has the `dmm_timeout_ms`
+timeout), no further SCPI command is sent, and then the instrument is returned
+to front-panel control (GTL) and closed. A failed GTL is logged as a warning and
+the close goes ahead; a failed close is logged as an error and the handle is
+kept, so the next clean-up can try again.
+
+A failing DMM step is an ordinary step error: the run stops and, as for any
+other error, Dobot arms in the same flow are sent home. Current ranges go
+through the instrument's fuse; check the lead configuration before measuring
+current.
+
+What commissioning the first unit taught (order of work, what the firmware
+accepted, an unexplained line-sync observation, things not to do) is in
+[`knowledge/keithley2002-commissioning.md`](../knowledge/keithley2002-commissioning.md).
+
+## 11. NF LI5640 lock-in amplifier (optional, read-only)
+
+SAIGEN reads the LI5640 over GPIB; it does not set it up. Sensitivity, time
+constant, slope, reference, input, filters, dynamic reserve and the DATA1 /
+DATA2 display (with offset, expand, normalize and ratio) are set on the front
+panel. The only setting SAIGEN writes is the read-out selection `OTYP`, which it
+reads when it opens the instrument and writes back, and reads back, when it
+closes it. The one exception, off by default, is the internal oscillator
+(`set_lockin_oscillator`, at the end of this section). The driver README
+([`src/devices/li5640/README.md`](../src/devices/li5640/README.md)) lists every
+command.
+
+The GPIB interface driver and PyVISA are the same as in §10. On the instrument
+and the PC:
+
+1. On the LI5640, *SHIFT + SPECIAL* (`intFc`) must show `GPib`: the LI5640
+   uses either GPIB or RS-232, not both (manual 5-3).
+2. Read the address with *SHIFT + ADDRESS* (0 to 30, manual 5-4) and make it
+   different from every other instrument on the same GPIB bus; check each
+   instrument's own panel. Two instruments at one address corrupt the bus. The
+   transmit terminator can stay as it is.
+3. Continuous data output must be off. While it runs the LI5640 answers no
+   other query (manual 5-68, error -440); SAIGEN checks `OSTR?` when it opens
+   the instrument and refuses to go on if it is running, without stopping it.
+4. List the GPIB resources only (as in §10 step 3) and put the resource in
+   `config.yaml`:
+
+   ```yaml
+   shared_devices:
+     lockin_resource: "GPIB0::<address>::INSTR"
+     lockin_timeout_ms: 5000
+     wait_after_lockin: 0.0   # optional pause AFTER each measure_lockin step (s)
+   ```
+
+5. Check the link. This talks to the instrument (`*IDN?`, the error queue,
+   `OSTR?`, `OTYP?`, the panel settings, one `DOUT?`, then `OTYP` restored and
+   front-panel control) and moves nothing. As in §10, the listing, this check
+   and the real run are the human's (CLAUDE.md rule 1):
+
+   ```bash
+   python -m src.devices.li5640.li5640 GPIB0::<address>::INSTR
+   ```
+
+6. `--validate-only` and `--mock` the example
+   [`examples/li5640/read_lockin.json`](../examples/li5640/read_lockin.json),
+   then run it for real; for the first check add `--no-record` (no sensor CSV
+   or video recording; the run folder is still written).
+
+Side effects on the instrument besides `OTYP`: a device clear addressed to it
+(clears its input and output buffers; the setup does not change, manual 5-78),
+`*CLS` (clears its event registers and error queue; not restored) and the
+REMOTE state until the end of the run (the front panel is locked; SAIGEN sends
+GTL to this instrument only, never REN off, IFC or DCL to the bus).
+
+Each `measure_lockin` step reads the panel settings before and after its
+readings and fails if they differ (a change made and undone within the step is
+not detected), fails while an automatic setup is running, discards readings
+taken with an over-level or UNLOCK, and fails if none is left. The settings
+decide what DATA1 and DATA2 mean (X, R, θ, noise, AUX; normalize and ratio) and
+their unit. **SAIGEN does not wait for the output to settle**: after a change on
+the panel, wait before the step (manual Table 4-3: at 24 dB/oct about 10 time
+constants to 99 %; noise density about 170 time constants times the smoothing
+factor). `interval` only spaces the readings, and `wait_after_lockin` is a
+pause after the step.
+
+Ctrl+C during a lock-in step behaves as in §10: the robots are stopped first,
+the I/O on the bus is left to finish, nothing more is sent, and then the
+instrument is cleared, `OTYP` restored, sent to local and closed; each of these
+is tried even if the one before failed. If a second Ctrl+C arrives while
+SAIGEN waits for one GPIB instrument, it still releases the other before it
+stops.
+
+**Setting the internal oscillator (optional, off by default).** A flow step
+`set_lockin_oscillator` can set the oscillator frequency and the OSC OUT
+amplitude (Vrms). It is refused before anything opens unless `config.yaml`
+allows it:
+
+```yaml
+shared_devices:
+  lockin_osc_max_vrms: 0.3     # 0 = disabled (default)
+  lockin_osc_min_hz: 10.0
+  lockin_osc_max_hz: 1000.0
+```
+
+Choose the limits for what is wired to OSC OUT. They limit the **set values**
+only: not the actual output, not how long it stays on, not the load. After a
+failure the run may home robots or close other instruments before it restores
+the oscillator, so keep a sample on OSC OUT only if it tolerates the maximum for
+an unlimited time. SAIGEN never switches the amplitude range: set it on the
+panel (50 mV, 500 mV or 5 V) so that it holds every amplitude of the flow. Each
+command is read back before the next is sent. When the run ends, fails or is
+stopped with Ctrl+C, SAIGEN reads the oscillator and writes back the values it
+found when it opened the instrument (Ctrl+C does **not** switch OSC OUT off, and
+the restore may raise the amplitude to its earlier value). The result is in
+`metadata.json` (`lockin_oscillator_restore`); if it could not restore or check
+it, a completed run is marked failed (exit code 1) and a run stopped with Ctrl+C
+stays aborted (exit code 130); both get a note: check OSC OUT on the front
+panel. Details and every rule are in the driver README. The example
+[`examples/li5640/oscillator/osc_sweep_scope.json`](../examples/li5640/oscillator/osc_sweep_scope.json)
+sweeps the amplitude and frequency and reads OSC OUT on the oscilloscope of §12.
+
+What commissioning the first unit taught (what firmware 1.60 answered, the
+defects review found before the bench, open points, things not to do) is in
+[`knowledge/li5640-commissioning.md`](../knowledge/li5640-commissioning.md).
+
+## 12. Agilent 1000 series oscilloscope (optional, read-only)
+
+SAIGEN reads the automatic measurements (Vpp, mean, RMS, frequency, rise time,
+duty cycle ...) of an Agilent DSO1002A / 1004A / 1012A / 1014A / 1022A / 1024A
+over USB. It sends queries only, apart from a device clear when it opens and
+closes the instrument and `*CLS` when it opens it (`*CLS` also clears errors left in the instrument's queue
+by front-panel use): vertical scale, time base, trigger and acquisition are set
+on the front panel. The driver README
+([`src/devices/dso1000/README.md`](../src/devices/dso1000/README.md)) lists
+every command.
+
+1. Connect the rear **USB DEVICE** port (the square connector) to the PC. The
+   VISA library of §10 (NI-VISA) also drives USB instruments (USBTMC); no
+   GPIB adapter is involved.
+2. List USB resources only and put the one of the oscilloscope
+   (`USB0::0x0957::...::INSTR`, vendor 0x0957 = Agilent) in `config.yaml`. It
+   contains the instrument's serial number, so it stays in `config.yaml`:
+
+   ```bash
+   python -c "import pyvisa; print(pyvisa.ResourceManager().list_resources('USB?*::INSTR'))"
+   ```
+
+   ```yaml
+   shared_devices:
+     scope_resource: "USB0::0x0957::<product id>::<serial>::INSTR"
+     scope_timeout_ms: 5000
+     wait_after_scope: 0.0    # optional pause AFTER each measure_scope step (s)
+   ```
+
+3. On the front panel: show the channel to be measured, use the **Y-T** (or
+   ROLL) time base with the main (not zoomed) window and an **edge** trigger.
+   Other states make the step fail rather than record values whose meaning
+   SAIGEN cannot check.
+4. Check the link (the human's step, CLAUDE.md rule 1; queries only, after a
+   device clear and `*CLS`):
+
+   ```bash
+   python -m src.devices.dso1000.dso1000 USB0::0x0957::<product id>::<serial>::INSTR 1
+   ```
+
+5. `--validate-only` and `--mock` the example
+   [`examples/dso1000/read_scope.json`](../examples/dso1000/read_scope.json),
+   then run it for real; for the first check add `--no-record`.
+
+Each `measure_scope` step reads the settings before and after its reads and
+fails if they differ (a change made and undone within the step is not
+detected), if any requested item has no valid reading, or if the instrument
+reports an error. `samples` is the number of reads, not of acquisitions: the
+oscilloscope does not acquire while it answers, and nothing guarantees a new
+acquisition within `interval`. Ctrl+C behaves as in §10 and §11: robots first,
+the query on the bus is left to finish, nothing more is sent, then device clear
+and close. No GTL is sent: over USB it hung for 120 s and then failed on the
+DSO1014A that was tested. Between query sessions the front panel stayed usable,
+but it was once found locked after the session in which GTL hung (cause not
+determined; it was released from the front panel). On the bench all 18 items
+were read on a signal (duty cycle came back without the `%` the guide shows;
+both forms are accepted); accuracy against a known reference was not checked.
+
+What commissioning the first unit taught (what firmware 00.04.04 answered, the
+defects found on the bench and by review, open points, things not to do) is in
+[`knowledge/dso1000-commissioning.md`](../knowledge/dso1000-commissioning.md).
+
+## 13. Dobot MG400 robot (optional)
+
+Robot 5 can be a Dobot MG400 reached over TCP/IP (`type: mg400`). A flow may
+use `move_xyz`, `move_z`, `go_home` and `wait` on it; there is no pipette and
+no suction, and the preflight rejects every other action. Every move is one
+straight-line `MovL` in the controller's base frame (User 0 / Tool 0: the
+flange position in mm as the controller's `PositiveSolution` reports it), and
+the wrapper `src/devices/safety/mg400_robot.py` is the only code that sends
+control commands to the arm from a flow. The two human-run tools of
+`src/devices/mg400/` (observation and jog) are unchanged; what the bench
+taught before the first flow is in
+[`knowledge/mg400-commissioning.md`](../knowledge/mg400-commissioning.md).
+
+**Configuration.** A complete file is
+[`examples/mg400/config.mg400.yaml`](../examples/mg400/config.mg400.yaml);
+copy it to `config.yaml` or merge its `robots.5` entry into yours:
+
+```yaml
+robots:
+  5:
+    type: mg400
+    mg400_address: ""           # the arm's IP address, a numeric literal (no host name);
+                                # or --robot5-mg400 <address> / ROBOT5_MG400_ADDRESS
+    workspace:                  # the box every start pose, target and MovL segment must stay in
+      x_min: 350.0
+      x_max: 450.0
+      y_min: -50.0
+      y_max: 50.0
+      z_min: 170.0
+      z_max: 270.0
+      r_min: 350.0              # horizontal radius hypot(x, y) of the whole segment (optional)
+      r_max: 450.0
+    home_position: [400.0, 0.0, 220.0]   # the go_home target: set it to the arm's measured rest pose
+    joint_limits: [[-160.0, 160.0], [-25.0, 85.0], [-25.0, 105.0], [-180.0, 180.0]]
+    speed_ratio: 10             # SpeedL = AccL of every MovL, 1..10 (% of the controller's playback setting)
+    max_move_mm: 50.0           # longest single move, 1..50
+```
+
+Every key is required and nothing is inherited: an MG400 has no built-in
+defaults, and a `type: mg400` written at robot 4's id does not take the MaxArm's
+box or options either. A missing key, a key without a value, a workspace
+missing `x_min` ... `z_max`, or a value outside its range (`speed_ratio` not
+1..10, `max_move_mm` not 1..50, a `joint_limits` pair outside the published
+envelope, a `home_position` that is not `[x, y, z]`) refuses `--validate-only`,
+`--mock` and real runs with a configuration error naming the robot, before any
+device is opened. The
+numbers in the example are **not** measurements: the box is a small volume
+around the fake controller's start pose. Measure your arm's rest pose and the
+clear volume around it in DobotStudio Pro and tighten every value before the
+first real run. `joint_limits` can only tighten the ranges Dobot publishes for
+the MG400 (J1 ±160°, J2 -25..85°, J3 -25..105°, J4 ±180°); `speed_ratio`
+multiplies the controller's own playback speed and global ratio, which SAIGEN
+does not read; `max_move_mm` bounds one move. An agent never widens any of them
+(CLAUDE.md rule 2).
+
+**What a move is checked against.** The start pose is always measured
+(`PositiveSolution` of `GetAngle()`), never assumed. Before a `MovL` is written,
+in this order: the start pose is inside the box; the target is inside the box;
+the move is at least 1 mm and at most `max_move_mm`; the whole segment's
+horizontal radius stays within `r_min` .. `r_max` (computed analytically, not
+sampled); and the controller's `InverseSolution` of the target and of a sample
+every 5 mm along the segment lies within `joint_limits`, with every joint's change
+between consecutive samples below 5°. A refusal names the step and the value, and
+nothing is sent. `go_home` moves to `home_position` (sends nothing when the
+flange is already within 1 mm of it) and the session never sends an MG400 home
+by itself after an error: the stop sequence tries to disable the arm where it
+stands, and the device report says whether the arm confirmed that. The arrival is
+the controller's word (RobotMode back to 5, and the measured pose within 0.5 mm
+and 0.2° of the target) within a deadline derived from the distance.
+
+**Joint tracking at rest.** `GetAngle()` answers the controller's target angles,
+not the measured ones (stage C1 saw J2 2° below its target with no alarm,
+`knowledge/mg400-commissioning.md` §3.13). So the robot type also reads the feedback
+port's measured angles (`q_actual`) and compares them, joint by joint, with the
+target (`q_target`). After the Enable, at every pose read while enabled, before
+every `MovL` and at arrival it also compares them with the `GetAngle()` value it
+is about to use; only a packet with RobotMode 5, received after the check began,
+counts. Between steps it compares with the target only, using the latest packet
+once the step's phase grace (0.3 s) has passed. More than 0.2° on any joint stops
+the run (the stop sequence; the run is failed and the report names the joint).
+At arrival a difference is not yet a fault: the arm may still settle until the
+move's deadline, and the deadline fault names the last difference. What is
+guaranteed is that the feedback values each successful check accepted were
+within 0.2°. The check is sampled: a fault while moving, a brief excursion
+between checks, or a packet the network delivered late can go unseen, and it
+adds no Cartesian accuracy beyond the arrival check. The record
+(`control.tracking`) holds every check inside a step, every failing check, and
+a passing check between steps at most once a second; `tracking_max` holds each
+joint's largest difference over all of them.
+
+**Running.** `--validate-only` checks the absolute targets and `home_position`
+against the box; `--mock` runs the same wrapper against a fake controller in
+this process (no address needed, every validation step and the stop path run
+for real):
+
+```bash
+python -m src.flow.run_flow examples/mg400/z_hop.json --validate-only
+python -m src.flow.run_flow examples/mg400/z_hop.json --mock
+```
+
+By default the fake answers from a stand-in planar model (not the MG400's
+kinematics), which fits the example's box but cannot reach a real rest pose
+near the base. For a mock run with your measured configuration, start the fake
+at the measured pose and choose the fitted model, both in `config.yaml`:
+
+```yaml
+shared_devices:
+  mock_start_pose:
+    5: [x, y, z, r]                 # the rest pose as observe.py's PositiveSolution reports it
+  mock_kinematics:
+    5: fitted_planar_v1
+```
+
+`fitted_planar_v1` is a fitted planar approximation to one controller's
+`PositiveSolution` answers at 13 joint sets (J2 / J3 between about -22° and
+30°). It is intended for use near those joints; its accuracy between and beyond
+them is unverified, and it is still a fake. A mock run that passes with it does
+not show that the controller will accept the moves: the real run asks the
+controller's `InverseSolution` for every sample. Only the mock reads
+`mock_kinematics`; an unknown name, or a value that is not a mapping by robot
+id, is a configuration error, and `fitted_planar_v1` without a `mock_start_pose`
+is refused. The model used is written into the run's MG400 record
+(`mock_kinematics`).
+
+A real run (`python -m src.flow.run_flow examples/mg400/z_hop.json`, the
+address in `config.yaml` or `--robot5-mg400 <address>`) prints what will happen
+(robot, address, box, speed ratio, home, the first MG400 step, what a stop
+means) and waits for Enter on a terminal **before** any device is opened or a
+log folder is created; anything but an empty line on a terminal ends the run
+with exit code 2. In the GUI the confirmation dialog of a real run is that step:
+it shows the same facts, and only its "start" button hands the approved MG400
+ids to the runner, which refuses a real MG400 run without them.
+Before pressing Enter: DobotStudio Pro closed, the controller's remote-control
+mode set to TCP/IP (otherwise the first `RobotMode()` is answered ErrorID -1 and
+the run ends before any control command), the arm disabled with no alarm,
+nothing on the flange, the volume of the box clear, the emergency-stop button
+within reach. After the Enter: ResetRobot, EnableRobot, the flow's moves, then
+DisableRobot confirmed by RobotMode 4 at the end. Pressing Enter is the human's
+step; an agent runs `--validate-only` and `--mock` and stops there
+(CLAUDE.md rule 1).
+
+**Stopping.** Ctrl+C and the GUI Stop are **not** an emergency stop. The control
+worker takes the stop at its next send, or within about 0.1 s when it is idle,
+and starts the orderly stop sequence of the jog tool: ResetRobot, DisableRobot,
+confirmation polls, then EmergencyStop unless the arm showed itself disabled
+(or in alarm with its joints still) and the Enable's outcome is known, bounded
+by 15 s; once the arm has reported disabled again after its DisableRobot, no
+stop sequence is added. A fault seen by the worker itself (the feedback stream
+stopping, a non-zero ErrorID, an unexpected RobotMode) starts the same sequence
+on its own. A stop that ends in EmergencyStop or without confirmation marks the
+run failed even when every step had finished (`RobotStopError`, exit code 1),
+with the controller's guidance in the log. The emergency stop is the button on
+the controller, which the human must have within reach. A stop before the
+connection (Stop pressed while another robot was still initializing) is kept as
+a latch: the MG400 is not connected at all; a stop while the MG400 is between
+its initialization and its registration still reaches it, and the robot is then
+not registered. In the terminal, for a run that uses an MG400 (`--mock`
+included), the first Ctrl+C is handed to a separate thread that sets the
+latch, also while the run is busy in another step (a camera capture, say),
+before anything is logged, and then cancels the run; every later Ctrl+C is
+deferred, with a message, until the run has finished its stop sequence,
+disconnect and record. The MG400's own disconnect wait is bounded (about 25 s);
+a step stuck in another device is not, and the runner then stays where it is.
+If that happens: check in DobotStudio Pro (or at the arm) that the MG400 shows
+itself disabled, press the emergency-stop button if it does not, and only then
+end the Python process (close the terminal, or end it in Task Manager). The run's
+`metadata.json` and the MG400's `report.json` may then be incomplete. A GUI Stop (or any cancel) while the disconnect is being
+waited for becomes a stop and the wait goes on to the end. A disconnect whose
+end could not be confirmed (the worker still running after the bound, or the
+wait interrupted in another way) is written into the report (`failed_reason`,
+`cleanup_incomplete`): a run whose steps had all finished is marked failed, an
+interrupted one stays aborted with that note. Check the arm in DobotStudio Pro
+then. A device record that could not be written
+marks the run failed too, with the arm's own state reported separately.
+
+**Records.** Each run writes `mg400_<robot id>/report.json` and `feedback.*`
+into its log folder (`logs/<date>/<flow>_<time>/`): every command and reply,
+every measured pose, every move with its validation and arrival, and the `stop`
+section when a stop ran. `metadata.json` carries the summary under
+`robot_reports`. The record is saved with the jog tool's retrying writer; a
+folder synced by OneDrive can still refuse the final rename
+(`knowledge/mg400-commissioning.md` §3.3), so keep `logs/` outside synced folders when
+you can.
+
+**Bench order** (each stage only when the human asks, in the session;
+`knowledge/mg400-commissioning.md` §2): the jog tool's stop sequence on the arm once (C1),
+`z_hop.json` with the measured `config.yaml` (C2), the same flow with a Ctrl+C
+during a move (C3), then the user's own flows at ratio 10 (D). A payload, a
+tool on the flange, R changes and ratios above 10 are later plans.
+
 ## Troubleshooting
 
 - **`GEMINI_API_KEY が設定されていません`** — the key is missing from `.env`, or the
@@ -421,6 +861,35 @@ The example flow is [`examples/maxarm/pick_and_place.json`](../examples/maxarm/p
   control once. `MicroscopeController.connect()` does that (5000 K, through
   DirectShow on Windows), so use the saigen driver rather than a plain OpenCV
   capture; the vendor viewer's *Connect* button has the same effect.
+- **`Keithley 2002 初期化エラー`** — `dmm_resource` is empty or wrong, the VISA
+  library is not installed (`pyvisa` then cannot find a backend), or another
+  program (NI MAX's interactive window, KickStart) holds the instrument. The
+  check in §10 step 5 shows which. A `*IDN?` that is not a 2002 is refused.
+- **`機器がエラーを報告しました: -113,"Undefined header"`** — the instrument
+  rejected a command; the message lists the errors from its queue. Old firmware
+  may lack `:FORMat:EXPonent`; report the firmware revision (the last field of
+  `*IDN?`).
+- **DMM step times out** — one reading takes longer than `dmm_timeout_ms` (high
+  NPLC with autorange, AC functions); raise it in `config.yaml`.
+- **`LI5640 初期化エラー`** — `lockin_resource` is empty or wrong, the interface
+  is set to RS-232 on the panel, two instruments share the address, continuous
+  data output is running (`連続データ出力（OSTR 1）が動いています`), or the
+  `*IDN?` is not an LI5640. The check in §11 step 5 shows which.
+- **`LI5640 の設定が測定中に変わりました`** — a panel setting differed before and
+  after the readings (someone used the panel, or an automatic function ran).
+  The settings before and after and the difference are in the `diagnostics`
+  column of `measurements.csv` and under `step_diagnostics` in `metadata.json`.
+- **`LI5640 から有効なサンプルを取得できませんでした`** — every reading had an
+  over-level or UNLOCK; the reasons are counted in the message and in
+  `diagnostics`. Check the sensitivity, the reference and the lamps on the panel.
+- **`オシロスコープ初期化エラー`** — `scope_resource` is empty or wrong, the cable
+  is in the front USB host port instead of the rear USB DEVICE port, or the
+  model is not one of the six of the series (`対応していない機種です`).
+- **`有効な値を取得できなかった項目があります`** — the oscilloscope could not
+  make that measurement on the displayed waveform (for example a rise time
+  faster than it can resolve comes back as `<value`, a frequency needs a full
+  cycle on screen). The reasons per item are in `diagnostics`; adjust the time
+  base or the vertical scale on the panel.
 - **Microscope LED does nothing** — `microscope_led` needs `microscope_port`: the
   400-CAM106 exposes a second device, a Silicon Labs CP210x serial port (VID
   `10C4`, S/N `0001`), on the same USB cable. Set that COM port in `config.yaml`.
