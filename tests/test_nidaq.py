@@ -57,6 +57,7 @@ class Bench:
         self.clock_sources = []   # source of each cfg_samp_clk_timing (None = onboard)
         self.ai_chans = {}        # physical channel -> the channel object handed out
         self.change_detection = []  # (rising, falling, mode) of cfg_change_detection_timing
+        self.product_type = "USB-6351"  # the model the fake device reports
 
 
 class FakeDaqError(Exception):
@@ -200,7 +201,7 @@ def install_fake_nidaqmx(monkeypatch, bench):
 
     class _Device:
         def __init__(self, name):
-            self.name, self.product_type = name, "USB-6351"
+            self.name, self.product_type = name, bench.product_type
 
     class _Devices(list):
         pass
@@ -2204,3 +2205,391 @@ def test_stimulus_column_does_not_slip_at_exact_sample_boundaries(tmp_path):
     period = waveform_period("sawtooth", 1.0, 1.0, 1000)
     assert all(float(row[-1]) == pytest.approx(period[i % 1000], abs=1e-6)
                for i, row in enumerate(rows))
+
+
+# ----------------------------------------------------------------------
+# Device profiles: one table entry per model (USB-6351, USB-6002)
+# ----------------------------------------------------------------------
+from src.devices.nidaq import profiles as daq_profiles  # noqa: E402
+from src.devices.nidaq import probe as daq_probe  # noqa: E402
+
+U6002 = {"daq_model": "USB-6002"}
+U6002_OUT = {"daq_model": "USB-6002", "daq_ao_channels": ["ao0", "ao1"],
+             "daq_do_lines": ["port0/line0"], "daq_ao_min_v": 0.0, "daq_ao_max_v": 5.0}
+
+
+def _service_6002(config=None):
+    backend = MockNIDaq(model="USB-6002")
+    return DaqService(backend, U6002 if config is None else config, mock=True), backend
+
+
+@pytest.mark.parametrize("name", ["USB-6002", "usb6002", "NI USB-6002", " usb-6002 "])
+def test_profile_lookup_accepts_the_usual_spellings(name):
+    assert daq_profiles.get_profile(name) is daq_profiles.USB_6002
+
+
+def test_profile_default_and_unknown_model():
+    assert daq_profiles.get_profile(None) is daq_profiles.USB_6351
+    assert daq_profiles.get_profile("") is daq_profiles.USB_6351
+    with pytest.raises(daq_profiles.DaqProfileError, match="USB-6002, USB-6351"):
+        daq_profiles.get_profile("USB-6999")
+
+
+@pytest.mark.parametrize("name, kind_6351, kind_6002", [
+    ("ai7", "ai", "ai"), ("ai8", "ai", None), ("ai16", None, None),
+    ("ao1", "ao", "ao"), ("ao2", None, None),
+    ("port0/line7", "line", "line"), ("port1/line3", "line", "line"),
+    ("port1/line4", "line", None), ("port2/line0", "line", "line"),
+    ("port2/line1", "line", None), ("port3/line0", None, None),
+    ("ctr0", "counter", "counter"), ("ctr1", "counter", None),
+    ("pfi1", "terminal", "terminal"), ("pfi2", "terminal", None),
+    ("100khztimebase", "terminal", None),
+])
+def test_profiles_know_which_channels_each_model_has(name, kind_6351, kind_6002):
+    assert daq_profiles.USB_6351.kind_of(name) == kind_6351
+    assert daq_profiles.USB_6002.kind_of(name) == kind_6002
+    # the schema, which does not know the model, accepts what some model has
+    assert daq_policy.physical_kind(name) == (kind_6351 or kind_6002)
+
+
+def test_every_feature_and_action_in_the_tables_is_known():
+    assert set(daq_profiles.ACTION_FEATURES) <= set(DAQ_ACTION_NAMES)
+    assert {a for a, _ in daq_profiles.OPTION_FEATURES} <= set(DAQ_ACTION_NAMES)
+    used = set(daq_profiles.ACTION_FEATURES.values()) | set(daq_profiles.OPTION_FEATURES.values())
+    assert used | {daq_profiles.THERMOCOUPLE, daq_profiles.RTD} == set(daq_profiles.FEATURE_LABEL)
+    assert daq_profiles.USB_6351.features == frozenset(daq_profiles.FEATURE_LABEL)
+    for step in DAQ_ACTION_NAMES:                       # the first model runs every step
+        daq_profiles.USB_6351.check_step(step, {})
+
+
+def test_policy_of_the_6002_refuses_what_it_does_not_have():
+    p = daq_profiles.USB_6002
+    DaqOutputPolicy.from_config({"daq_ao_channels": ["ao0", "ao1"],
+                                 "daq_do_lines": ["port1/line3", "port2/line0"]}, p)
+    with pytest.raises(DaqPolicyError, match="USB-6002 has no digital line port1/line4"):
+        DaqOutputPolicy.from_config({"daq_do_lines": ["port1/line4"]}, p)
+    with pytest.raises(DaqPolicyError, match="cannot output pulse trains"):
+        DaqOutputPolicy.from_config({"daq_co_counters": ["ctr0"]}, p)
+    with pytest.raises(DaqPolicyError, match="USB-6002 has no counter ctr1"):
+        DaqOutputPolicy.from_config({"daq_co_counters": ["ctr1"]}, p)
+    # the unused frequency limit of a config written for another model does not matter
+    assert DaqOutputPolicy.from_config({"daq_co_max_hz": 1000.0}, p).co_counters == frozenset()
+    with pytest.raises(DaqPolicyError, match="no hardware-timed"):
+        DaqOutputPolicy.from_config({"daq_do_lines": ["port0/line0"]}, p).check_digital_pattern(
+            ["port0/line0"])
+
+
+@pytest.mark.parametrize("spec, message", [
+    ({"channel": "ai8"}, "USB-6002 has no analog input ai8"),
+    ({"channel": "pfi2"}, "USB-6002 has no terminal pfi2"),
+    ({"channel": "100khztimebase"}, "USB-6002 has no terminal"),
+    ({"channel": "ai0", "terminal": "nrse"}, "terminal must be one of"),
+    ({"channel": "ai4", "terminal": "diff"}, "cannot be read differentially"),
+    ({"channel": "ai0", "v_range": 5}, "v_range must be one of"),
+    ({"channel": "ai0", "sensor": "thermocouple", "tc_type": "K", "cjc_c": 25.0},
+     "does not support thermocouple"),
+    ({"channel": "ai0", "sensor": "rtd", "excitation_a": 0.001}, "does not support RTD"),
+])
+def test_signals_of_the_6002_are_checked_against_its_profile(spec, message):
+    with pytest.raises(DaqPolicyError, match=message):
+        DaqSignals({"probe": spec}, daq_profiles.USB_6002)
+    if spec["channel"] != "ai4":
+        DaqSignals({"probe": spec})                         # fine on the USB-6351
+
+
+def test_signals_of_the_6002_that_it_has():
+    signals = DaqSignals({"sensor_v": {"channel": "ai3", "terminal": "diff", "v_range": 10,
+                                       "scale": 2.0, "unit": "bar"},
+                          "valve": "port1/line3", "flow": "pfi1"}, daq_profiles.USB_6002)
+    assert signals.resolve("sensor_v", "ai").channel == "ai3"
+    assert signals.resolve("ai7", "ai").channel == "ai7"
+    with pytest.raises(DaqPolicyError, match="USB-6002 has no analog input ai12"):
+        signals.resolve("ai12", "ai")
+
+
+def test_differential_pairs_are_checked_on_the_6351_too():
+    service, _ = _service()
+    with pytest.raises(DaqPolicyError, match="ai8 cannot be read differentially"):
+        _go(service, "daq_read_analog", channel="ai8", terminal="diff")
+    assert _go(service, "daq_read_analog", channel="ai7", terminal="diff")["voltage"] == 1.234
+
+
+@pytest.mark.parametrize("action, params", [
+    ("daq_measure_frequency", {"terminal": "pfi0"}),
+    ("daq_measure_period", {"terminal": "pfi0"}),
+    ("daq_measure_pulse_width", {"terminal": "pfi0"}),
+    ("daq_measure_edge_separation", {"first": "pfi0", "second": "pfi1"}),
+    ("daq_start_encoder", {"a": "pfi0", "b": "pfi1", "pulses_per_rev": 360}),
+    ("daq_read_encoder", {}),
+    ("daq_stop_encoder", {}),
+    ("daq_generate_pulses", {"counter": "ctr0", "frequency_hz": 10.0}),
+    ("daq_acquire_digital", {"lines": ["port0/line0"], "rate_hz": 1000.0, "duration_s": 0.1}),
+    ("daq_write_digital_pattern", {"lines": ["port0/line0"], "pattern": ["1", "0"],
+                                   "rate_hz": 10.0}),
+    ("daq_wait_digital_change", {"lines": ["port0/line0"]}),
+    ("daq_acquire", {"channels": ["ai0"], "trigger": "ai0", "trigger_level": 1.0}),
+    ("daq_acquire", {"channels": ["ai0"], "trigger": "pfi0", "pretrigger_s": 0.1}),
+    ("daq_acquire", {"channels": ["ai0"], "clock": "pfi0"}),
+])
+def test_the_6002_refuses_steps_it_cannot_run_before_touching_the_device(action, params):
+    service, backend = _service_6002(U6002_OUT)
+    called = []
+    for name in [n for n in dir(backend) if not n.startswith("_") and callable(getattr(backend, n))]:
+        original = getattr(backend, name)
+        setattr(backend, name, lambda *a, _n=name, _f=original, **k: (called.append(_n), _f(*a, **k))[1])
+    with pytest.raises(DaqPolicyError, match="the USB-6002 does not support"):
+        _go(service, action, **params)
+    assert called == []
+    assert service.unsupported_steps([{"action": action, **params}])[0].startswith("step 1: ")
+
+
+def test_the_6002_runs_the_steps_it_has(tmp_path):
+    service, backend = _service_6002(U6002_OUT)
+    assert service.profile is daq_profiles.USB_6002 and backend.product_type == "USB-6002 (mock)"
+    assert _go(service, "daq_read_analog", channel="ai7", terminal="rse")["voltage"] == 1.234
+    _go(service, "daq_write_analog", channel="ao1", voltage=2.0)
+    _go(service, "daq_write_digital", line="port0/line0", state=True)
+    _go(service, "daq_pulse_digital", line="port0/line0", duration_s=0.01)
+    assert _go(service, "daq_read_digital", line="port2/line0")["digital_state"] in (True, False)
+    path = str(tmp_path / "wave.csv")
+    _go(service, "daq_acquire", channels=["ai0", "ai1"], rate_hz=25000.0, duration_s=0.01,
+        trigger="pfi1", file_path=path)
+    assert len(_csv(path)) == 251
+    _go(service, "daq_count_edges", terminal="pfi0", duration_s=0.01)
+    _go(service, "daq_generate_waveform", channel="ao0", waveform="sine", frequency_hz=10.0,
+        amplitude_v=1.0, offset_v=2.0)
+    assert backend.waveforms["ao0"]["rate_hz"] == 5000.0    # 500 points per cycle, not 1000
+    _go(service, "daq_stop_output", channel="ao0")
+    _go(service, "daq_stimulate_acquire", channel="ao0", waveform="triangle", frequency_hz=10.0,
+        amplitude_v=1.0, offset_v=2.0, channels=["ai0"], rate_hz=5000.0, duration_s=0.1,
+        file_path=str(tmp_path / "stim.csv"))
+    assert service.close() == []
+
+
+@pytest.mark.parametrize("params, message", [
+    ({"channels": ["ai0"], "rate_hz": 60000.0, "duration_s": 0.01}, "limit of the USB-6002"),
+    ({"channels": ["ai0", "ai1"], "rate_hz": 30000.0, "duration_s": 0.01}, "limit of the USB-6002"),
+    ({"channels": ["ai0"], "v_range": 5.0}, "v_range must be one of"),
+    ({"channels": ["ai0"], "terminal": "nrse"}, "terminal must be one of"),
+    ({"channels": ["ai4"], "terminal": "diff"}, "cannot be read differentially"),
+    ({"channels": ["ai8"]}, "USB-6002 has no analog input ai8"),
+    ({"channels": ["ai0"], "trigger": "pfi5"}, "USB-6002 has no terminal pfi5"),
+])
+def test_the_6002_limits_apply_to_an_acquisition(params, message, tmp_path):
+    service, _ = _service_6002()
+    with pytest.raises(ValueError, match=message):
+        _go(service, "daq_acquire", file_path=str(tmp_path / "x.csv"), **params)
+
+
+def test_the_6002_waveform_frequency_is_bounded_by_its_update_rate():
+    service, _ = _service_6002(U6002_OUT)
+    with pytest.raises(ValueError, match="too high"):
+        _go(service, "daq_generate_waveform", channel="ao0", waveform="sine",
+            frequency_hz=500.0, amplitude_v=1.0, offset_v=2.0)     # 10 points per cycle
+    _go(service, "daq_generate_waveform", channel="ao0", waveform="sine",
+        frequency_hz=250.0, amplitude_v=1.0, offset_v=2.0)         # 20 points per cycle
+
+
+def test_real_driver_takes_the_profile_from_the_device(bench):
+    bench.product_type = "USB-6002"
+    daq = NIDaq("Dev1")
+    assert daq.profile is daq_profiles.USB_6351             # until the device has been asked
+    assert daq.connect() is True and daq.profile is daq_profiles.USB_6002
+    with pytest.raises(ValueError, match="limit of the USB-6002"):
+        daq.acquire([("ai0", 10.0, "rse")], 60000.0, 10)
+    with pytest.raises(ValueError, match="rate_hz"):
+        daq.start_waveform("ao0", [0.0, 1.0], 6000.0)
+    with pytest.raises(ValueError, match="the device has"):
+        daq.count_edges("pfi0", 0.01, counter="ctr1")
+    assert bench.outputs == {}
+    daq.close()
+
+
+def test_real_driver_refuses_a_model_without_a_profile(bench, caplog):
+    bench.product_type = "USB-6999"
+    daq = NIDaq("Dev1")
+    assert daq.connect() is False
+    assert "has no profile" in caplog.text and "profiles.py" in caplog.text
+
+
+def _shared_real(config):
+    async def go():
+        shared = SharedDevices(use_daq=True, daq_device="Dev1", **config)
+        ok = await shared.initialize()
+        return shared, ok
+    return asyncio.run(go())
+
+
+def test_real_session_stops_when_config_names_another_model(bench, caplog):
+    bench.product_type = "USB-6351"
+    shared, ok = _shared_real({"daq_model": "USB-6002"})
+    assert ok is False and "means USB-6002, but the device is a USB-6351" in caplog.text
+    assert bench.outputs == {} and bench.open_tasks == 0
+
+
+def test_real_session_on_a_6002_refuses_what_the_model_lacks(bench):
+    bench.product_type = "USB-6002"
+    shared, ok = _shared_real({"daq_model": "USB-6002"})
+    assert ok is True and shared.daq_service.profile is daq_profiles.USB_6002
+
+    async def go():
+        with pytest.raises(DaqPolicyError, match="USB-6002 does not support"):
+            await shared.daq_step("daq_measure_period", terminal="pfi0")
+        with pytest.raises(DaqPolicyError, match="daq_ao_channels"):
+            await shared.daq_step("daq_write_analog", channel="ao0", voltage=1.0)
+        await shared.cleanup()
+    asyncio.run(go())
+    assert bench.outputs == {} and bench.counters == []
+
+
+def test_a_config_for_the_6351_is_refused_by_a_6002(bench, caplog):
+    bench.product_type = "USB-6002"
+    shared, ok = _shared_real({"daq_model": "USB-6002", "daq_co_counters": ["ctr0"]})
+    assert ok is False and "cannot output pulse trains" in caplog.text
+
+
+def test_a_blank_daq_model_means_the_default_model_on_the_bench_too(bench, caplog):
+    """--mock imitates a USB-6351 when daq_model is empty; a real USB-6002 must then not
+    start, or a flow could pass --mock and be refused on the bench."""
+    bench.product_type = "USB-6002"
+    shared, ok = _shared_real({})
+    assert ok is False
+    assert "set daq_model: USB-6002 in config.yaml" in caplog.text
+    assert bench.outputs == {} and bench.open_tasks == 0
+
+
+def test_real_driver_refuses_a_device_without_a_product_type(bench, caplog):
+    bench.product_type = " "
+    assert NIDaq("Dev1").connect() is False and "no product type" in caplog.text
+
+
+@pytest.mark.parametrize("name", ["ai00", "ai07", "pfi00", "pfi01", "port0/line00",
+                                  "port2/line04", "ctr00", "ao00"])
+def test_padded_channel_numbers_are_not_names(name):
+    """DAQmx refuses them, and "port2/line04" would slip past the pin-conflict table."""
+    assert daq_policy.physical_kind(name) is None
+    assert daq_profiles.USB_6351.kind_of(name) is None
+    with pytest.raises(ValueError):
+        daq_policy.check_flow_name(name, daq_policy.KINDS)
+    with pytest.raises(DaqPolicyError):
+        DaqSignals({"x": name})
+    if name.startswith("port"):
+        with pytest.raises(DaqPolicyError):
+            DaqOutputPolicy.from_config({"daq_do_lines": [name]})
+
+
+@pytest.mark.parametrize("make", [NIDaq, MockNIDaq])
+def test_an_averaged_reading_respects_the_model_rate_limit(bench, make):
+    daq = make("Dev1") if make is NIDaq else make(model="USB-6002")
+    if make is NIDaq:
+        bench.product_type = "USB-6002"
+        assert daq.connect()
+    with pytest.raises(ValueError, match="limit of the USB-6002"):
+        daq.read_analog("ai0", samples=100, rate_hz=60000.0, terminal="rse")
+    daq.read_analog("ai0", samples=1, rate_hz=60000.0, terminal="rse")   # no clock is used
+    daq.read_analog("ai0", samples=100, rate_hz=50000.0, terminal="rse")
+    daq.close()
+
+
+@pytest.mark.parametrize("model, pfi, line", [("USB-6002", "pfi0", "port2/line0"),
+                                              ("USB-6002", "pfi1", "port1/line1"),
+                                              ("USB-6351", "pfi0", "port1/line0"),
+                                              ("USB-6351", "pfi12", "port2/line4")])
+@pytest.mark.parametrize("make", [NIDaq, MockNIDaq])
+def test_a_pfi_is_no_input_while_its_pin_is_driven_as_a_digital_output(bench, make, model,
+                                                                      pfi, line):
+    bench.product_type = model
+    daq = make("Dev1") if make is NIDaq else make(model=model)
+    assert daq.connect()
+    daq.count_edges(pfi, 0.001)                             # free pin: fine
+    daq.write_digital(line, True)
+    with pytest.raises(RuntimeError, match=f"{pfi} is the pin of {line}"):
+        daq.count_edges(pfi, 0.001)
+    with pytest.raises(RuntimeError, match=f"{pfi} is the pin of {line}"):
+        daq.acquire([("ai0", 10.0, "rse")], 1000.0, 10, trigger=pfi)
+    if make is NIDaq:
+        assert bench.outputs[f"Dev1/{line}"] is True         # the output was not disturbed
+    daq.stop_output(line)
+    assert daq.close() == []
+
+
+@pytest.mark.parametrize("make", [NIDaq, MockNIDaq])
+def test_a_line_is_not_driven_while_the_encoder_listens_on_its_pin(bench, make):
+    daq = make("Dev1") if make is NIDaq else make()
+    assert daq.connect()
+    daq.start_encoder("pfi8", "pfi10", 360)
+    with pytest.raises(RuntimeError, match="encoder"):
+        daq.write_digital("port2/line0", True)               # pfi8
+    daq.write_digital("port2/line1", True)                   # pfi9: not an encoder pin
+    daq.stop_encoder()
+    daq.write_digital("port2/line0", True)
+    assert daq.close() == []
+
+
+def test_profiles_are_checked_for_consistency():
+    import dataclasses
+    base = daq_profiles.USB_6351
+    with pytest.raises(ValueError, match="counter_output_lines"):
+        dataclasses.replace(base, counter_output_lines={"ctr0": "port2/line4"})
+    with pytest.raises(ValueError, match="pfi_lines"):
+        dataclasses.replace(base, pfi_lines={})
+    with pytest.raises(ValueError, match="not a digital line"):
+        dataclasses.replace(daq_profiles.USB_6002, pfi_lines={"pfi0": "port2/line0",
+                                                             "pfi1": "port1/line7"})
+    with pytest.raises(ValueError, match="timed_port"):
+        dataclasses.replace(daq_profiles.USB_6002, timed_port="port0")
+
+
+def _use_config(monkeypatch, extra):
+    shared = dict(run_flow.lab_config.get_shared_devices(), daq_signals={}, daq_model="",
+                  daq_ao_channels=[], daq_do_lines=[], daq_co_counters=[])
+    shared.update(extra)
+    monkeypatch.setattr(run_flow.lab_config, "get_shared_devices", lambda: dict(shared))
+
+
+def test_6002_input_example_runs_as_a_6002_and_as_a_6351(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_flow, "LOGS_DIR", str(tmp_path / "logs"))
+    flow = os.path.join(REPO_ROOT, "examples", "daq", "usb6002_inputs.json")
+    assert run_flow.main([flow, "--validate-only"]) == 0
+    for model in ("USB-6002", ""):
+        _use_config(monkeypatch, {"daq_model": model})
+        assert run_flow.main([flow, "--mock"]) == 0
+        rows = _rows(_latest_run_dir(str(tmp_path / "logs")))
+        assert len(rows) == 9 and all(r["status"] == "ok" for r in rows)
+    with open(flow, encoding="utf-8") as f:
+        import json
+        assert all(s["action"].startswith("daq_") for s in json.load(f)["steps"])
+
+
+def test_a_flow_the_model_cannot_run_is_stopped_before_its_first_step(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(run_flow, "LOGS_DIR", str(tmp_path / "logs"))
+    flow = os.path.join(REPO_ROOT, "examples", "daq", "timing_and_triggers.json")
+    _use_config(monkeypatch, {"daq_model": "USB-6002"})
+    assert run_flow.main([flow, "--mock"]) == 1
+    assert _rows(_latest_run_dir(str(tmp_path / "logs"))) == []     # nothing was executed
+    assert "step 1: daq_measure_period: the USB-6002 does not support" in caplog.text
+    assert "step 5: daq_acquire: the USB-6002 does not support pre-trigger" in caplog.text
+
+
+def test_6002_loopback_check_runs_only_with_its_outputs_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_flow, "LOGS_DIR", str(tmp_path / "logs"))
+    flow = os.path.join(REPO_ROOT, "examples", "daq", "usb6002_loopback_check.json")
+    assert run_flow.main([flow, "--validate-only"]) == 0
+    _use_config(monkeypatch, {"daq_model": "USB-6002"})        # as shipped: refused at step 1
+    assert run_flow.main([flow, "--mock"]) == 1
+    rows = _rows(_latest_run_dir(str(tmp_path / "logs")))
+    assert len(rows) == 1 and "daq_ao_channels" in rows[0]["error"]
+    _use_config(monkeypatch, U6002_OUT)
+    assert run_flow.main([flow, "--mock"]) == 0
+    rows = _rows(_latest_run_dir(str(tmp_path / "logs")))
+    assert len(rows) == 28 and all(r["status"] == "ok" for r in rows)
+
+
+def test_probe_compares_a_device_report_with_its_profile():
+    info = {"model": "USB-6002", "ai_channels": 8, "v_ranges": [10.0],
+            "ai_max_rate_single_hz": 50000.0, "ai_max_rate_aggregate_hz": 50000.0,
+            "ao_channels": 2, "ao_max_rate_hz": 5000.0, "port_lines": (8, 4, 1),
+            "counters": 1, "pfi": 2, "timed_ports": []}
+    assert daq_probe.compare(info)[0].startswith("the compared figures agree with the USB-6002")
+    assert "counters: device reports 2" in daq_probe.compare({**info, "counters": 2})[0]
+    assert "no profile for USB-6999" in daq_probe.compare({**info, "model": "USB-6999"})[0]

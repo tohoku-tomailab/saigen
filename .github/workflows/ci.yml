@@ -81,6 +81,7 @@ jobs:
           python -m src.flow.run_flow examples/daq/read_voltage.json --mock
           python -m src.flow.run_flow examples/daq/acquire_and_count.json --mock
           python -m src.flow.run_flow examples/daq/timing_and_triggers.json --mock
+          python -m src.flow.run_flow examples/daq/usb6002_inputs.json --mock
 
       - name: Recompute the dispensing-stability statistics
         run: python examples/dispensing_stability/stats.py

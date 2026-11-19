@@ -5,11 +5,16 @@
 | `read_voltage.json` | no | `daq_device` | Averaged voltage readings and one digital input |
 | `acquire_and_count.json` | no | `daq_device` | Waveform capture to CSV, continuous recording in the background, the counters measuring the internal 100 kHz timebase (no wiring) |
 | `timing_and_triggers.json` | no | `daq_device` | Period, pulse width and edge-to-edge time of the internal timebase; an acquisition on an external clock and one with pre-trigger samples; a digital waveform of port 0; an encoder (no wiring) |
+| `usb6002_inputs.json` | no | `daq_device` (a USB-6002 or a USB-6351) | The input steps a USB-6002 has: readings, a two-channel waveform at its 50 kS/s limit, a recording while its counter counts, digital inputs |
+| `usb6002_loopback_check.json` | **yes**, into the board's own inputs | a USB-6002, four jumpers, outputs enabled for the check | Bench check of the USB-6002's outputs, counter and trigger by loop-back (below) |
 | `output_loopback_check.json` | **yes**, into the board's own inputs | four jumpers, outputs enabled for the check | Bench check of every output function by loop-back (below) |
 | `stimulus_response_template.json` | **yes** | signals defined, wired and enabled | A flow written with signal names only: DC level, waveform excitation, triggered-by-condition waits, valve pulse, pulse train |
 
-The first three are safe with nothing wired: `--validate-only`, `--mock`, then a
-real run. An unconnected analog input reads an arbitrary, drifting voltage.
+The first three and `usb6002_inputs.json` are safe with nothing wired:
+`--validate-only`, `--mock`, then a real run. The first three need a USB-6351
+(`acquire_and_count.json` and `timing_and_triggers.json` use its internal timebase
+and counter measurements; with `daq_model: USB-6002` they are stopped before their
+first step, with the reason). An unconnected analog input reads an arbitrary, drifting voltage.
 They contain `daq_*` steps only, so a real run opens the DAQ and nothing else.
 A `wait` step belongs to a robot (robot 1 unless `robot_id` says otherwise): add
 one to a DAQ flow and a real run also connects to that arm, without moving it.
@@ -96,3 +101,49 @@ pattern with its response). Steps 25–27 drive a DC level and a waveform at the
 same time, which had not been tried on a device either. If DAQmx refuses one of
 them the flow stops there with its error, the outputs are reset, and everything
 before it has still been checked; report the error text.
+
+## Bench check of a USB-6002: `usb6002_loopback_check.json`
+
+The same idea on the smaller board. It has no pulse-train output, so its own
+analog output, as a 0–5 V square wave, is the signal for its counter and its
+digital trigger. **Disconnect everything else from the terminal block first.**
+Four jumpers (AO 0 carries two):
+
+| From | To | Checks |
+|---|---|---|
+| AO 0 | AI 0 | DC output, waveform output |
+| AO 0 | PFI 0 | edge counting, digital start trigger |
+| AO 1 | AI 1 | second analog output; DC and waveform at the same time |
+| P0.0 | P0.1 | digital output and pulse |
+
+In `config.yaml` (section `shared_devices`), for the check:
+
+```yaml
+daq_device: Dev2          # the name NI MAX shows for the USB-6002
+daq_model: USB-6002
+daq_ao_channels: [ao0, ao1]
+daq_do_lines: [port0/line0]
+daq_co_counters: []
+daq_ao_min_v: 0.0
+daq_ao_max_v: 5.0
+```
+
+`--validate-only`, `--mock`, then the real run. Expected:
+
+| Steps | Expected |
+|---|---|
+| 1–6 | ai0 reads 2.5 V, then 1.0 V, then 0 V (within about 10 mV: this board's accuracy is a few mV) |
+| 7–10 | the waveform CSV holds 5 cycles of a sine between 1 V and 3 V; afterwards ai0 reads 0 V |
+| 11–16 | port0/line1 reads High, then Low, then Low again after the pulse |
+| 17–18 | about 100 edges in 2 s (a 50 Hz square wave between 0 V and 5 V on PFI 0) |
+| 19 | the acquisition starts on a rising edge: the CSV begins near 5 V and shows 5 cycles in 0.1 s |
+| 20–21 | 0 edges: the output is back at 0 V |
+| 22 | the CSV holds 5 cycles of a triangle between 1 V and 3 V in `ai0_V`, following the `ao0_set_V` column |
+| 23–25 | ai1 holds 1.5 V while ai0 shows a square wave between 1 V and 3 V |
+| 26–28 | both back at 0 V |
+
+None of these outputs had been driven on a USB-6002 when this was written. The
+likeliest refusals are step 22 (an acquisition started by the analog output: the
+device accepted the configuration, it was not run) and steps 23–25 (a DC level
+and a waveform on the two outputs at once). If DAQmx refuses a step the flow
+stops there with its error and the outputs are reset; report the error text.

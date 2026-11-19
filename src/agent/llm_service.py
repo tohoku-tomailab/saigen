@@ -97,8 +97,9 @@ SYSTEM_PROMPT = """
 - measure_weight: {"action": "measure_weight", "stabilization_count": 3} (重量測定)
 - tare_scale: {"action": "tare_scale", "delay": 1.0} (風袋引き)
 
-### DAQ 操作（NI USB-6351）※共有デバイスのためrobot_id不要。ユーザーが明示的に求めたときだけ使う
+### DAQ 操作（NI USB-6351 / USB-6002）※共有デバイスのためrobot_id不要。ユーザーが明示的に求めたときだけ使う
 チャンネルは config.yaml の daq_signals で定義された信号名（ユーザーが名前を示した場合）か、物理名（ai0-ai15 / ao0-ao1 / port0/line0 / ctr0-ctr3 / pfi0-pfi15）。出力は config.yaml で許可されたものだけが実行でき、実行終了時に 0 V / Low / 停止 に戻る
+ユーザーが USB-6002 と言った場合、使える物理名は ai0-ai7 / ao0-ao1 / port0/line0-7・port1/line0-3・port2/line0 / ctr0 / pfi0-pfi1 だけで、v_range は 10 のみ、terminal に nrse は使えない。また daq_measure_frequency / daq_measure_period / daq_measure_pulse_width / daq_measure_edge_separation / エンコーダ / daq_generate_pulses / daq_acquire_digital / daq_write_digital_pattern / daq_wait_digital_change と、daq_acquire の trigger_level / pretrigger_s / clock は使えない（実行前に拒否される）
 - daq_read_analog: {"action": "daq_read_analog", "channel": "ai0", "samples": 100, "rate_hz": 1000.0} (電圧を samples 回平均で測定。任意: "v_range": 0.1/0.2/0.5/1/2/5/10, "terminal": "default"/"rse"/"nrse"/"diff")
 - daq_acquire: {"action": "daq_acquire", "channels": ["ai0", "ai1"], "rate_hz": 1000.0, "duration_s": 1.0} (波形を取り込んで CSV に保存。任意: "trigger": "pfi0", "trigger_edge": "rising"/"falling", "timeout_s": 10.0。アナログトリガ: "trigger": channels の先頭と同じ入力, "trigger_level": 電圧。"pretrigger_s": トリガ前に取り込む秒数。"clock": "pfi0" で外部サンプルクロック)
 - daq_start_logging: {"action": "daq_start_logging", "channels": ["ai0"], "rate_hz": 100.0} (連続記録を開始。他のステップの実行中も記録が続く。記録中は他のアナログ入力ステップは使えない)
