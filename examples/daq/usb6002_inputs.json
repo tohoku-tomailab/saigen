@@ -1,0 +1,15 @@
+{
+  "name": "daq_usb6002_inputs",
+  "description": "Input-only tour of a USB-6002 (set daq_model: USB-6002 in config.yaml so that --mock imitates it): averaged readings, a waveform of two analog inputs at the device's 50 kS/s aggregate limit saved as CSV, a continuous recording that runs while the counter counts edges on PFI0, and three digital inputs. Nothing is driven and no robot is opened. With nothing wired the analog inputs read arbitrary voltages and the counter counts 0. The flow also runs on a USB-6351.",
+  "steps": [
+    {"action": "daq_read_analog", "channel": "ai0", "samples": 1000, "rate_hz": 1000.0, "terminal": "rse"},
+    {"action": "daq_read_analog", "channel": "ai0", "samples": 1000, "rate_hz": 1000.0, "terminal": "diff"},
+    {"action": "daq_acquire", "channels": ["ai0", "ai1"], "rate_hz": 25000.0, "duration_s": 0.2, "terminal": "rse"},
+    {"action": "daq_start_logging", "channels": ["ai0", "ai1"], "rate_hz": 1000.0, "terminal": "rse"},
+    {"action": "daq_count_edges", "terminal": "pfi0", "duration_s": 2.0},
+    {"action": "daq_read_digital", "line": "port0/line0"},
+    {"action": "daq_read_digital", "line": "port1/line3"},
+    {"action": "daq_read_digital", "line": "port2/line0"},
+    {"action": "daq_stop_logging"}
+  ]
+}

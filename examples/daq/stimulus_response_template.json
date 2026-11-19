@@ -1,0 +1,15 @@
+{
+  "name": "daq_stimulus_response_template",
+  "description": "TEMPLATE, not runnable as shipped: it drives outputs and uses signal names (lamp, excitation, photodiode, valve, ready, stirrer_clock) that must first be defined, wired and enabled in config.yaml (see examples/daq/README.md). It shows how a flow stays free of wiring: set a DC level, wait for an external ready line, record a response while a sine excitation runs, wait until the response has decayed, pulse a valve, and clock a stepper for a fixed number of steps.",
+  "steps": [
+    {"action": "daq_write_analog", "channel": "lamp", "voltage": 2.5},
+    {"action": "daq_wait_digital", "line": "ready", "state": true, "timeout_s": 30.0},
+    {"action": "daq_generate_waveform", "channel": "excitation", "waveform": "sine", "frequency_hz": 10.0, "amplitude_v": 1.0, "offset_v": 1.0},
+    {"action": "daq_acquire", "channels": ["photodiode"], "rate_hz": 5000.0, "duration_s": 2.0},
+    {"action": "daq_stop_output", "channel": "excitation"},
+    {"action": "daq_wait_analog", "channel": "photodiode", "condition": "below", "threshold": 0.1, "timeout_s": 60.0},
+    {"action": "daq_pulse_digital", "line": "valve", "duration_s": 0.5},
+    {"action": "daq_generate_pulses", "counter": "stirrer_clock", "frequency_hz": 200.0, "duty_cycle": 0.5, "count": 400},
+    {"action": "daq_stop_output", "channel": "lamp"}
+  ]
+}

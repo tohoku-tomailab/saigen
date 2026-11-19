@@ -333,6 +333,15 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator, **ex
     )
 
 
+#: 共有デバイス設定のうち DAQ（NI USB-6351）に渡すキー
+DAQ_CONFIG_KEYS = ("daq_device", "daq_model", "daq_signals", "daq_ao_channels", "daq_do_lines",
+                   "daq_co_counters", "daq_ao_min_v", "daq_ao_max_v", "daq_co_max_hz")
+
+
+def _daq_config(config) -> dict:
+    return {k: config[k] for k in DAQ_CONFIG_KEYS if k in config}
+
+
 #: 内部発振器の上限（config.yaml の shared_devices）。発振器を書くランのデバイスへ渡す
 OSC_LIMIT_KEYS = ("lockin_osc_max_vrms", "lockin_osc_min_hz", "lockin_osc_max_hz")
 
@@ -346,13 +355,15 @@ def _osc_kwargs(config: dict, lockin_osc_plan) -> dict:
 
 def default_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
                            use_microscope_serial=False, use_dmm=False, use_lockin=False,
-                           use_scope=False, lockin_osc_plan=None):
+                           use_scope=False, lockin_osc_plan=None, use_daq=False):
     """実機 SharedDevices を生成する既定ファクトリ"""
     return SharedDevices(
         use_scale=use_scale,
         use_camera=use_camera,
         use_microscope=use_microscope,
         use_microscope_serial=use_microscope_serial,
+        use_daq=use_daq,
+        **_daq_config(config),
         use_dmm=use_dmm,
         use_lockin=use_lockin,
         use_scope=use_scope,
@@ -376,12 +387,16 @@ def default_shared_factory(*, use_scale, use_camera, config, use_microscope=Fals
 
 def mock_shared_factory(*, use_scale, use_camera, config, use_microscope=False,
                         use_microscope_serial=False, use_dmm=False, use_lockin=False,
-                        use_scope=False, lockin_osc_plan=None):
-    """MockSharedDevices を生成するファクトリ"""
+                        use_scope=False, lockin_osc_plan=None, use_daq=False):
+    """MockSharedDevices を生成するファクトリ
+
+    DAQ の出力許可リスト・電圧範囲だけは設定から渡す（モックも実機と同じ判定をする）。
+    """
     return MockSharedDevices(use_scale=use_scale, use_camera=use_camera,
                              use_microscope=use_microscope,
                              use_microscope_serial=use_microscope_serial,
                              use_dmm=use_dmm, use_lockin=use_lockin, use_scope=use_scope,
+                             use_daq=use_daq, **_daq_config(config),
                              **_osc_kwargs(config, lockin_osc_plan))
 
 
@@ -665,7 +680,8 @@ class ExperimentSession:
     async def add_shared(self, *, use_scale: bool = False, use_camera: bool = False,
                          use_microscope: bool = False, use_microscope_serial: bool = False,
                          use_dmm: bool = False, use_lockin: bool = False,
-                         use_scope: bool = False, lockin_osc_plan=None):
+                         use_scope: bool = False, lockin_osc_plan=None,
+                         use_daq: bool = False):
         """設定の値で共有デバイスを生成・初期化して登録する
 
         ``lockin_osc_plan`` はフローが LI5640 の内部発振器を書くときだけ渡す
@@ -689,6 +705,8 @@ class ExperimentSession:
             kwargs["use_lockin"] = True
         if use_scope:
             kwargs["use_scope"] = True
+        if use_daq:
+            kwargs["use_daq"] = True
         if lockin_osc_plan is not None:
             kwargs["lockin_osc_plan"] = lockin_osc_plan
         shared = self.shared_factory(config=self.shared_config(), **kwargs)

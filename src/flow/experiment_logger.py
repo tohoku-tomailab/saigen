@@ -213,6 +213,10 @@ class ExperimentLogger:
         nominal_time = result.get("nominal_time_s")
         focus_position = result.get("focus_position")
         focus_converged = result.get("focus_converged")
+        voltage = result.get("voltage")
+        digital_state = result.get("digital_state")
+        daq_value = result.get("daq_value")
+        data_path = result.get("data_path")
         dmm_value = result.get("dmm_value")
         # 撮影ステップが「画像なし」で成功扱いになるのを防ぐ（executor も例外に
         # するが、戻り値だけを渡す呼び出し側があっても記録を誤らせない）
@@ -236,6 +240,17 @@ class ExperimentLogger:
             "image_path": image_path or "",
             "focus_position": str(focus_position) if isinstance(focus_position, int) else "",
             "focus_converged": ("" if focus_converged is None else ("True" if focus_converged else "False")),
+            # DAQ: 読み取り値と、出力ステップで設定した値（再現に必要なので両方残す）
+            "daq_channel": result.get("daq_channel") or "",
+            "voltage_v": (f"{voltage:.6f}" if isinstance(voltage, (int, float))
+                          and not isinstance(voltage, bool) else ""),
+            "digital_state": "" if digital_state is None else ("1" if digital_state else "0"),
+            # 換算値（信号の単位）・カウント・周波数など。単位は daq_unit
+            "daq_value": (f"{daq_value:.9g}" if isinstance(daq_value, (int, float))
+                          and not isinstance(daq_value, bool) else ""),
+            "daq_unit": (result.get("daq_unit") or "") if daq_value is not None else "",
+            # 波形・連続記録の CSV
+            "data_path": data_path or "",
             "dmm_value": _full_precision(dmm_value),
             "dmm_unit": result.get("dmm_unit") or "",
             "dmm_function": result.get("dmm_function") or "",
@@ -311,6 +326,12 @@ class ExperimentLogger:
                 "kind": "image", "detail": image_path,
                 "step_index": index, "iteration": record["iteration"],
             })
+        if data_path and action != "daq_stop_logging":   # 開始時に同じファイルを載せている
+            self.events.append({
+                "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
+                "kind": "data", "detail": data_path,
+                "step_index": index, "iteration": record["iteration"],
+            })
         if record["dmm_value"]:
             self.events.append({
                 "timestamp": record["timestamp"], "elapsed_s": record["elapsed_s"],
@@ -375,6 +396,14 @@ class ExperimentLogger:
         filename = f"step{index:03d}{middle}_{ts}.jpg"
         return os.path.join(self.images_dir, filename)
 
+    def next_data_path(self, index, tag: str = "daq"):
+        """daq_acquire / daq_start_logging 用の保存先パスを払い出す（実行フォルダの
+        data/ に束ねる。フォルダは最初の払い出しで作る）。"""
+        data_dir = os.path.join(self.dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        ts = datetime.now().strftime("%H%M%S")
+        return os.path.join(data_dir, f"step{index:03d}_{tag}_{ts}.csv")
+
     # ------------------------------------------------------------------
     # 終了処理
     # ------------------------------------------------------------------
@@ -402,7 +431,8 @@ class ExperimentLogger:
         fields = ["timestamp", "mode", "elapsed_s", "step_index", "total_steps",
                   "iteration", "action", "robot_id", "status", "duration_s",
                   "weight_g", "nominal_time_s", "image_path", "focus_position",
-                  "focus_converged", "dmm_value", "dmm_unit", "dmm_function",
+                  "focus_converged", "daq_channel", "voltage_v", "digital_state",
+                  "daq_value", "daq_unit", "data_path", "dmm_value", "dmm_unit", "dmm_function",
                   "dmm_range", "dmm_nplc", "dmm_valid_samples",
                   "lockin_data1", "lockin_data1_kind", "lockin_data1_unit",
                   "lockin_data2", "lockin_data2_kind", "lockin_data2_unit",
@@ -466,6 +496,7 @@ class ExperimentLogger:
                 "measurements_csv": os.path.basename(self.csv_path),
                 "summary": os.path.basename(self.summary_path),
                 "images_dir": "images",
+                "data_dir": "data" if os.path.isdir(os.path.join(self.dir, "data")) else None,
             },
         }
         with open(self.metadata_path, "w", encoding="utf-8") as f:
@@ -532,12 +563,12 @@ class ExperimentLogger:
             lines.append("| 経過(s) | 時刻 | 種別 | ステップ | 反復 | 内容 |")
             lines.append("|--------:|------|------|---------:|------|------|")
             for e in self.events:
-                kind = {"weight": "⚖️ 重量", "image": "📷 画像", "dmm": "🔌 DMM",
+                kind = {"weight": "⚖️ 重量", "image": "📷 画像", "data": "📈 データ", "dmm": "🔌 DMM",
                         "lockin": "📈 ロックイン", "scope": "📉 オシロ",
                         "lockin_osc": "🔊 発振器",
                         "diagnostics": "⚠️ 診断"}.get(e["kind"], e["kind"])
                 detail = e["detail"]
-                if e["kind"] == "image":
+                if e["kind"] in ("image", "data"):
                     rel = os.path.relpath(detail, self.dir) if os.path.isabs(detail) else detail
                     detail = f"[{os.path.basename(detail)}]({rel.replace(os.sep, '/')})"
                 lines.append(f"| {e['elapsed_s']:.1f} | {e['timestamp'].split(' ')[1]} "
@@ -631,6 +662,18 @@ class ExperimentLogger:
                 note = f"lens {r['focus_position']}"
                 if r.get("focus_converged") == "False":
                     note += " (not converged)"
+            elif r.get("data_path"):
+                note = f"{r['daq_channel']} -> {os.path.basename(r['data_path'])}"
+                if r.get("daq_value"):
+                    note += f" ({r['daq_value']} {r['daq_unit']})"
+            elif r.get("voltage_v"):
+                note = f"{r['daq_channel']} {float(r['voltage_v']):+.5f} V"
+                if r.get("daq_value"):
+                    note += f" = {r['daq_value']} {r['daq_unit']}"
+            elif r.get("daq_value"):
+                note = f"{r['daq_channel']} {r['daq_value']} {r['daq_unit']}"
+            elif r.get("digital_state"):
+                note = f"{r['daq_channel']} {'High' if r['digital_state'] == '1' else 'Low'}"
             elif r["error"]:
                 note = f"⚠️ {r['error']}"
             state = {"ok": "✅", "aborted": "⛔"}.get(r["status"], "❌")

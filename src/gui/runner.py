@@ -52,10 +52,12 @@ from pydantic import ValidationError
 from src import config as lab_config
 from src.devices.safety.validators import default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import SHARED_DEVICE_ACTIONS, execute_step, expand_loops
+from src.flow.executor import (DAQ_DATA_ACTIONS, SHARED_DEVICE_ACTIONS, execute_step,
+                               expand_loops)
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, SafetyAbort
-from src.flow.run_flow import LOGS_DIR, PreflightError, plan_resources, require_preflight
+from src.flow.run_flow import (LOGS_DIR, PreflightError, plan_daq, plan_resources,
+                               require_preflight)
 from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
 
 logger = logging.getLogger("gui.runner")
@@ -689,6 +691,9 @@ class FlowRunner:
                     step = {**step, "file_path": exp_logger.next_image_path(i)}
                 elif action == "capture_microscope" and not step.get("file_path"):
                     step = {**step, "file_path": exp_logger.next_image_path(i, tag="microscope")}
+                elif action in DAQ_DATA_ACTIONS and not step.get("file_path"):
+                    step = {**step, "file_path": exp_logger.next_data_path(
+                        i, tag=DAQ_DATA_ACTIONS[action])}
 
                 logger.info(
                     "[%d/%d] %s: %s %s", i, total,

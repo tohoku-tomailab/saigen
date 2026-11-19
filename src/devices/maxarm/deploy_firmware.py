@@ -260,7 +260,7 @@ def pulse_rts_reset(ser, sleep: Optional[Callable[[float], None]] = None) -> Non
     sleep = sleep or time.sleep
     ser.dtr = False
     ser.rts = True
-    sleep(0.2)
+    sleep(0.5)      # 0.2 s was not always enough on the bench (2026-10-16): no boot at all
     ser.rts = False
 
 

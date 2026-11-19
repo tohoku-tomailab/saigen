@@ -1,0 +1,12 @@
+{
+  "name": "daq_acquire_and_count",
+  "description": "Input-only tour of the NI DAQ device (USB-6351): a hardware-timed waveform of two analog inputs saved as CSV, then a continuous recording of ai0 that keeps running while the counters measure the board's internal 100 kHz timebase (no wiring needed), and the end of the recording. Nothing is driven and no robot is opened. Unconnected inputs read arbitrary voltages.",
+  "steps": [
+    {"action": "daq_acquire", "channels": ["ai0", "ai1"], "rate_hz": 10000.0, "duration_s": 0.5, "terminal": "rse"},
+    {"action": "daq_start_logging", "channels": ["ai0"], "rate_hz": 100.0, "terminal": "rse"},
+    {"action": "daq_count_edges", "terminal": "100khztimebase", "duration_s": 1.0},
+    {"action": "daq_measure_frequency", "terminal": "100khztimebase", "min_hz": 1000.0, "max_hz": 1000000.0},
+    {"action": "daq_read_digital", "line": "port0/line0"},
+    {"action": "daq_stop_logging"}
+  ]
+}

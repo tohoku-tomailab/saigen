@@ -19,6 +19,11 @@ See [`bom.md`](bom.md) for the full list. The minimum for the ZIF-8 demonstratio
   used by the `capture_microscope` step
 - 1 × Hiwonder MaxArm with suction nozzle — optional robot 4 for pick-and-place,
   USB (see §9); not needed for the ZIF-8 demonstration
+- 1 × National Instruments USB-6351 multifunction DAQ — optional, analog, digital
+  and counter I/O for the `daq_*` steps. Needs the NI-DAQmx driver from ni.com; the device name
+  shown in NI MAX (e.g. `Dev1`) goes into `shared_devices.daq_device`. Outputs stay
+  disabled until their channels are listed in `config.yaml`; see
+  [`src/devices/nidaq/README.md`](../src/devices/nidaq/README.md)
 - 3D-printed fixtures from `cad/` (pipette holders on the arm tips, flask holders,
   balance splash guard)
 
@@ -70,7 +75,7 @@ Edit `config.yaml`:
 | Section | Purpose |
 |---|---|
 | `robots` | `dobot_port` (and `picus2_address`, if that robot has a pipette) per `robot_id`. Robot 4 is an optional MaxArm (`type: maxarm`, `maxarm_port`, its own `workspace`, see §9); robot 5 is an optional Dobot MG400 (`type: mg400`, `mg400_address`, its own `workspace`, `home_position`, `joint_limits`, `speed_ratio`, `max_move_mm`, see §13); a robot without `type` is a Dobot |
-| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10); `lockin_resource` and `lockin_timeout_ms` of the optional NF LI5640 lock-in amplifier (§11); `scope_resource` and `scope_timeout_ms` of the optional Agilent 1000 series oscilloscope (§12) |
+| `shared_devices` | `scale_port`, `camera_index`, `microscope_index`, `microscope_port` and `microscope_resolution` of the balance, the photo camera and the digital microscope (camera index for photos, serial port for the LED and focus, capture size; 4K by default, lower it when the image volume gets heavy); `dmm_resource` and `dmm_timeout_ms` of the optional Keithley 2002 DMM (§10); `lockin_resource` and `lockin_timeout_ms` of the optional NF LI5640 lock-in amplifier (§11); `scope_resource` and `scope_timeout_ms` of the optional Agilent 1000 series oscilloscope (§12); for the optional NI DAQ: `daq_device`, the named signals flows refer to (`daq_signals`: name → channel, wiring, conversion to a unit), the outputs a flow may drive (`daq_ao_channels`, `daq_do_lines`, `daq_co_counters`; empty = none) and their limits (`daq_ao_min_v`, `daq_ao_max_v`, `daq_co_max_hz`) |
 | `workspace` | X/Y/Z and Joint-1 limits every move is checked against before it is commanded |
 
 If `config.yaml` is absent the tracked `config.example.yaml` is used, and if that is
@@ -85,7 +90,7 @@ Edit `.env`:
 | `GEMINI_API_KEY` | required for `gemini`; free key from Google AI Studio |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | for any OpenAI-compatible endpoint (local inference server etc.) |
 | `ROBOT1_DOBOT_PORT`, `ROBOT1_PICUS2_PORT`, `ROBOT2_*`, `ROBOT3_DOBOT_PORT`, `ROBOT4_MAXARM_PORT`, `ROBOT5_MG400_ADDRESS` | optional per-run override of the `config.yaml` robot ports / addresses |
-| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE`, `LOCKIN_RESOURCE`, `SCOPE_RESOURCE` | optional per-run override of the shared devices |
+| `SCALE_PORT`, `CAMERA_INDEX`, `MICROSCOPE_INDEX`, `MICROSCOPE_PORT`, `DMM_RESOURCE`, `LOCKIN_RESOURCE`, `SCOPE_RESOURCE`, `DAQ_DEVICE` | optional per-run override of the shared devices (for the DAQ only the device name; which outputs are enabled is set in `config.yaml` alone) |
 | `SENSOR_SERVER_URL` | dashboard URL used to start/stop recording (optional) |
 
 `.env` is git-ignored. No key is read from anywhere else. For device ports the

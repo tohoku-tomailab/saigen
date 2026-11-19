@@ -81,6 +81,39 @@ shared_devices:
   scope_resource: ""      # Agilent 1000 series oscilloscope (DSO1014A etc., USB, read-only) for measure_scope: VISA resource such as USB0::0x0957::<product id>::<serial>::INSTR; "" = no scope
   scope_timeout_ms: 5000  # upper limit of one oscilloscope read or write
   wait_after_scope: 0.0   # seconds to wait AFTER each measure_scope step
+  # National Instruments DAQ (USB-6351 or USB-6002), used by the daq_* steps. Needs the
+  # NI-DAQmx driver. Channel counts and ranges below are the USB-6351's; what a USB-6002
+  # has is in src/devices/nidaq/README.md (no counter output: leave daq_co_counters empty).
+  daq_device: ""          # device name shown in NI MAX, e.g. Dev1; "" = no DAQ
+  daq_model: ""           # USB-6351 or USB-6002: what --mock imitates ("" = USB-6351). A real
+                          # run reads the model from the device and does not start if this
+                          # differs, so with a USB-6002 write daq_model: USB-6002.
+  # Named signals: what is wired where. Flows use the names, so the same flow runs
+  # in a lab that wired the same signals to other terminals. A signal is
+  # {channel: <ai0 | ao0 | port0/line0 | ctr0 | pfi0>}; an analog input may add
+  # terminal (rse / nrse / diff / default), v_range (0.1 .. 10 V) and a conversion
+  # value = volts * scale + offset with a unit. Naming a signal does not enable it.
+  # An analog input can be a temperature sensor instead of a voltage (the steps then
+  # return degrees Celsius): sensor: thermocouple with tc_type (B E J K N R S T) and
+  # cjc_c, the temperature of the terminal block (the device has no cold-junction
+  # sensor); sensor: rtd with excitation_a, the current of your external source, and
+  # optionally rtd_type (pt3851), r0_ohm (100), wires (4). min_c / max_c = expected range.
+  daq_signals: {}
+  #  furnace:       {channel: ai2, sensor: thermocouple, tc_type: K, cjc_c: 25.0, terminal: diff, max_c: 400}
+  #  photodiode:    {channel: ai0, terminal: diff, v_range: 1, scale: 2.0, offset: 0.0, unit: mW}
+  #  valve:         {channel: port0/line0}
+  #  flow_meter:    {channel: pfi0}
+  #  stirrer_clock: {channel: ctr0}
+  # Outputs can switch whatever is wired to the terminal block, so a flow may drive
+  # only the physical channels listed here (inputs are always allowed). Leave empty
+  # until the wiring has been checked. Every output driven by a run returns to
+  # 0 V / low / stopped when the run ends, including on Ctrl+C and on an error.
+  daq_ao_channels: []     # e.g. [ao0]
+  daq_do_lines: []        # e.g. [port0/line0, port0/line1]
+  daq_co_counters: []     # counters that may emit pulse trains, e.g. [ctr0] (ctr0 outputs on PFI12)
+  daq_ao_min_v: 0.0       # allowed analog output span (the device itself can do -10..10 V)
+  daq_ao_max_v: 5.0
+  daq_co_max_hz: 1000.0   # highest pulse-train frequency a flow may ask for
 
 # Dobot workspace limits. WorkspaceValidator checks every move against
 # these BEFORE the robot is commanded, for all robots (except where a

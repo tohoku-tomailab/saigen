@@ -73,7 +73,9 @@ from src import config as lab_config
 from src.devices.li5640 import oscillator as osc
 from src.devices.safety.validators import WorkspaceViolationError, default_workspace_validator
 from src.flow.accuracy_logger import DispenseAccuracyLogger
-from src.flow.executor import execute_step, expand_loops, SHARED_DEVICE_ACTIONS, MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS, DMM_ACTIONS, LOCKIN_ACTIONS, SCOPE_ACTIONS
+from src.flow.executor import (execute_step, expand_loops, SHARED_DEVICE_ACTIONS, DAQ_ACTIONS, DAQ_DATA_ACTIONS,
+                               MICROSCOPE_CAMERA_ACTIONS, MICROSCOPE_SERIAL_ACTIONS,
+                               DMM_ACTIONS, LOCKIN_ACTIONS, SCOPE_ACTIONS)
 from src.flow.experiment_logger import ExperimentLogger
 from src.flow.experiment_session import ExperimentSession, robot_type, validator_for_robot
 from src.flow.schema import MAX_ROBOT_ID, ExperimentWorkflow
@@ -277,6 +279,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="capture_microscope 用の顕微鏡カメラ index（既定: MICROSCOPE_INDEX / config.yaml）")
     p.add_argument("--microscope-port", default=None,
                    help="顕微鏡 LED 制御用シリアルポート（既定: MICROSCOPE_PORT / config.yaml。空なら LED 制御なし）")
+    p.add_argument("--daq-device", default=None,
+                   help="daq_* 用の NI DAQ デバイス名（NI MAX 上の名前、例: Dev1。既定: DAQ_DEVICE / config.yaml）")
     p.add_argument("--dmm-resource", default=None,
                    help="Keithley 2002 DMM の VISA リソース（例 GPIB0::16::INSTR。"
                         "既定: DMM_RESOURCE / config.yaml）")
@@ -348,6 +352,10 @@ def resolve_ports(args) -> Tuple[dict, dict]:
         shared_config["microscope_port"] = cli_port
     elif os.getenv("MICROSCOPE_PORT"):
         shared_config["microscope_port"] = os.getenv("MICROSCOPE_PORT")
+    # DAQ はデバイス名だけ上書きできる（出力の許可リスト・電圧範囲は config.yaml のみ）
+    daq = getattr(args, "daq_device", None) or os.getenv("DAQ_DEVICE")
+    if daq:
+        shared_config["daq_device"] = daq
     # CSV ランナーは自前のパーサーでこの関数を呼ぶので getattr で読む
     dmm = getattr(args, "dmm_resource", None) or os.getenv("DMM_RESOURCE")
     if dmm:
@@ -723,12 +731,14 @@ class ResourcePlan(NamedTuple):
     needs_scope: bool
     #: フローが LI5640 の内部発振器を書くなら、その要約（oscillator.OscPlan）。無ければ None
     lockin_osc_plan: Optional[object] = None
+    #: フローが daq_* ステップを含む（NI の DAQ デバイスを開く）
+    needs_daq: bool = False
 
     @property
     def needs_shared(self) -> bool:
         return (self.needs_scale or self.needs_camera or self.needs_microscope
                 or self.needs_microscope_serial or self.needs_dmm or self.needs_lockin
-                or self.needs_scope)
+                or self.needs_scope or self.needs_daq)
 
     def shared_kwargs(self) -> dict:
         """ExperimentSession.add_shared() に渡す use_* 引数"""
@@ -739,6 +749,9 @@ class ResourcePlan(NamedTuple):
                       use_scope=self.needs_scope)
         if self.lockin_osc_plan is not None:
             kwargs["lockin_osc_plan"] = self.lockin_osc_plan
+        if self.needs_daq:
+            # 要るときだけ渡す（use_daq を知らない差し替えファクトリも動くように）
+            kwargs["use_daq"] = True
         return kwargs
 
     def shared_labels(self) -> list:
@@ -747,7 +760,7 @@ class ResourcePlan(NamedTuple):
                                   ("顕微鏡カメラ", self.needs_microscope),
                                   ("顕微鏡制御ポート", self.needs_microscope_serial),
                                   ("DMM", self.needs_dmm), ("ロックイン", self.needs_lockin),
-                                  ("オシロ", self.needs_scope))
+                                  ("オシロ", self.needs_scope), ("DAQ", self.needs_daq))
                 if need]
 
 
@@ -777,7 +790,16 @@ def plan_resources(steps: list) -> ResourcePlan:
     needs_scope = bool(actions & SCOPE_ACTIONS)                           # Agilent DSO1000
     return ResourcePlan(sorted(robot_ids), picus2_robots, needs_scale, needs_camera,
                         needs_microscope, needs_microscope_serial, needs_dmm, needs_lockin,
-                        needs_scope, osc.plan_from_steps(steps))
+                        needs_scope, osc.plan_from_steps(steps),
+                        needs_daq=bool(actions & DAQ_ACTIONS))
+
+
+def plan_daq(steps: list) -> bool:
+    """フローが NI の DAQ デバイス（daq_* アクション）を必要とするか。
+
+    plan_resources(steps).needs_daq と同じ（フローの一覧だけ見たい呼び出し側のため）。
+    """
+    return any(s.get("action") in DAQ_ACTIONS for s in steps)
 
 
 def _fmt_params(step: dict) -> str:
@@ -889,6 +911,18 @@ async def run(args) -> int:
         if plan.needs_shared:
             await session.add_shared(**plan.shared_kwargs())
 
+        # DAQ: 接続した機種（Mock では config.yaml の daq_model）にできないステップが
+        # あれば、最初のステップを実行する前に止める
+        daq_service = getattr(session.shared, "daq_service", None) if plan.needs_daq else None
+        if daq_service is not None:
+            problems = daq_service.unsupported_steps(steps)
+            for line in problems:
+                logger.error(f"DAQ（{daq_service.profile.model}）: {line}")
+            if problems:
+                raise RuntimeError(
+                    f"このフローには {daq_service.profile.model} で実行できない daq_* ステップが "
+                    f"{len(problems)} 件あります（何も実行していません）")
+
         logger.info("=== フロー実行開始 ===")
         total = len(steps)
         for i, step in enumerate(steps, 1):
@@ -905,6 +939,10 @@ async def run(args) -> int:
                 step = {**step, "file_path": exp_logger.next_image_path(i)}
             elif action == "capture_microscope" and not step.get("file_path"):
                 step = {**step, "file_path": exp_logger.next_image_path(i, tag="microscope")}
+            elif action in DAQ_DATA_ACTIONS and not step.get("file_path"):
+                # DAQ の波形・連続記録も実験フォルダ内（data/）に束ねる
+                step = {**step, "file_path": exp_logger.next_data_path(
+                    i, tag=DAQ_DATA_ACTIONS[action])}
 
             iteration = step.get("_iteration")
             t_start = time.monotonic()

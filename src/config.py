@@ -65,6 +65,17 @@ DEFAULTS = {
         "microscope_index": 2,
         "microscope_port": "",
         "microscope_resolution": "3840x2160",
+        # NI DAQ (USB-6351). Outputs are refused unless listed here.
+        "daq_device": "",
+        "daq_model": "",
+        "daq_ao_channels": [],
+        "daq_do_lines": [],
+        "daq_ao_min_v": 0.0,
+        "daq_ao_max_v": 5.0,
+        "daq_co_counters": [],
+        "daq_co_max_hz": 1000.0,
+        # name -> {channel: ai0, terminal: diff, v_range: 1, scale: 2.0, offset: 0, unit: mW}
+        "daq_signals": {},
         # Keithley 2002 DMM: VISA resource, e.g. GPIB0::16::INSTR. Empty: a flow
         # with measure_dmm refuses to start a real run until it is set.
         "dmm_resource": "",

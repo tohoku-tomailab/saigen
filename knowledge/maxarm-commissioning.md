@@ -104,6 +104,13 @@ z at that (x, y); nothing is sent to the arm.
 
 - **Firmware fault (`EVT FAULT`), board at the REPL:** RTS reset restarts the
   SAIGEN launcher; it never moves the arm at boot.
+- **Port present but the board is completely silent** (no reply to any line,
+  no `>>> `, no ROM banner even after an RTS pulse or a USB re-plug): seen
+  once (2026-10-16) after the USB connector had been re-seated. A longer RTS
+  pulse (0.5 s instead of 0.2 s) produced the normal boot banner and
+  `EVT READY`; `pulse_rts_reset` now holds RTS for 0.5 s. A 5 s USB re-plug
+  did not visibly restart the chip, so do not rely on a short re-plug as a
+  power cycle.
 - **Back to the factory program:** `deploy_firmware --restore backups/<dir>`;
   the next reset then homes the arm (clear its reach). `/main_factory.py` on
   the device is a second copy of the factory `main.py`.

@@ -449,11 +449,24 @@ class MockSharedDevices:
         "preshoot": 1.0,
     }
 
+    #: daq_read_analog が返すモック電圧 (V)（MockNIDaq.MOCK_VOLTAGE と同じ値）
+    MOCK_VOLTAGE = 1.234
+
     def __init__(self, use_scale: bool = False, use_camera: bool = False,
                  use_microscope: bool = False, use_microscope_serial: bool = False,
                  use_dmm: bool = False, use_lockin: bool = False, use_scope: bool = False,
-                 lockin_osc_plan=None, **configs):
+                 lockin_osc_plan=None, use_daq: bool = False, **device_configs):
         self.use_scale = use_scale
+        self.use_daq = use_daq
+        # DAQ: 実機と同じ DaqService（信号名の解決・出力の許可判定）を模擬デバイスの上で
+        # 動かす（--mock で通ったフローが実機でこれらの理由により拒否されないように）
+        from src.devices.nidaq import DaqService, MockNIDaq
+        # 模擬する機種は config.yaml の daq_model（無指定なら既定の機種）
+        self.daq = MockNIDaq(model=device_configs.get("daq_model")) if use_daq else None
+        self.daq_service = DaqService(self.daq, device_configs, mock=True) if use_daq else None
+        self.daq_policy = self.daq_service.policy if use_daq else None
+        self.daq_analog_outputs = self.daq.analog_outputs if use_daq else {}     # {"ao0": 2.5}
+        self.daq_digital_outputs = self.daq.digital_outputs if use_daq else {}   # {"port0/line0": True}
         self.use_camera = use_camera
         self.use_microscope = use_microscope
         self.use_microscope_serial = use_microscope_serial
@@ -466,7 +479,7 @@ class MockSharedDevices:
         # LI5640 の内部発振器（実機と同じ規則で検査する。初期状態はフローに合わせる:
         # 最初の周波数、0 V、フローの全振幅を表せる最小のレンジ）
         self.lockin_osc_plan = lockin_osc_plan
-        self._configs = configs
+        self._configs = device_configs
         self._osc_state = None
         self._osc_saved = None
         self._osc_dirty = False
@@ -685,7 +698,38 @@ class MockSharedDevices:
         logger.info(f"✓ [MOCK] 顕微鏡フォーカス {mode}: レンズ位置 {self.microscope_focus_position}")
         return {"focus_position": self.microscope_focus_position, "focus_converged": True}
 
+    def _require_daq(self):
+        if not self.use_daq or self.daq_service is None:
+            raise RuntimeError("DAQ が初期化されていません "
+                               "(config.yaml の shared_devices.daq_device を設定してください)")
+        return self.daq_service
+
+    async def daq_step(self, action: str, **params) -> dict:
+        """daq_* ステップを 1 つ実行する（実機と同じ DaqService、模擬デバイス）"""
+        return await self._require_daq().run(action, **params)
+
+    async def daq_read_analog(self, channel: str, samples: int = 100, rate_hz: float = 1000.0,
+                              v_range: float = 10.0, terminal: str = "default") -> float:
+        result = await self.daq_step("daq_read_analog", channel=channel, samples=samples,
+                                rate_hz=rate_hz, v_range=v_range, terminal=terminal)
+        return result["voltage"]
+
+    async def daq_write_analog(self, channel: str, voltage: float) -> float:
+        result = await self.daq_step("daq_write_analog", channel=channel, voltage=voltage)
+        return result["voltage"]
+
+    async def daq_read_digital(self, line: str) -> bool:
+        result = await self.daq_step("daq_read_digital", line=line)
+        return result["digital_state"]
+
+    async def daq_write_digital(self, line: str, state: bool) -> bool:
+        result = await self.daq_step("daq_write_digital", line=line, state=state)
+        return result["digital_state"]
+
     async def cleanup(self):
+        # 実機と同じく、連続記録を止め、駆動した出力は 0 V / Low に戻す
+        if self.daq_service is not None:
+            self.daq_service.close()
         if self._lockin_open and self._osc_dirty and self._osc_report is None:
             self._osc_report = {"state": "verified", "saved": self._osc_saved.as_record(),
                                 "read_before": self._osc_state.as_record(), "errors": []}

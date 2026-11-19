@@ -33,6 +33,12 @@ The electronic balance is the closest existing example, and every step below
 names the balance code to copy from. Read `src/devices/README.md` first for the
 two-layer design (thin drivers, one safety wrapper).
 
+> **Another model of an instrument that is already supported** is a smaller job
+> than this guide. The NI DAQ shows the pattern: a second model (USB-6002 next to
+> the USB-6351) is one table entry in `src/devices/nidaq/profiles.py` plus bench
+> checks, with no new step, schema entry or GUI block; see "Adding another model"
+> in `src/devices/nidaq/README.md`.
+
 ## 0. Decide where it belongs
 
 | Question | Answer for a DMM | Consequence |
