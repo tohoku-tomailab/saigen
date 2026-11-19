@@ -240,7 +240,7 @@ def mock_robot_factory(robot_id, *, use_picus2, ports, workspace_validator):
 
 
 #: 共有デバイス設定のうち DAQ（NI USB-6351）に渡すキー
-DAQ_CONFIG_KEYS = ("daq_device", "daq_signals", "daq_ao_channels", "daq_do_lines",
+DAQ_CONFIG_KEYS = ("daq_device", "daq_model", "daq_signals", "daq_ao_channels", "daq_do_lines",
                    "daq_co_counters", "daq_ao_min_v", "daq_ao_max_v", "daq_co_max_hz")
 
 

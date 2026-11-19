@@ -753,6 +753,18 @@ async def run(args) -> int:
                                      use_microscope_serial=needs_microscope_serial,
                                      use_daq=needs_daq)
 
+        # DAQ: 接続した機種（Mock では config.yaml の daq_model）にできないステップが
+        # あれば、最初のステップを実行する前に止める
+        daq_service = getattr(session.shared, "daq_service", None) if needs_daq else None
+        if daq_service is not None:
+            problems = daq_service.unsupported_steps(steps)
+            for line in problems:
+                logger.error(f"DAQ（{daq_service.profile.model}）: {line}")
+            if problems:
+                raise RuntimeError(
+                    f"このフローには {daq_service.profile.model} で実行できない daq_* ステップが "
+                    f"{len(problems)} 件あります（何も実行していません）")
+
         logger.info("=== フロー実行開始 ===")
         total = len(steps)
         for i, step in enumerate(steps, 1):

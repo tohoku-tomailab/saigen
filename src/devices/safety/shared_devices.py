@@ -237,11 +237,12 @@ class SharedDevices:
             logger.info(f"DAQ（{device}）を初期化中...")
             from src.devices.nidaq import DaqService, NIDaq
 
+            # 存在確認と機種の読み取り（チャンネルは開かない）。続いて、その機種に対する
             # 信号名・出力の許可リスト・電圧範囲。設定が不正ならここで止める
             daq = NIDaq(device=device)
-            service = DaqService(daq, self.device_configs)
             if not daq.connect():
                 return False
+            service = DaqService(daq, self.device_configs)
             self.daq = daq
             self.daq_service = service
             self.daq_policy = service.policy

@@ -446,7 +446,8 @@ class MockSharedDevices:
         # DAQ: 実機と同じ DaqService（信号名の解決・出力の許可判定）を模擬デバイスの上で
         # 動かす（--mock で通ったフローが実機でこれらの理由により拒否されないように）
         from src.devices.nidaq import DaqService, MockNIDaq
-        self.daq = MockNIDaq() if use_daq else None
+        # 模擬する機種は config.yaml の daq_model（無指定なら既定の機種）
+        self.daq = MockNIDaq(model=device_configs.get("daq_model")) if use_daq else None
         self.daq_service = DaqService(self.daq, device_configs, mock=True) if use_daq else None
         self.daq_policy = self.daq_service.policy if use_daq else None
         self.daq_analog_outputs = self.daq.analog_outputs if use_daq else {}     # {"ao0": 2.5}

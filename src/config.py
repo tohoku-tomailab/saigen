@@ -67,6 +67,7 @@ DEFAULTS = {
         "microscope_resolution": "3840x2160",
         # NI DAQ (USB-6351). Outputs are refused unless listed here.
         "daq_device": "",
+        "daq_model": "",
         "daq_ao_channels": [],
         "daq_do_lines": [],
         "daq_ao_min_v": 0.0,

@@ -65,8 +65,13 @@ shared_devices:
   microscope_index: 2     # USB digital microscope (UVC, e.g. 400-CAM106) used by capture_microscope
   microscope_port: ""     # its control serial port (CP210x, e.g. COM10) for microscope_led; "" = no LED control
   microscope_resolution: "3840x2160"   # capture size; 4K is the sharpest and fastest mode (0.4-2 MB per JPEG). Use "1280x720" to keep data small
-  # National Instruments DAQ (USB-6351), used by the daq_* steps. Needs the NI-DAQmx driver.
+  # National Instruments DAQ (USB-6351 or USB-6002), used by the daq_* steps. Needs the
+  # NI-DAQmx driver. Channel counts and ranges below are the USB-6351's; what a USB-6002
+  # has is in src/devices/nidaq/README.md (no counter output: leave daq_co_counters empty).
   daq_device: ""          # device name shown in NI MAX, e.g. Dev1; "" = no DAQ
+  daq_model: ""           # USB-6351 or USB-6002: what --mock imitates ("" = USB-6351). A real
+                          # run reads the model from the device and does not start if this
+                          # differs, so with a USB-6002 write daq_model: USB-6002.
   # Named signals: what is wired where. Flows use the names, so the same flow runs
   # in a lab that wired the same signals to other terminals. A signal is
   # {channel: <ai0 | ao0 | port0/line0 | ctr0 | pfi0>}; an analog input may add
