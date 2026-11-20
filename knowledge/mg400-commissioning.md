@@ -105,7 +105,9 @@ the stages of the flow plan, each only on the human's request in the session
    tracking failure, no alarm, the operator saw the hop and nothing else. An
    arrival `mismatch` record followed by an `ok` at the same arrival (the arm
    settled) is accepted by the software. For C2 it is written up and looked at
-   before C3; it is not a failure by itself.
+   before C3; it is not a failure by itself. Result (2026-11-20, §3.16): the first run
+   was stopped by the tracking check (feedback 0.52 s stale during the wait),
+   the second was `complete` at a new rest pose (§3.15).
 11. C3: the same flow with Ctrl+C during the first `move_z`: the stop sequence
    from a flow through the executor and the session. Record the distance
    moved after the Ctrl+C and the hold after the disable. Progression to D:
@@ -548,8 +550,99 @@ the arm disabled 0.56 s after the DisableRobot was sent, so the command took
 effect, but its reply did not arrive within the stop sequence's 1 s. The
 EnableRobot reply in the same run took 1.23 s.
 
+### 3.15 A noise while jogging by hand, and a new rest pose (2026-11-10, 2026-11-20)
+
+After the arm had been switched off and on, `observe.py` (2026-11-10) found it
+far from the rest pose of 2026-11-04 (z about 54 mm lower, y about 74 mm
+away), disabled and without an alarm. The forearm's unlock button did not
+free the arm; DobotStudio Pro's jog moved it. While the operator jogged it
+back toward the rest pose there was a loud noise and a jerk. The observation
+taken afterwards found the arm disabled, no alarm, J2 -8.9 deg and J3
+-5.2 deg (mid-range), 1533 feedback packets with none rejected, and the
+controller's 12 `PositiveSolution` answers identical to those of 2026-11-04.
+The cause is not known. A first guess, that J2 had reached its -25 deg limit,
+does not fit the joints the record shows. Whether the positions the
+controller reports still agree with where the arm is has not been checked on
+the bench; the records cannot show it.
+
+The earlier rest pose had J2 at -21.9 deg, 3 deg from its limit, and at that
+(x, y) raising the flange takes J2 toward the limit. On 2026-11-20 the
+operator chose the pose the arm was then in as the new rest pose: J2 26.0 deg
+and J3 42.1 deg, with 5 cm clear around the flange. The gitignored
+`config.yaml` took that pose as `home_position`, a box of 50 mm around it
+(`z_min` 1 mm below it) and `mock_start_pose`. At this pose the fitted fake
+model (`fitted_planar_v1`) is within 0.001 mm of the controller's answer,
+although J3 lies outside the joints the fit used.
+
+Returning the arm to a rest pose after a power cycle is manual work in
+DobotStudio Pro, outside the flow's checks; no procedure for it is written
+yet.
+
+### 3.16 Stage C2 (2026-11-20): stopped once by a 1 s gap in the feedback, then complete
+
+Two real runs of `examples/mg400/z_hop.json` at the new rest pose (§3.15),
+`speed_ratio` 10, the controller at playback speed 50 %, acceleration 50 %,
+global ratio 50 %. `--validate-only` and `--mock` (fitted fake model) had
+returned 0 with the same `config.yaml`.
+
+**First run (07:09 UTC): the tracking check stopped it during the wait.**
+The first `go_home` sent nothing (0.010 mm from home). The +5 mm `MovL`
+arrived after 0.61 s. About 0.1 s into the 1 s wait the feedback stopped
+arriving for 1.06 s; the check between requests found the last valid packet
+0.52 s old and stopped the run (`TrackingFault: idle: feedback stale`). The
+stop was `reset_disable` with the disable confirmed: ResetRobot answered,
+DisableRobot got no reply within 1 s on the first Dashboard connection (as in
+§3.13 and §3.14) and was answered on the stop connection. The arm stayed 5 mm
+above home, which is what the operator saw ("it went up and did not come
+down").
+
+The packets of the gap were not lost: 118 arrived together when it ended, and
+their controller timestamps continue in 8 ms steps. The arm kept sending; the
+PC received late. The control worker ran during the gap (it sent the
+ResetRobot and read its reply), so the whole process was not stalled. In all
+earlier records with the arm (jog, observe, more than 20) the largest
+inter-arrival gap was 0.03 s. Two things differed in this run: the runner
+had just started the sensor dashboard and the CSV recording (the dashboard's
+start took 11 s, right before the arm was opened), and the record folder was
+inside OneDrive (§3.3). Which of these, or the network, delayed the feedback
+is not known.
+
+Until the gap, the measured joints were within 0.0055 deg of their targets
+at every check.
+
+**Second run (07:18 UTC): `complete`.** The same command; the dashboard was
+already running. The arm started 4.94 mm from home (where the first run had
+left it; z had changed by 0.06 mm while disabled), so the first `go_home` was
+a `MovL` to home. Then +5 mm, the wait, -5 mm, and a last `go_home` that sent
+nothing.
+
+| move | distance | arrival after | tracking at arrival |
+|---|---|---|---|
+| `go_home` | 4.94 mm | 0.59 s | 0.009 deg |
+| `move_z` +5 | 5.00 mm | 0.70 s | 0.009 deg |
+| `move_z` -5 | 5.00 mm | 0.61 s | 0.006 deg |
+
+All 16 tracking checks were ok; the worst joint difference of the run was
+0.009 deg (J2, at an arrival; the limit is 0.2 deg). No arrival `mismatch`
+was recorded. 817 feedback packets over 6.6 s, the largest gap 0.03 s. The
+disable was confirmed (RobotMode 4) and no stop sequence ran.
+
+These were the first `MovL`, the first `InverseSolution` sampling and the
+first tracking checks on the arm from a flow. By the progression rule of §2
+the first run failed C2 and the second met it, subject to what the operator
+saw.
+
 ## 4. Open points
 
+- The 1.06 s gap in the feedback's arrival in the first C2 run (§3.16): seen
+  once, cause open (the dashboard's start, the record folder inside OneDrive,
+  the network). The check stopped the run as designed; its 0.5 s budget is not
+  to be widened to make a run pass. A run with the dashboard already started
+  did not show it.
+- The noise and jerk while jogging by hand on 2026-11-10 (§3.15): cause open;
+  whether reported and physical positions agree is unchecked.
+- No written procedure for bringing the arm back to its rest pose after a
+  power cycle (§3.15).
 - J2 2 deg below its target while enabled (§3.13), seen once in three
   enabled jog records at that start (J2 -19.78). It did not repeat in
   `jog_08` (§3.14), which started at J2 -21.84, where §3.13 had left it.
