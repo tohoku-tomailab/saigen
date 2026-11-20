@@ -116,7 +116,8 @@ the stages of the flow plan, each only on the human's request in the session
    wrapper's report (`metadata.json` → `robot_reports`), no motion seen after
    the stop, a stop distance the human accepts for their cell at ratio 10. C3 is
    also the first time the runner's Ctrl+C handling (§5: the first through a
-   separate thread, later ones deferred) meets the arm; none of it has been seen outside `--mock` and the tests.
+   separate thread, later ones deferred) meets the arm; none of it has been seen outside `--mock` and the tests. Result (2026-11-20, §3.17):
+   `reset_disable`, disabled, 7.1 mm after the trigger at about 90 mm/s.
 12. D: the user's own flows inside the measured box at ratio 10. A payload, a
    tool on the flange, R changes and ratios above 10 are later plans with
    their own C-stages.
@@ -633,6 +634,51 @@ first tracking checks on the arm from a flow. By the progression rule of §2
 the first run failed C2 and the second met it. The operator saw the second
 run's moves (down to home, up 5 mm, the wait, down 5 mm) and nothing else, no
 noise, and accepted C2 as passed (2026-11-20).
+
+### 3.17 Stage C3 (2026-11-20): Ctrl+C during the first move from a flow
+
+The flow was `z_hop.json` with its two `move_z` at 40 mm instead of 5 mm (an
+untracked copy), because the 5 mm leg of §3.16 lasted 0.6 to 0.7 s. Same
+`config.yaml`, `speed_ratio` 10. `--validate-only` and `--mock` had returned
+0.
+
+Three invocations right after the arm's power had been switched on ended
+before anything was sent: the feedback port timed out, then was aborted by
+the PC's stack (WinError 10053), then connected without a valid packet within
+the wait. The controller was apparently still starting. An `observe.py` run
+then found the arm disabled, no alarm, 0.02 mm from home.
+
+**The run (08:11 UTC).** The first `go_home` sent nothing (0.016 mm). The
+`MovL` to z +40 mm was accepted (9 samples). The operator's Ctrl+C was taken
+0.64 s after the `MovL` was sent, with the flange 27.1 mm above its start and
+moving at about 90 mm/s (peak 101 mm/s in the feedback). Times on the PC's
+monotonic clock, from the trigger:
+
+| time | event |
+|---|---|
+| 0 s | Ctrl+C taken by the control worker; ResetRobot sent on the first Dashboard connection |
+| 0.11 s | feedback RobotMode 7 (moving) for the last time |
+| 0.14 s | the flange at rest, 7.1 mm above where it was at the trigger |
+| 0.17 s | ResetRobot answered; DisableRobot sent on the first Dashboard connection |
+| 0.39 s | feedback RobotMode 4 |
+| 0.6 to 0.8 s | z -0.04 mm (20.256 to 20.214), the arm disabled |
+| 1.17 s | no reply within 1 s to the DisableRobot (as in §3.13, §3.14, §3.16); a stop connection was opened |
+| 1.18 to 2.28 s | DisableRobot answered on the stop connection; RobotMode 4 read and held for 1.0 s |
+
+The wrapper's report: `stop_state: reset_disable`, `stop.disabled: true`, no
+deadline hit, 2.28 s in all; no EmergencyStop was sent. The arm stayed
+34.1 mm above home, inside the box. The six tracking checks before the move
+were ok (worst 0.008 deg); the feedback's largest inter-arrival gap was
+0.016 s. The runner logged the first Ctrl+C as a stop sequence, disconnected
+and wrote its record; the run is marked failed (`complete: false`), as a
+stopped run is.
+
+The operator reported the arm moving "about 20 mm". The feedback shows
+34.1 mm of travel in all, 7.1 mm of it after the trigger.
+
+The 40 mm leg would have taken well under a second: at `speed_ratio` 10 with
+the controller at 50 % the flange reached about 100 mm/s. A stop distance of
+7 mm belongs to that speed.
 
 ## 4. Open points
 
