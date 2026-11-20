@@ -676,6 +676,9 @@ stopped run is.
 The operator reported the arm moving "about 20 mm". The feedback shows
 34.1 mm of travel in all, 7.1 mm of it after the trigger.
 
+The operator reported no noise at the stop and accepted the stop distance
+(about 7 mm at about 90 mm/s) for their cell: C3 passed (2026-11-20).
+
 The 40 mm leg would have taken well under a second: at `speed_ratio` 10 with
 the controller at 50 % the flange reached about 100 mm/s. A stop distance of
 7 mm belongs to that speed.
