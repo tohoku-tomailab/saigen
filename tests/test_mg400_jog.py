@@ -20,6 +20,20 @@ from src.devices.mg400.protocol import MG400ProtocolError
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MG400_DIR = os.path.join(REPO_ROOT, "src", "devices", "mg400")
+TEST_FEEDBACK_MAX_AGE_S = 5.0
+
+
+@pytest.fixture(autouse=True)
+def _feedback_age_limit_of_a_loaded_machine(monkeypatch):
+    """The tool ends a run when its last valid feedback packet is older than
+    observe.FEEDBACK_MAX_AGE_S (0.5 s). On a CI runner a test of something else once ended
+    with "feedback stale: last valid packet 0.59 s ago"; the suspected cause is scheduling
+    delay (the fake sends its packets from a thread of this process, the recorder reads them
+    in another). No test of this module is about that limit, so
+    they run with a wider one. The shipped value is asserted here before every test, so a
+    change to it fails the whole module."""
+    assert observe.FEEDBACK_MAX_AGE_S == 0.5
+    monkeypatch.setattr(observe, "FEEDBACK_MAX_AGE_S", TEST_FEEDBACK_MAX_AGE_S)
 
 
 def connect_to(fake):
