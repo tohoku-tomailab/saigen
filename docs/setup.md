@@ -823,6 +823,42 @@ interrupted one stays aborted with that note. Check the arm in DobotStudio Pro
 then. A device record that could not be written
 marks the run failed too, with the arm's own state reported separately.
 
+**After switching the arm on.** A flow starts from wherever the arm is, so
+look before the first run of a session. These steps come from two bench
+sessions (`knowledge/mg400-commissioning.md` §3.15, §3.17); they are not a
+tested procedure, and step 4 happens outside the flow's checks:
+
+1. Wait until the controller has finished starting. Three runs started right
+   after power-on ended before any command was sent (the feedback port timed
+   out, was aborted, or delivered no valid packet); the controller was
+   apparently still starting, and a later run connected.
+2. With DobotStudio Pro disconnected and the arm disabled, read the pose (the
+   human's step; read-only):
+
+   ```bash
+   python -m src.devices.mg400.observe <address>
+   ```
+
+   Compare its `PositiveSolution` pose with `home_position`. The arm can be
+   somewhere else after a power cycle: it was once found 54 mm lower and
+   74 mm to the side.
+3. If the pose is outside the `workspace` box, a flow is refused at its start.
+   Inside the box and at least 1 mm (3D distance) from home, the first
+   `go_home` is a straight `MovL` to home, subject to every move check
+   (refused beyond `max_move_mm`): check that this line is clear before the
+   run.
+4. To bring the arm back, jog it in DobotStudio Pro at low speed, with the
+   emergency stop in reach, toward the rest pose (its joint angles are in the
+   `GetAngle()` reply of the observation that defined it). On 2026-11-10 a
+   loud noise and a jerk happened during such a jog; its cause is not known.
+   Then Disable, **disconnect DobotStudio Pro**, and observe again.
+
+A disabled arm has been seen to sink by 0.04 to 0.06 mm; those are two
+observations, not a bound. The margin between the rest pose and `z_min` is
+for you to set for your cell (the bench used 1 mm). A rest pose with J2 3 deg
+from its limit left almost no room above it; the later one had J2 and J3 near
+the middle of `joint_limits`.
+
 **Records.** Each run writes `mg400_<robot id>/report.json` and `feedback.*`
 into its log folder (`logs/<date>/<flow>_<time>/`): every command and reply,
 every measured pose, every move with its validation and arrival, and the `stop`

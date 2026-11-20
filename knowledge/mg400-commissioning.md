@@ -577,8 +577,8 @@ model (`fitted_planar_v1`) is within 0.001 mm of the controller's answer,
 although J3 lies outside the joints the fit used.
 
 Returning the arm to a rest pose after a power cycle is manual work in
-DobotStudio Pro, outside the flow's checks; no procedure for it is written
-yet.
+DobotStudio Pro, outside the flow's checks (`docs/setup.md` §13, "After
+switching the arm on").
 
 ### 3.16 Stage C2 (2026-11-20): stopped once by a 1 s gap in the feedback, then complete
 
@@ -714,8 +714,9 @@ The operator saw the moves as listed and reported no problem.
   did not show it.
 - The noise and jerk while jogging by hand on 2026-11-10 (§3.15): cause open;
   whether reported and physical positions agree is unchecked.
-- No written procedure for bringing the arm back to its rest pose after a
-  power cycle (§3.15).
+- Bringing the arm back to its rest pose after a power cycle is manual work
+  (§3.15); the steps are in `docs/setup.md` §13 ("After switching the arm
+  on"). They come from two sessions and are not a tested procedure.
 - J2 2 deg below its target while enabled (§3.13), seen once in three
   enabled jog records at that start (J2 -19.78). It did not repeat in
   `jog_08` (§3.14), which started at J2 -21.84, where §3.13 had left it.
