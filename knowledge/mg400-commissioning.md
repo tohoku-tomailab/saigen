@@ -703,7 +703,7 @@ The run was `complete`: all 22 tracking checks ok (worst 0.012 deg, J4,
 between requests), every arrival accepted, the last `go_home` sent nothing,
 the disable confirmed, 1206 feedback packets with a largest gap of 0.016 s.
 These were the first `move_xyz` and the first horizontal `MovL` on the arm.
-What the operator saw is not recorded here yet.
+The operator saw the moves as listed and reported no problem.
 
 ## 4. Open points
 
