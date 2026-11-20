@@ -683,6 +683,28 @@ The 40 mm leg would have taken well under a second: at `speed_ratio` 10 with
 the controller at 50 % the flange reached about 100 mm/s. A stop distance of
 7 mm belongs to that speed.
 
+### 3.18 Stage D, first flow (2026-11-20): forward 30 mm, up 20 mm, and back
+
+The operator's first own flow (an untracked file): `go_home`, `move_xyz`
+30 mm in +X at the rest height, `move_z` +20 mm, a 1 s wait, the same path
+back, `go_home`. `--validate-only` and `--mock` had returned 0. The arm
+started where §3.17 had left it, so the first `go_home` was a `MovL` of
+34.1 mm down to home.
+
+| move | distance | arrival after | tracking at arrival |
+|---|---|---|---|
+| `go_home` | 34.11 mm | 1.05 s | 0.007 deg |
+| `move_xyz` +X | 30.00 mm | 0.92 s | 0.007 deg |
+| `move_z` +20 | 20.00 mm | 0.83 s | 0.004 deg |
+| `move_z` -20 | 20.00 mm | 0.84 s | 0.007 deg |
+| `move_xyz` -X | 30.00 mm | 0.95 s | 0.004 deg |
+
+The run was `complete`: all 22 tracking checks ok (worst 0.012 deg, J4,
+between requests), every arrival accepted, the last `go_home` sent nothing,
+the disable confirmed, 1206 feedback packets with a largest gap of 0.016 s.
+These were the first `move_xyz` and the first horizontal `MovL` on the arm.
+What the operator saw is not recorded here yet.
+
 ## 4. Open points
 
 - The 1.06 s gap in the feedback's arrival in the first C2 run (§3.16): seen
