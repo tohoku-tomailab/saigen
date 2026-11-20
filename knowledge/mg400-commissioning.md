@@ -107,7 +107,8 @@ the stages of the flow plan, each only on the human's request in the session
    settled) is accepted by the software. For C2 it is written up and looked at
    before C3; it is not a failure by itself. Result (2026-11-20, §3.16): the first run
    was stopped by the tracking check (feedback 0.52 s stale during the wait),
-   the second was `complete` at a new rest pose (§3.15).
+   the second was `complete` at a new rest pose (§3.15); the operator accepted
+   C2 as passed.
 11. C3: the same flow with Ctrl+C during the first `move_z`: the stop sequence
    from a flow through the executor and the session. Record the distance
    moved after the Ctrl+C and the hold after the disable. Progression to D:
@@ -629,8 +630,9 @@ disable was confirmed (RobotMode 4) and no stop sequence ran.
 
 These were the first `MovL`, the first `InverseSolution` sampling and the
 first tracking checks on the arm from a flow. By the progression rule of §2
-the first run failed C2 and the second met it, subject to what the operator
-saw.
+the first run failed C2 and the second met it. The operator saw the second
+run's moves (down to home, up 5 mm, the wait, down 5 mm) and nothing else, no
+noise, and accepted C2 as passed (2026-11-20).
 
 ## 4. Open points
 
